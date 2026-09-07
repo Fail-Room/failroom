@@ -2,7 +2,9 @@
 
 ## Status
 
-Failroom Phase 0 has no application runtime, terminal gateway, sandbox implementation, authentication system, or production deployment. Every control in this document is a mandatory requirement for future implementation, not an implemented guarantee. Runtime claims require test evidence from the phase that introduces them.
+Failroom has no application runtime, terminal gateway, sandbox implementation, authentication system, or production deployment. Phase 1 includes a pure profile qualification gate and a transactional SQLite state store. They enforce evidence-decision and repository authority rules, but neither runs runtime probes or allocates containers. Their tests do not prove runtime isolation or signed-token security. Other controls in this document remain mandatory requirements for future implementation. Runtime claims require test evidence from the phase that introduces them.
+
+The [state store](../packages/state-store/README.md) separates backend/control-plane writers and checks trusted identity context, ownership, scope, current tuple, version, epoch, lifecycle state and expiry. `jti` consumption is atomic and stores only its hash. Immutable deadline and cleanup-intent SQL guards, post-lock Clock sampling, restart finalization, and fixed failure-code persistence are tested. The caller must authenticate identities and verify token signatures before constructing these contexts; accepting client-constructed context objects would bypass that upstream boundary. Evidence-reference syntax does not certify readiness or destruction.
 
 ## Security Objective
 
@@ -70,6 +72,8 @@ Trust is not transitive. Knowing a Room ID, sandbox ID, network address, or term
 - Document any narrower local proof-of-concept network policy gap with an owner, compensating control, and removal condition.
 
 ### Resources and Lifetime
+
+- Before allocation, require a complete, passing, current qualification report bound to the exact runtime/boot/daemon identity, runtime configuration, image and full profile. The implemented [qualification gate](../services/sandbox-engine/README.md) evaluates these prerequisites; the trusted collector and allocation-path integration are not implemented. A caller-supplied report, digest reference or sandbox success string must never establish evidence authenticity. Reject missing or unverifiable results and keep cleanup available when creation is denied.
 
 - Enforce finite CPU, memory, PID, storage, I/O, terminal-output, network, concurrent terminal connection and session, and absolute-lifetime limits per sandbox.
 - Persist an immutable absolute-TTL deadline before allocation. Check it before and after every lifecycle side effect, including create, start, and reset work, and use bounded cleanup retries.
@@ -164,15 +168,17 @@ Before a sandbox capability is accepted, automated or reproducible tests must de
 
 Tests must run against the actual selected runtime and document platform-specific exceptions. A passing interface mock is not isolation evidence.
 
-## Known Phase 0 Limitations
+## Known Implementation Limitations
 
-There is no runtime to inspect or test in Phase 0, so none of these controls is implemented or verified. The runtime, identity provider, credential format, network enforcement mechanism, syscall profile, storage driver, secret store, cleanup reconciler, and production topology remain unselected.
+There is no application runtime to inspect or test. Qualification decisions and SQLite authority/cleanup-intent persistence are implemented; evidence collection, actual limit enforcement, authentication, PTY handling, background reconciliation and physical cleanup remain unimplemented. SQLite storage does not enforce TTL while services are down. The selected Phase 1 direction is Docker with a strict, nonprivileged, read-only, network-disabled profile and bounded scratch storage. Real runtime evidence for the final image is still required before learner creation can be enabled.
+
+The state database, WAL and journals require a trusted private local directory outside synchronized or network storage, with service-account permissions and no sandbox exposure. The package requires an explicit path but does not configure ACLs or identify sync software; deployment/startup verification remains required. Unknown database versions are refused rather than reset. Runtime setup must also provide bounded admission, database growth/retention policy, monitoring and independent TTL enforcement; the storage module alone is not a safe public service.
 
 Phase 1 is a local proof of concept, not evidence of production-grade multi-tenant isolation. It must still prove one authoritative attempt record, backend-preallocated resource identity, one-time capability, authenticated backend introspection, final control-plane attachment lease, bounded resources, explicit destroy, and durable absolute-TTL cleanup. The Phase 1 baseline persists `expires_at`, expiry intent, and destroy intent in authoritative storage, reconciles owned runtime resources on process or service startup, and resumes expiry or destroy until verified destruction so no orphan survives its deadline. Phase 2 generalizes these controls into reset, multiple concurrent sandboxes, the complete reusable state machine and transition/race matrices, and broader reconciliation; it is not the first implementation of durable cleanup. Any temporary local limitation must be explicit, bounded, and unable to violate the non-negotiable host socket, host shell, host filesystem, authorization, isolation, resource-limit, TTL, or cleanup rules.
 
 ## Future Isolation Options
 
-The initial runtime decision will be made during Phase 1 planning. Options for later evaluation include Rootless Docker, Rootless Podman, gVisor, Kata Containers, and Firecracker microVMs. These are deferred choices, not present safeguards.
+Phase 1 targets a local Docker Linux engine with strict limits and denial when qualification is incomplete. Options for later evaluation include Rootless Docker, Rootless Podman, gVisor, Kata Containers, and Firecracker microVMs. These are deferred choices, not present safeguards.
 
 Evaluation must compare host support, kernel boundary strength, PTY behavior, filesystem and network policy, resource accounting, startup latency, cleanup reliability, observability, maintenance cost, and known escape surface. Stronger isolation does not replace application-level ownership checks or credential scoping.
 

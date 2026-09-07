@@ -6,6 +6,20 @@ This document is the planned lifecycle, terminal, isolation, and cleanup contrac
 
 A sandbox is an internal disposable runtime resource for one Room attempt. It is not a product identity, an authorization credential, or a durable user environment.
 
+## Implemented Qualification Prerequisite
+
+The [sandbox engine qualification gate](../services/sandbox-engine/README.md) is the first Phase 1 module. It requires every code-owned check to have exactly one typed PASS result, a valid evidence digest reference, and an aware observation time within the caller's explicit maximum age. It rejects missing, failed, unverified, duplicated, malformed, expired or future evidence and mismatches in engine identity, host boot, daemon epoch, runtime configuration, image or full profile digest.
+
+This is a pure evidence evaluator and raising guard, not a Docker configuration validator or resource allocator. Reports must be assembled by trusted verifiers; artifact hashes alone do not authenticate evidence. A future adapter must invoke the guard before allocation and separately enforce all authorization and lifecycle contracts below. Cleanup must remain possible when new creation is denied. The complete lifecycle, Docker probes, PTY and TTL enforcement are not implemented.
+
+## Implemented Persistence Prerequisite
+
+The [state store](../packages/state-store/README.md) implements the Phase 1 database boundary: backend-preallocated tuple and immutable deadline, separate attempt/resource writers, ownership and service role/scope checks, resource state/version compare-and-set, actor-key/request-fingerprint idempotency, consumed-jti hashing, session revocation and durable cleanup intent. It does not execute lifecycle side effects or authenticate a transport.
+
+Expiry is evaluated with a trusted clock after obtaining the database writer lock. Backend expiry/leave updates only attempt authority; control-plane transition and reconciliation update only resource authority. An expiry denial commits cleanup intent in the owner's existing record; a denied first resource acceptance leaves the reserved attempt/deadline for expiry and reconciliation. A `FAILED` transition stores a fixed failure code and permits cleanup only. Cleanup retry time/count and stable operation identity survive restart. Resource `DESTROYED` requires a trusted evidence reference, and backend completion independently checks that record. `pending_finalizations()` recovers a restart between these two commits.
+
+The supported resource transition matrix is tested as stored observations. Reset and new-generation retry are not implemented: Phase 1 tuples are immutable for an attempt. No passing database test proves Docker creation, physical destruction, PTY behavior, final attachment leasing, or an independent TTL deadline. These remain required runtime integration work.
+
 ## Responsibilities
 
 - The backend API authenticates the caller and owns the authoritative Room attempt record: user ownership, attempt status, active and pending sandbox identities and generations, provisioning/reset intent, `session_epoch`, idempotency key, and immutable expiry deadline. It preallocates and persists every expected `sandbox_id` and generation before create.

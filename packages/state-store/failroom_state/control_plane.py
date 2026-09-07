@@ -1,0 +1,417 @@
+"""Control-plane-owned resource observations and durable cleanup work.
+
+No method here allocates, inspects or deletes a container. Evidence references
+must come from trusted runtime verifiers; accepting a hash does not verify it.
+"""
+
+import sqlite3
+from datetime import datetime
+from uuid import uuid4
+
+from .common import (
+    binding,
+    cas,
+    digest,
+    finish,
+    identifier,
+    instant,
+    positive,
+    read_clock,
+    ref_valid,
+    replay,
+    request_hash,
+    row_ref,
+    service,
+    timestamp,
+)
+from .database import CommitDenial, Database
+from .models import (
+    Action,
+    CleanupTask,
+    Clock,
+    Receipt,
+    Resource,
+    ResourceRef,
+    ResourceState,
+    Role,
+    ServiceIdentity,
+    StoreError,
+)
+
+_NEXT = {
+    ResourceState.REQUESTED: {ResourceState.CREATING, ResourceState.STOPPING},
+    ResourceState.CREATING: {
+        ResourceState.STARTING,
+        ResourceState.FAILED,
+        ResourceState.STOPPING,
+    },
+    ResourceState.STARTING: {
+        ResourceState.READY,
+        ResourceState.FAILED,
+        ResourceState.STOPPING,
+    },
+    ResourceState.READY: {ResourceState.RUNNING, ResourceState.STOPPING},
+    ResourceState.RUNNING: {ResourceState.RESOLVED, ResourceState.STOPPING},
+    ResourceState.RESOLVED: {ResourceState.STOPPING},
+    ResourceState.STOPPING: {ResourceState.DESTROYED, ResourceState.FAILED},
+    ResourceState.FAILED: {ResourceState.STOPPING},
+    ResourceState.DESTROYED: set(),
+}
+
+
+def _resource(connection: sqlite3.Connection, ref: ResourceRef) -> sqlite3.Row:
+    row: sqlite3.Row | None = connection.execute(
+        "SELECT * FROM sandbox_resources WHERE sandbox_id=?",
+        (ref.sandbox_id,),
+    ).fetchone()
+    if row is None or row_ref(row) != ref:
+        raise StoreError("STALE_BINDING")
+    return row
+
+
+def _stop(connection: sqlite3.Connection, row: sqlite3.Row, expired: bool) -> None:
+    if row["state"] == "DESTROYED":
+        return
+    if (
+        row["state"] != "STOPPING"
+        or not row["destroy_intent"]
+        or (expired and not row["expiry_intent"])
+    ):
+        connection.execute(
+            """UPDATE sandbox_resources SET state='STOPPING',destroy_intent=1,
+            expiry_intent=max(expiry_intent,?),version=version+1 WHERE sandbox_id=?""",
+            (int(expired), row["sandbox_id"]),
+        )
+
+
+def _live(
+    connection: sqlite3.Connection,
+    attempt: sqlite3.Row,
+    resource: sqlite3.Row | None,
+    now: int,
+) -> None:
+    expired = now >= attempt["expires_at"] or bool(attempt["expiry_intent"])
+    if (
+        expired
+        or attempt["destroy_intent"]
+        or attempt["state"] in ("STOPPING", "FAILED", "DESTROYED")
+        or (resource is not None and resource["destroy_intent"])
+    ):
+        if expired and resource is not None:
+            _stop(connection, resource, expired)
+            raise CommitDenial("ATTEMPT_UNAVAILABLE")
+        raise StoreError("ATTEMPT_UNAVAILABLE")
+
+
+class ControlPlaneStore:
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    def accept(
+        self, identity: ServiceIdentity, ref: ResourceRef, *, key: str, now: Clock
+    ) -> Receipt:
+        actor = service(identity, Role.BACKEND, Action.CREATE)
+        ref_valid(ref)
+        fingerprint = request_hash(
+            "accept", [ref.attempt_id, ref.sandbox_id, ref.generation]
+        )
+        with self._database._transaction() as connection:
+            clock = read_clock(now)
+            attempt = binding(connection, ref)
+            _live(connection, attempt, None, clock)
+            previous = replay(connection, actor, key, fingerprint)
+            if previous is not None:
+                return previous
+            if attempt["state"] != "PROVISIONING" or not attempt["provisioning_intent"]:
+                raise StoreError("INVALID_TRANSITION")
+            if connection.execute(
+                "SELECT 1 FROM sandbox_resources WHERE sandbox_id=?", (ref.sandbox_id,)
+            ).fetchone():
+                raise StoreError("RESOURCE_EXISTS")
+            connection.execute(
+                """INSERT INTO sandbox_resources
+                (sandbox_id,attempt_id,generation,state,expires_at)
+                VALUES (?,?,?,'REQUESTED',?)""",
+                (ref.sandbox_id, ref.attempt_id, ref.generation, attempt["expires_at"]),
+            )
+            return finish(
+                connection, actor, "accept", key, fingerprint, ref, "REQUESTED", 0
+            )
+
+    def inspect(self, identity: ServiceIdentity, ref: ResourceRef) -> Resource:
+        # Runtime details are never returned to a UserIdentity.
+        if type(identity) is not ServiceIdentity or identity.role not in (
+            Role.BACKEND,
+            Role.CONTROL_PLANE,
+        ):
+            raise StoreError("NOT_AUTHORIZED")
+        service(identity, identity.role, Action.INSPECT)
+        with self._database._transaction() as connection:
+            binding(connection, ref)
+            row = _resource(connection, ref)
+            return Resource(
+                ref,
+                str(row["state"]),
+                int(row["version"]),
+                row["container_id"],
+                instant(int(row["expires_at"])),
+                bool(row["expiry_intent"]),
+                bool(row["destroy_intent"]),
+                row["evidence_digest"],
+                row["cleanup_evidence_digest"],
+            )
+
+    def transition(
+        self,
+        identity: ServiceIdentity,
+        ref: ResourceRef,
+        *,
+        expected_version: int,
+        state: ResourceState,
+        key: str,
+        now: Clock,
+        container_id: str | None = None,
+        evidence_digest: str | None = None,
+        error_code: str | None = None,
+    ) -> Receipt:
+        actor = service(identity, Role.CONTROL_PLANE, Action.TRANSITION)
+        ref_valid(ref)
+        if type(state) is not ResourceState:
+            raise StoreError("INVALID_REQUEST")
+        if state == ResourceState.FAILED:
+            if error_code not in (
+                "CREATE_FAILED",
+                "START_FAILED",
+                "RUNTIME_UNAVAILABLE",
+                "CLEANUP_INCOMPLETE",
+            ):
+                raise StoreError("INVALID_REQUEST")
+        elif error_code is not None:
+            raise StoreError("INVALID_REQUEST")
+        if state in (ResourceState.READY, ResourceState.DESTROYED):
+            digest(evidence_digest)
+        elif evidence_digest is not None:
+            raise StoreError("INVALID_REQUEST")
+        if state == ResourceState.STARTING:
+            identifier(container_id)
+        elif container_id is not None:
+            raise StoreError("INVALID_REQUEST")
+        fingerprint = request_hash(
+            "transition",
+            [
+                ref.attempt_id,
+                ref.sandbox_id,
+                ref.generation,
+                expected_version,
+                state.value,
+                container_id,
+                evidence_digest,
+                error_code,
+            ],
+        )
+        with self._database._transaction() as connection:
+            clock = read_clock(now)
+            attempt = binding(connection, ref)
+            resource = _resource(connection, ref)
+            cleanup = state in (ResourceState.STOPPING, ResourceState.DESTROYED) or (
+                state == ResourceState.FAILED and resource["destroy_intent"]
+            )
+            if not cleanup:
+                _live(connection, attempt, resource, clock)
+            previous = replay(connection, actor, key, fingerprint)
+            if previous is not None:
+                return previous
+            cas(resource, expected_version)
+            if state not in _NEXT[ResourceState(resource["state"])]:
+                raise StoreError("INVALID_TRANSITION")
+            destroy = state in (
+                ResourceState.STOPPING,
+                ResourceState.FAILED,
+                ResourceState.DESTROYED,
+            )
+            expired = clock >= resource["expires_at"] or bool(attempt["expiry_intent"])
+            connection.execute(
+                """UPDATE sandbox_resources SET state=?,version=version+1,
+                container_id=coalesce(?,container_id),
+                destroy_intent=max(destroy_intent,?),expiry_intent=max(expiry_intent,?),
+                evidence_digest=coalesce(?,evidence_digest),
+                cleanup_evidence_digest=coalesce(?,cleanup_evidence_digest)
+                WHERE sandbox_id=?""",
+                (
+                    state.value,
+                    container_id,
+                    int(destroy),
+                    int(expired),
+                    evidence_digest if state == ResourceState.READY else None,
+                    evidence_digest if state == ResourceState.DESTROYED else None,
+                    ref.sandbox_id,
+                ),
+            )
+            if state == ResourceState.DESTROYED:
+                connection.execute(
+                    """UPDATE lifecycle_operations SET status='SUCCEEDED',
+                    result_state='DESTROYED',result_version=?,error_code=NULL
+                    WHERE actor='internal:cleanup' AND idempotency_key=?""",
+                    (expected_version + 1, ref.sandbox_id),
+                )
+            return finish(
+                connection,
+                actor,
+                "transition",
+                key,
+                fingerprint,
+                ref,
+                state.value,
+                expected_version + 1,
+                error_code,
+            )
+
+    def reconcile(
+        self, identity: ServiceIdentity, *, now: Clock, limit: int
+    ) -> tuple[CleanupTask, ...]:
+        service(identity, Role.CONTROL_PLANE, Action.RECONCILE)
+        positive(limit, maximum=1000)
+        tasks: list[CleanupTask] = []
+        with self._database._transaction() as connection:
+            clock = read_clock(now)
+            rows = connection.execute(
+                """SELECT a.* FROM room_attempts a
+                LEFT JOIN sandbox_resources r ON r.sandbox_id=a.sandbox_id
+                LEFT JOIN lifecycle_operations o ON o.actor='internal:cleanup'
+                    AND o.idempotency_key=a.sandbox_id
+                WHERE a.state!='DESTROYED' AND (r.state IS NULL OR r.state!='DESTROYED')
+                AND (a.destroy_intent=1 OR a.expires_at<=? OR r.destroy_intent=1)
+                AND (o.operation_id IS NULL OR o.retry_at<=?)
+                ORDER BY a.expires_at,a.attempt_id LIMIT ?""",
+                (clock, clock, limit),
+            ).fetchall()
+            for attempt in rows:
+                ref = row_ref(attempt)
+                expired = clock >= attempt["expires_at"] or bool(
+                    attempt["expiry_intent"]
+                )
+                # Even an interrupted create with no resource row has a reserved
+                # identity to inspect for absence. Do not silently mark it destroyed.
+                connection.execute(
+                    """INSERT INTO sandbox_resources
+                    (sandbox_id,attempt_id,generation,state,expires_at,destroy_intent,
+                     expiry_intent) VALUES (?,?,?,'STOPPING',?,1,?)
+                    ON CONFLICT(sandbox_id) DO NOTHING""",
+                    (
+                        ref.sandbox_id,
+                        ref.attempt_id,
+                        ref.generation,
+                        attempt["expires_at"],
+                        int(expired),
+                    ),
+                )
+                _stop(connection, _resource(connection, ref), expired)
+                resource = _resource(connection, ref)
+                connection.execute(
+                    """INSERT INTO lifecycle_operations
+                    (operation_id,actor,action,idempotency_key,request_hash,
+                     attempt_id,sandbox_id,generation,status,result_state,result_version)
+                    VALUES (?,'internal:cleanup','cleanup',?,?,?,?,?,'PENDING','STOPPING',?)
+                    ON CONFLICT(actor,idempotency_key) DO NOTHING""",
+                    (
+                        str(uuid4()),
+                        ref.sandbox_id,
+                        request_hash(
+                            "cleanup", [ref.attempt_id, ref.sandbox_id, ref.generation]
+                        ),
+                        ref.attempt_id,
+                        ref.sandbox_id,
+                        ref.generation,
+                        resource["version"],
+                    ),
+                )
+                operation = connection.execute(
+                    """SELECT * FROM lifecycle_operations WHERE actor='internal:cleanup'
+                    AND idempotency_key=?""",
+                    (ref.sandbox_id,),
+                ).fetchone()
+                tasks.append(
+                    CleanupTask(
+                        str(operation["operation_id"]),
+                        ref,
+                        str(resource["state"]),
+                        int(resource["version"]),
+                        bool(resource["expiry_intent"]),
+                        int(operation["retry_count"]),
+                    )
+                )
+        return tuple(tasks)
+
+    def cleanup_failed(
+        self,
+        identity: ServiceIdentity,
+        ref: ResourceRef,
+        *,
+        operation_id: str,
+        expected_version: int,
+        key: str,
+        error_code: str,
+        retry_at: datetime,
+        now: Clock,
+    ) -> Receipt:
+        actor = service(identity, Role.CONTROL_PLANE, Action.RECONCILE)
+        identifier(operation_id)
+        ref_valid(ref)
+        retry = timestamp(retry_at)
+        if error_code not in ("RUNTIME_UNAVAILABLE", "CLEANUP_INCOMPLETE"):
+            raise StoreError("INVALID_REQUEST")
+        fingerprint = request_hash(
+            "cleanup-failed",
+            [
+                ref.attempt_id,
+                ref.sandbox_id,
+                ref.generation,
+                operation_id,
+                expected_version,
+                error_code,
+                retry,
+            ],
+        )
+        with self._database._transaction() as connection:
+            clock = read_clock(now)
+            binding(connection, ref)
+            resource = _resource(connection, ref)
+            previous = replay(connection, actor, key, fingerprint)
+            if previous is not None:
+                return previous
+            if retry <= clock:
+                raise StoreError("INVALID_REQUEST")
+            cas(resource, expected_version)
+            operation = connection.execute(
+                """SELECT * FROM lifecycle_operations WHERE operation_id=?
+                AND actor='internal:cleanup' AND idempotency_key=?""",
+                (operation_id, ref.sandbox_id),
+            ).fetchone()
+            if (
+                resource["state"] != "STOPPING"
+                or operation is None
+                or operation["status"] == "SUCCEEDED"
+            ):
+                raise StoreError("INVALID_TRANSITION")
+            connection.execute(
+                """UPDATE sandbox_resources SET state='FAILED',version=version+1
+                WHERE sandbox_id=?""",
+                (ref.sandbox_id,),
+            )
+            connection.execute(
+                """UPDATE lifecycle_operations SET status='RETRY',retry_count=retry_count+1,
+                retry_at=?,error_code=?,result_state='FAILED',result_version=?
+                WHERE operation_id=?""",
+                (retry, error_code, expected_version + 1, operation_id),
+            )
+            return finish(
+                connection,
+                actor,
+                "cleanup-failed",
+                key,
+                fingerprint,
+                ref,
+                "FAILED",
+                expected_version + 1,
+                error_code,
+            )

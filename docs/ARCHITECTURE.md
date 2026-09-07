@@ -2,9 +2,19 @@
 
 ## Status and Scope
 
-This document defines the planned architecture for Failroom. Phase 0 contains documentation and repository rules only; no web application, backend, terminal gateway, sandbox runtime, authentication system, or database is implemented.
+This document defines the architecture for Failroom. Phase 0 established documentation and repository rules. Phase 1 implements an internal profile qualification evaluator in `services/sandbox-engine/` and SQLite repositories in `packages/state-store/`. No web/API application, terminal gateway, sandbox runtime, authentication system, or deployment is implemented.
+
+The [qualification module](../services/sandbox-engine/README.md) evaluates trusted per-check evidence against the current runtime, image and profile fingerprints and an explicit maximum age. Its raising guard rejects incomplete, failed, malformed, stale or mismatched reports. It has no runtime side effects and cannot replace authentication, ownership, generation, lifecycle or final attachment authorization. Evidence collection and invocation from a real allocation adapter remain unimplemented.
 
 The first implementation target is one secure browser-to-sandbox terminal path. Next.js, xterm.js, and FastAPI are planned architecture choices. Phase 1 selects and locks their concrete versions, manifests, dependency tooling, and integration layout. It implements the minimum secure slice: one authoritative attempt record, a backend-preallocated resource identity, one-time terminal capability, backend introspection, control-plane attachment lease, bounded resources, immutable absolute TTL, explicit destroy, and durable cleanup. That cleanup persists `expires_at`, expiry intent, and destroy intent in authoritative storage, reconciles owned runtime resources against records on service startup, and resumes expiry or destroy work until verified destruction so no orphan survives its deadline. Phase 2 generalizes this baseline into reset, multiple concurrent sandboxes, the complete reusable lifecycle state machine and transition/race matrices, and broader reconciliation. The component boundaries below are logical contracts; Phase 1 may colocate processes, but it must preserve the same authorization and trust boundaries.
+
+## Implemented Persistence Boundary
+
+The [state store](../packages/state-store/README.md) uses four SQLite tables: backend-owned `room_attempts` and `terminal_capability_uses`, control-plane-owned `sandbox_resources`, and an operation-owner `lifecycle_operations` log. Backend preallocation, ownership checks, exact tuple matching, compare-and-set resource transitions, immutable TTL, epoch revocation, request-fingerprint idempotency and atomic consumed-jti hashing are implemented at the repository boundary. Resource and attempt updates remain separate even though their transactions use one private local database.
+
+These APIs require already authenticated contexts and verified capability claims from trusted callers; they do not implement authentication or signature verification. A trusted Clock is sampled after obtaining the writer lock. Resource readiness and destruction accept trusted evidence references, not sandbox assertions. Receipts are historical database results and cannot authorize allocation or attachment. Reset, runtime probes, lease consumption, workers and independent TTL enforcement remain unimplemented.
+
+Cleanup intent and retry records survive reopening. Control-plane reconciliation enumerates reserved cleanup tuples, including interrupted creates without a resource row. Backend finalization has its own recovery query for interruptions after resource destruction was recorded. Actual inventory inspection, orphan removal and physical absence verification must be integrated before learner access. Store database and journal files outside synchronized source checkouts and sandbox-accessible paths.
 
 ## Decision Priorities
 
@@ -85,7 +95,7 @@ Terminal results come from the real PTY-backed shell. Fake terminal responses, p
 
 ## Planned Monorepo Shape
 
-The following shape is planned but not yet created:
+The following shape is the target layout. The sandbox qualification and state-store modules now exist; application and runtime directories remain planned:
 
 ```text
 apps/
@@ -94,7 +104,8 @@ services/
   api/                    FastAPI identity, ownership, and Room control
   sandbox-engine/         terminal gateway and trusted lifecycle adapters
 scenarios/                minimal declarative Room definitions
-packages/                 shared contracts and narrow reusable libraries
+packages/
+  state-store/            backend/control-plane SQLite repositories
 infra/                    local and deployment infrastructure definitions
 docs/                     product and engineering contracts
 ```
