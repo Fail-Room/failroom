@@ -2,7 +2,7 @@
 
 ## Status and Scope
 
-This document is the planned lifecycle, terminal, isolation, and cleanup contract for Failroom sandboxes. Phase 0 implements none of it. Phase 1 will prove one minimum secure terminal slice with one authoritative attempt record, backend-preallocated resource identity, one-time capability, backend introspection, control-plane attachment lease, bounded resources, explicit destroy, and durable absolute-TTL cleanup. The Phase 1 cleanup baseline persists `expires_at`, expiry intent, and destroy intent, reconciles owned runtime resources on startup, and resumes expiry or destroy until verified destruction. Phase 2 will generalize that slice into reset, multiple concurrent sandboxes, the complete reusable state machine and transition/race matrices, and broader reconciliation.
+This document is the planned lifecycle, terminal, isolation, and cleanup contract for Failroom sandboxes. Phase 1 implements internal qualification, diagnostic-only Docker profile/lifecycle checks, authoritative persistence and an injected cleanup pass. It has not proved a learner terminal slice with browser authentication, one-time capability verification, attachment leasing, independent TTL scheduling, or full runtime isolation. Phase 2 will generalize the lifecycle into reset, multiple concurrent sandboxes, the complete reusable state machine and transition/race matrices, and broader reconciliation.
 
 A sandbox is an internal disposable runtime resource for one Room attempt. It is not a product identity, an authorization credential, or a durable user environment.
 
@@ -10,7 +10,7 @@ A sandbox is an internal disposable runtime resource for one Room attempt. It is
 
 The [sandbox engine qualification gate](../services/sandbox-engine/README.md) is the first Phase 1 module. It requires every code-owned check to have exactly one typed PASS result, a valid evidence digest reference, and an aware observation time within the caller's explicit maximum age. It rejects missing, failed, unverified, duplicated, malformed, expired or future evidence and mismatches in engine identity, host boot, daemon epoch, runtime configuration, image or full profile digest.
 
-This is a pure evidence evaluator and raising guard, not a Docker configuration validator or resource allocator. Reports must be assembled by trusted verifiers; artifact hashes alone do not authenticate evidence. A future adapter must invoke the guard before allocation and separately enforce all authorization and lifecycle contracts below. Cleanup must remain possible when new creation is denied. The complete lifecycle, Docker probes, PTY and TTL enforcement are not implemented.
+The qualification module is a pure evidence evaluator and raising guard. The same component also has a separate diagnostic-only Docker adapter that compiles a fixed profile, checks image metadata and post-create settings, and proves exact-resource absence after removal. It is not a learner allocator. Reports must be assembled by trusted verifiers; artifact hashes alone do not authenticate evidence. A future learner adapter must invoke the guard before allocation and separately enforce all authorization and lifecycle contracts below. Cleanup must remain possible when new creation is denied.
 
 ## Implemented Persistence Prerequisite
 
@@ -18,7 +18,7 @@ The [state store](../packages/state-store/README.md) implements the Phase 1 data
 
 Expiry is evaluated with a trusted clock after obtaining the database writer lock. Backend expiry/leave updates only attempt authority; control-plane transition and reconciliation update only resource authority. An expiry denial commits cleanup intent in the owner's existing record; a denied first resource acceptance leaves the reserved attempt/deadline for expiry and reconciliation. A `FAILED` transition stores a fixed failure code and permits cleanup only. Cleanup retry time/count and stable operation identity survive restart. Resource `DESTROYED` requires a trusted evidence reference, and backend completion independently checks that record. `pending_finalizations()` recovers a restart between these two commits.
 
-The supported resource transition matrix is tested as stored observations. Reset and new-generation retry are not implemented: Phase 1 tuples are immutable for an attempt. No passing database test proves Docker creation, physical destruction, PTY behavior, final attachment leasing, or an independent TTL deadline. These remain required runtime integration work.
+The supported resource transition matrix is tested as stored observations. `DockerCleanupWorker` can execute one injected verifier pass only after rechecking the exact tuple, version, `STOPPING` state and destroy intent; it records `DESTROYED` only after supplied absence evidence and then independently finalizes the backend record. Reset and new-generation retry are not implemented: Phase 1 tuples are immutable for an attempt. No passing database test proves learner Docker creation, PTY behavior, final attachment leasing, or an independent TTL deadline. These remain required runtime integration work.
 
 ## Responsibilities
 

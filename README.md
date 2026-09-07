@@ -34,7 +34,7 @@ The intended terminal path is:
 
 `Browser → xterm.js → authorized WebSocket → terminal gateway → PTY → isolated Linux sandbox`
 
-The planned architecture uses Next.js with xterm.js for the browser interface and FastAPI for backend authorization and control. It separates those layers from the terminal gateway, trusted sandbox control plane, untrusted user sandbox, and Room scenario definitions. Internal profile qualification and SQLite state modules are implemented; the runtime components are not connected.
+The planned architecture uses Next.js with xterm.js for the browser interface and FastAPI for backend authorization and control. It separates those layers from the terminal gateway, trusted sandbox control plane, untrusted user sandbox, and Room scenario definitions. Internal profile qualification, a diagnostic-only Docker adapter, and SQLite state modules are implemented; learner runtime components are not connected.
 
 ## Security Boundary
 
@@ -44,7 +44,7 @@ As a product design objective, failures should have real consequences inside a R
 
 ## Current Development Status
 
-Phase 0 established documentation and repository rules. Phase 1 includes a tested profile qualification gate and a transactional SQLite state store for ownership, lifecycle records, single-use identifier consumption and durable cleanup intent. These modules do not collect runtime evidence, create containers or run cleanup workers. There is still no runnable web application, real terminal, sandbox, authentication flow, or deployment.
+Phase 0 established documentation and repository rules. Phase 1 includes a tested profile qualification gate, a diagnostic-only Docker lifecycle adapter, and a transactional SQLite state store for ownership, lifecycle records, single-use identifier consumption, durable cleanup intent and injected cleanup passes. The diagnostic adapter does not authorize or create learner Rooms. There is still no runnable web application, real learner terminal, authentication flow, or deployment.
 
 ## Roadmap
 
@@ -64,7 +64,7 @@ Phase 0 established documentation and repository rules. Phase 1 includes a teste
 
 ## Local Development
 
-The [sandbox engine](services/sandbox-engine/README.md) and [state store](packages/state-store/README.md) are Python 3.12 modules with no runtime dependencies and reproducible test, lint, format, and type checks. Web, API, and Docker runtime setup will be documented when those components are implemented and verified.
+The [sandbox engine](services/sandbox-engine/README.md) and [state store](packages/state-store/README.md) are Python 3.12 modules with no runtime dependencies and reproducible test, lint, format, and type checks. The Docker diagnostic adapter is opt-in and requires a trusted Linux control-plane host with explicit operator profile inputs. Web, API, learner runtime and terminal setup remain planned.
 
 ## Contributing
 

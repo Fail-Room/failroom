@@ -1,8 +1,8 @@
 # Sandbox Engine
 
-This component currently implements a profile qualification evidence evaluator
-and a raising guard. It has no Docker adapter, probe runner, HTTP service,
-database, terminal gateway, or sandbox creation endpoint.
+This component implements a profile qualification evidence evaluator and raising
+guard, plus a trusted, diagnostic-only Docker lifecycle adapter. It has no HTTP
+service, database, terminal gateway, learner sandbox creation endpoint, or PTY.
 
 The package uses Python 3.12.13 and the standard library. Ruff and mypy are pinned
 development tools; `uv.lock` locks their transitive dependencies. Commands below
@@ -66,6 +66,42 @@ numbers and non-JSON types are rejected. It does not validate the security of
 configuration values, fill defaults, or access Docker. Loaders must reject
 duplicate JSON keys, resolve every setting, and serialize mutations while
 fingerprinting. Required settings must not be omitted from the document.
+
+## Diagnostic Docker lifecycle
+
+`StrictDockerProfile` compiles an explicit, immutable diagnostic profile. It
+requires a digest-pinned image, non-root numeric UID:GID, finite CPU represented
+as exact Docker NanoCPUs, equal memory/swap limits, bounded PID/tmpfs/shm/FD/I/O
+values, terminal/session/TTL limits, and an absolute seccomp policy path and
+digest. It compiles fixed Docker arguments for `runc`, private PID/IPC/cgroup
+namespaces, `network=none`, read-only root, dropped capabilities,
+`no-new-privileges`, disabled health checks, no restart and disabled logging.
+There are no profile fields for host mounts, volumes, devices, ports, extra
+capabilities, arbitrary commands, or a learner-selected image.
+
+`SeccompPolicyStore` is Linux-only. Before Docker create it opens the configured
+policy without following symlinks, checks a bounded regular file against its
+SHA-256 digest, and creates a private read-only snapshot below an explicitly
+provisioned control-plane directory. Unsupported platforms and unsafe paths or
+directories deny creation. The store trusts root and the control-plane UID; it
+does not protect against hostile processes running as that same UID. A process
+kill can leave a private snapshot directory until deployment cleanup handles it.
+
+`DockerDiagnosticLifecycle` is an operator/control-plane primitive. Before a
+create it checks the locally resolved digest-pinned image has no declared
+volumes. The policy store verifies policy bytes before create; after create and
+start, the lifecycle verifies the exact private snapshot path, image, profile,
+labels and allowed tmpfs mounts. A mismatch prevents start and only an exact
+matching diagnostic resource can be stopped or removed. Post-remove inspect must
+prove absence before it returns canonical evidence. These checks do not qualify an
+image or runtime for learner use, and `create_qualified()` remains disabled after
+the qualification guard succeeds.
+
+The opt-in test `test_docker_diagnostic_integration.py` requires
+`FAILROOM_DOCKER_INTEGRATION=1`, a trusted Linux control-plane host, and every
+`FAILROOM_*` profile or adapter-bound limit. With any input missing, it reports
+`UNVERIFIED` by skipping rather than supplying source defaults. It is not run by
+default.
 
 ## Trust and integration boundary
 

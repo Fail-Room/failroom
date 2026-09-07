@@ -2,7 +2,7 @@
 
 ## Current Repository State
 
-Phase 0 established the product and engineering contracts. Phase 1 has started with the profile qualification module in `services/sandbox-engine/` and SQLite repositories in `packages/state-store/`, each with tests and a Python development manifest/lockfile. There is no runnable web/API application, terminal, sandbox, authentication flow, deployment, or production service. No persistent service database is created by installing or testing these modules.
+Phase 0 established the product and engineering contracts. Phase 1 has started with profile qualification and a diagnostic-only Docker adapter in `services/sandbox-engine/`, plus SQLite repositories and an injected cleanup pass in `packages/state-store/`, each with tests and a Python development manifest/lockfile. There is no runnable web/API application, learner terminal, authentication flow, deployment, or production service. No persistent service database is created by installing or testing these modules.
 
 Next.js, xterm.js, and FastAPI are the planned architecture choices. Phase 1 will select and lock their concrete versions, manifests, dependency tooling, and integration layout. Application setup commands will be documented only after those artifacts exist and are verified.
 
@@ -18,7 +18,7 @@ uv run --locked ruff format --check .
 uv run --locked mypy failroom_sandbox
 ```
 
-These checks cover evidence completeness, typing, duplication, context binding, age boundaries, deterministic safe errors, and configuration fingerprints. Test fixtures are synthetic and do not certify Docker resources. Actual resource probes, allocation-path integration and browser-to-PTY end-to-end checks are required when those components are introduced. See the [component contract](../services/sandbox-engine/README.md) for the implemented boundary.
+These checks cover evidence completeness, typing, duplication, context binding, age boundaries, deterministic safe errors, profile compilation, bounded Docker CLI transport, diagnostic ownership/mount checks, and seccomp snapshot handling. Default Docker lifecycle fixtures are synthetic. The opt-in diagnostic test is skipped unless a trusted Linux controller supplies every explicit `FAILROOM_*` profile input. Actual learner resource probes, allocation-path integration and browser-to-PTY end-to-end checks remain required. See the [component contract](../services/sandbox-engine/README.md) for the implemented boundary.
 
 The state store also uses Python 3.12.13 with no runtime dependencies. From `packages/state-store/`, run:
 
@@ -116,7 +116,7 @@ Sandbox-related changes must explicitly cover backend-preallocated identity, aut
 
 ## Local Validation
 
-Use the module checks above for the implemented qualification gate. Application integration and browser-to-PTY checks become available with their respective runtime components. Documentation-only changes should at minimum:
+Use the module checks above for the implemented qualification gate, diagnostic adapter and state worker. The opt-in Docker diagnostic test must be run only from a trusted Linux control-plane host after explicit operator profile inputs are configured. Application integration and browser-to-PTY checks become available with their respective runtime components. Documentation-only changes should at minimum:
 
 1. Confirm every referenced local Markdown link resolves.
 2. Check headings, terminology, planned-status wording, and final newlines.

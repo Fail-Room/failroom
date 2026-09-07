@@ -3,7 +3,8 @@
 Internal Phase 1 SQLite persistence for trusted services. This package stores
 authority, lifecycle observations and recovery work. It does not implement an
 HTTP API, authentication, signed capabilities, Docker operations, attachment
-leases, a PTY, or a background worker. It is not a running Failroom application.
+leases, a PTY, or a background scheduler. It includes a synchronous cleanup pass
+with an injected runtime verifier. It is not a running Failroom application.
 
 ## Ownership
 
@@ -79,9 +80,10 @@ references. `FAILED` requires one of `CREATE_FAILED`, `START_FAILED`,
 
 ## Recovery integration contract
 
-The future authenticated workers must perform all of these steps on startup and
-continue bounded retries during operation. These repository methods do not
-schedule themselves or enforce a deadline while every service is down.
+Authenticated service integration must perform all of these steps on startup and
+continue bounded retries during operation. These repository methods and the
+injected cleanup pass do not schedule themselves or enforce a deadline while
+every service is down.
 
 1. Backend calls `expire()` in bounded batches to persist due attempt intents and
    revoke terminal access. Control-plane methods independently reject expired
@@ -100,6 +102,45 @@ schedule themselves or enforce a deadline while every service is down.
    its evidence reference. Backend calls `complete_cleanup()` independently.
 5. Backend drains `pending_finalizations()` as well. This recovers a crash between
    the resource's destruction record and the attempt's final state update.
+
+`DockerCleanupWorker(control, backend, runtime, retry_delay=...)` implements one
+bounded pass of steps 2–5. Its `run_once(control_identity, backend_identity,
+now=..., limit=...)` first validates control-plane `RECONCILE`, `INSPECT` and
+`TRANSITION` scopes and backend `RECONCILE` and `PUBLISH` scopes. It drains pending
+finalizations before requesting due cleanup work; the combined number of selected
+records cannot exceed `limit` (1–1000). Before a runtime call, a fresh exact-tuple
+inspection must still match the task version, `STOPPING`, and destroy intent.
+
+The injected `CleanupRuntime.destroy_and_verify_absent(CleanupTarget)` receives
+the reserved `ResourceRef`, optional container ID and durable cleanup operation
+ID. A missing container ID still requires verification, including interrupted
+create discovery by exact tuple. The cleanup operation ID is **not** the original
+create-operation label; the runtime must resolve and validate creation labels
+separately. The runtime must implement bounded, idempotent removal and verify
+absence of every owned container, process, PTY, volume, network and session before
+returning canonical `sha256:<64 lowercase hex>` evidence. This package imports
+no Docker client and supplies no runtime verifier or service wiring.
+
+Only verified absence followed by a successful version-checked `DESTROYED`
+receipt permits backend completion. Runtime failures and malformed evidence
+persist only `RUNTIME_UNAVAILABLE` or `CLEANUP_INCOMPLETE`, retain destroy intent,
+and schedule a future retry using the explicit positive `timedelta` delay. Raw
+exceptions become `CLEANUP_INCOMPLETE` without storing their text. Store contention
+and concurrent state/version changes defer the affected operation without
+recording a runtime failure. If writer-lock waiting consumes the retry interval,
+the rejected retry record leaves work pending for a later pass. Deterministic
+hashed keys bind each transition to the tuple, cleanup operation and observed
+version; finalization keys bind the
+tuple. Repeated passes recover interrupted backend completion without another
+runtime call. Multiple workers may call the runtime for the same task, so this
+contract does not provide an exclusive work lease.
+
+`CleanupRun(destroyed, deferred, finalized)` counts successful destruction and
+backend-completion receipts and deferred operations. Destruction and completion
+can count the same tuple; a failed batch scan counts as one deferral. No internal
+loop, sleep or automatic retry runs after the pass returns. The injected-runtime
+tests establish SQLite orchestration behavior, not actual Docker removal or
+isolation evidence.
 
 Independent TTL enforcement, runtime inventory/orphan detection, attachment
 lease races, reset, final-image qualification and actual cleanup remain required
