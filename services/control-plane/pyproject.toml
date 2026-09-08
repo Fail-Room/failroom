@@ -5,6 +5,9 @@ description = "Trusted in-process lifecycle composition for Failroom"
 requires-python = ">=3.12,<3.13"
 dependencies = ["failroom-state-store", "failroom-sandbox-engine"]
 
+[project.scripts]
+failroom-control-plane = "failroom_control_plane.cli:main"
+
 [dependency-groups]
 dev = [
   "mypy==1.17.1",

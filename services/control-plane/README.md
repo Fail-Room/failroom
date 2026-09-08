@@ -47,4 +47,16 @@ cleanup error codes.
 
 There are no environment defaults, config-file fallbacks, HTTP listeners,
 background workers, shell execution paths, or learner-facing commands in this
-package. The operator-only migration command is added in a later approved task.
+package.
+
+## Operator migration
+
+The only CLI surface is the explicit `migrate` command. It requires absolute
+database and new backup paths plus a bounded busy timeout:
+
+```text
+failroom-control-plane migrate \
+  --database /var/lib/failroom/state.sqlite3 \
+  --backup /var/lib/failroom/state-before-v2.sqlite3 \
+  --busy-timeout-ms 5000
+```
