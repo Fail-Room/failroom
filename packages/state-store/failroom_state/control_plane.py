@@ -130,9 +130,15 @@ class ControlPlaneStore:
                 raise StoreError("RESOURCE_EXISTS")
             connection.execute(
                 """INSERT INTO sandbox_resources
-                (sandbox_id,attempt_id,generation,state,expires_at)
-                VALUES (?,?,?,'REQUESTED',?)""",
-                (ref.sandbox_id, ref.attempt_id, ref.generation, attempt["expires_at"]),
+                (sandbox_id,attempt_id,generation,state,expires_at,runtime_operation_id)
+                VALUES (?,?,?,'REQUESTED',?,?)""",
+                (
+                    ref.sandbox_id,
+                    ref.attempt_id,
+                    ref.generation,
+                    attempt["expires_at"],
+                    attempt["runtime_operation_id"],
+                ),
             )
             return finish(
                 connection, actor, "accept", key, fingerprint, ref, "REQUESTED", 0
@@ -154,6 +160,7 @@ class ControlPlaneStore:
                 str(row["state"]),
                 int(row["version"]),
                 row["container_id"],
+                row["runtime_operation_id"],
                 instant(int(row["expires_at"])),
                 bool(row["expiry_intent"]),
                 bool(row["destroy_intent"]),
@@ -295,7 +302,7 @@ class ControlPlaneStore:
                 connection.execute(
                     """INSERT INTO sandbox_resources
                     (sandbox_id,attempt_id,generation,state,expires_at,destroy_intent,
-                     expiry_intent) VALUES (?,?,?,'STOPPING',?,1,?)
+                     expiry_intent,runtime_operation_id) VALUES (?,?,?,'STOPPING',?,1,?,?)
                     ON CONFLICT(sandbox_id) DO NOTHING""",
                     (
                         ref.sandbox_id,
@@ -303,6 +310,7 @@ class ControlPlaneStore:
                         ref.generation,
                         attempt["expires_at"],
                         int(expired),
+                        attempt["runtime_operation_id"],
                     ),
                 )
                 _stop(connection, _resource(connection, ref), expired)

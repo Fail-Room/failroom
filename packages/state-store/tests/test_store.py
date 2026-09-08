@@ -133,7 +133,7 @@ class StoreTests(unittest.TestCase):
                     "lifecycle_operations",
                 },
             )
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
             self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
 
     def test_preallocation_and_owner_filtered_inspect(self):
@@ -152,6 +152,30 @@ class StoreTests(unittest.TestCase):
                 receipt.attempt_id,
             ),
         )
+
+    def test_accepted_resource_exposes_preallocated_runtime_operation_id(self):
+        receipt = self.create()
+        self.accept(receipt)
+
+        resource = self.control.inspect(
+            self.service(Role.CONTROL_PLANE, Action.INSPECT), receipt.ref
+        )
+
+        self.assertRegex(
+            getattr(resource, "runtime_operation_id", ""), r"^[0-9a-f]{32}$"
+        )
+
+    def test_runtime_operation_id_cannot_change_at_sql_boundary(self):
+        receipt = self.create()
+        self.accept(receipt)
+
+        with closing(sqlite3.connect(self.path)) as connection:
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE sandbox_resources SET runtime_operation_id=? "
+                    "WHERE sandbox_id=?",
+                    ("f" * 32, receipt.ref.sandbox_id),
+                )
 
     def test_create_requires_room_authority_and_future_aware_deadline(self):
         for user, room in [(None, "disk-full"), (self.alice, "other")]:

@@ -102,6 +102,7 @@ class Resource:
     state: str
     version: int
     container_id: str | None
+    runtime_operation_id: str | None
     expires_at: datetime
     expiry_intent: bool
     destroy_intent: bool
