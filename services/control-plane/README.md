@@ -31,7 +31,15 @@ cli = config.docker_cli()
 policies = config.seccomp_policy_store()
 ```
 
+`LifecycleOrchestrator.provision()` is the trusted state-to-runtime ordering
+boundary. It records `CREATING` before calling the runtime, records
+`STARTING` before starting a created container, and records `READY` only
+after a verified observation digest exists. It derives deterministic
+phase-specific idempotency keys, re-inspects the current resource before each
+runtime call, maps profile/ownership failures to fixed phase errors, and leaves
+cleanup to the durable cleanup worker.
+
 There are no environment defaults, config-file fallbacks, HTTP listeners,
-background workers, shell execution paths, or learner-facing commands in this
-package. Lifecycle orchestration, state transitions, Docker cleanup, and the
-operator-only migration command are added in later approved tasks.
+background workers, shell execution paths, Docker cleanup adapter, or
+learner-facing commands in this package. The operator-only migration command is
+added in a later approved task.
