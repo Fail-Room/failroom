@@ -39,7 +39,12 @@ phase-specific idempotency keys, re-inspects the current resource before each
 runtime call, maps profile/ownership failures to fixed phase errors, and leaves
 cleanup to the durable cleanup worker.
 
+`DockerProvisioningRuntime` connects that ordering boundary to the sandbox
+engine's pinned `prepare()` context. `DockerCleanupRuntime` converts the
+state-store's exact `CleanupTarget` into a `DockerBinding`, preserves the
+persisted runtime operation ID (including legacy `None`), and exposes only fixed
+cleanup error codes.
+
 There are no environment defaults, config-file fallbacks, HTTP listeners,
-background workers, shell execution paths, Docker cleanup adapter, or
-learner-facing commands in this package. The operator-only migration command is
-added in a later approved task.
+background workers, shell execution paths, or learner-facing commands in this
+package. The operator-only migration command is added in a later approved task.

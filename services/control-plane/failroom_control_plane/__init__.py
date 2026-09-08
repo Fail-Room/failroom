@@ -9,10 +9,13 @@ from .orchestrator import (
     ProvisioningSession,
     phase_key,
 )
+from .runtime_docker import DockerCleanupRuntime, DockerProvisioningRuntime
 
 __all__ = (
     "ConfigurationError",
     "ControllerConfig",
+    "DockerCleanupRuntime",
+    "DockerProvisioningRuntime",
     "LifecycleError",
     "LifecycleOrchestrator",
     "ProvisioningRequest",
