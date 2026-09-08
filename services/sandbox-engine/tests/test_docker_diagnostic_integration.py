@@ -78,6 +78,36 @@ def _profile_from_environment() -> StrictDockerProfile:
     )
 
 
+def _assert_hardening(
+    test_case: unittest.TestCase, data: dict[str, object], profile: StrictDockerProfile
+) -> None:
+    config = data["Config"]
+    host = data["HostConfig"]
+    mounts = data["Mounts"]
+    test_case.assertEqual(config["User"], f"{profile.uid}:{profile.gid}")
+    test_case.assertEqual(host["NetworkMode"], "none")
+    test_case.assertIsNone(host["Binds"])
+    test_case.assertIsNone(host["Mounts"])
+    test_case.assertIsNone(host["VolumesFrom"])
+    test_case.assertEqual(host["Devices"], [])
+    test_case.assertIsNone(host["DeviceRequests"])
+    test_case.assertEqual(
+        host["Tmpfs"],
+        {
+            "/workspace": f"rw,size={profile.workspace_tmpfs_bytes},nosuid,nodev,noexec",
+            "/tmp": f"rw,size={profile.temp_tmpfs_bytes},nosuid,nodev,noexec",
+        },
+    )
+    test_case.assertEqual(
+        mounts,
+        [
+            {"Type": "tmpfs", "Destination": "/workspace", "Source": ""},
+            {"Type": "tmpfs", "Destination": "/tmp", "Source": ""},
+        ],
+    )
+    test_case.assertNotIn("docker.sock", repr(data))
+
+
 @unittest.skipUnless(
     os.environ.get("FAILROOM_DOCKER_INTEGRATION") == "1",
     "UNVERIFIED: set FAILROOM_DOCKER_INTEGRATION=1 on a trusted Linux controller",
@@ -93,30 +123,47 @@ class DockerDiagnosticIntegrationTests(unittest.TestCase):
             Path(_required("FAILROOM_SECCOMP_STORE")),
             max_bytes=int(_required("FAILROOM_SECCOMP_MAX_BYTES")),
         )
+        cli = DockerCli(
+            context=context,
+            timeout=float(_required("FAILROOM_DOCKER_TIMEOUT_SECONDS")),
+            max_output_bytes=int(_required("FAILROOM_DOCKER_MAX_OUTPUT_BYTES")),
+        )
         lifecycle = DockerDiagnosticLifecycle(
-            DockerCli(
-                context=context,
-                timeout=int(_required("FAILROOM_DOCKER_TIMEOUT_SECONDS")),
-                max_output_bytes=int(_required("FAILROOM_DOCKER_MAX_OUTPUT_BYTES")),
-            ),
+            cli,
             store,
         )
         binding = DockerBinding(uuid4().hex, uuid4().hex, 1)
         operation_id = uuid4().hex
-        observation = lifecycle.create_diagnostic(profile, binding, operation_id)
+        container_id = None
         try:
+            observation = lifecycle.create_diagnostic(profile, binding, operation_id)
+            container_id = observation.container_id
             self.assertTrue(observation.running)
+            data = cli.inspect_container(container_id)
+            self.assertIsNotNone(data)
+            _assert_hardening(self, data, profile)
             evidence = lifecycle.destroy(
                 binding,
-                observation.container_id,
+                container_id,
                 operation_id=operation_id,
             )
             self.assertRegex(evidence, r"^sha256:[0-9a-f]{64}$")
+            self.assertEqual(
+                cli.list_containers(
+                    (
+                        "label=failroom.kind=diagnostic",
+                        "label=failroom.attempt_id=" + binding.attempt_id,
+                        "label=failroom.sandbox_id=" + binding.sandbox_id,
+                        "label=failroom.generation=1",
+                    )
+                ),
+                (),
+            )
         finally:
             # The lifecycle is idempotent; rerun cleanup after assertion failures.
             lifecycle.destroy(
                 binding,
-                observation.container_id,
+                container_id,
                 operation_id=operation_id,
             )
 
