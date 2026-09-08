@@ -117,9 +117,9 @@ records cannot exceed `limit` (1–1000). Before a runtime call, a fresh exact-t
 inspection must still match the task version, `STOPPING`, and destroy intent.
 
 The injected `CleanupRuntime.destroy_and_verify_absent(CleanupTarget)` receives
-the reserved `ResourceRef`, optional container ID and durable cleanup operation
-ID. A missing container ID still requires verification, including interrupted
-create discovery by exact tuple. The cleanup operation ID is **not** the original
+the reserved `ResourceRef`, optional container ID, nullable original `runtime_operation_id`,
+and durable cleanup operation ID. A missing container ID still requires verification,
+including interrupted create discovery by exact tuple. The cleanup operation ID is **not** the original
 create-operation label; the runtime must resolve and validate creation labels
 separately. The runtime must implement bounded, idempotent removal and verify
 absence of every owned container, process, PTY, volume, network and session before

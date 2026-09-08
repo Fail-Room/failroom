@@ -17,6 +17,7 @@ from failroom_state import (
     CapabilityClaims,
     ControlPlaneStore,
     Database,
+    ResourceRef,
     ResourceState,
     Role,
     ServiceIdentity,
@@ -176,6 +177,41 @@ class StoreTests(unittest.TestCase):
                     "WHERE sandbox_id=?",
                     ("f" * 32, receipt.ref.sandbox_id),
                 )
+
+    def test_legacy_runtime_binding_is_cleanup_only(self):
+        ref = ResourceRef("legacy-attempt", "legacy-sandbox", 1)
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                """INSERT INTO room_attempts
+                (attempt_id,user_id,room_id,sandbox_id,generation,state,created_at,expires_at,
+                 runtime_operation_id)
+                VALUES (?,?,?,?,1,'PROVISIONING',?,?,NULL)""",
+                (
+                    ref.attempt_id,
+                    "alice",
+                    "disk-full",
+                    ref.sandbox_id,
+                    int(self.now.timestamp() * 1_000_000),
+                    int(self.deadline.timestamp() * 1_000_000),
+                ),
+            )
+            connection.commit()
+        self.assert_error(
+            "LEGACY_RUNTIME_BINDING",
+            lambda: self.control.accept(
+                self.service(Role.BACKEND, Action.CREATE),
+                ref,
+                key="legacy-accept",
+                now=lambda: self.now,
+            ),
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT runtime_operation_id FROM room_attempts WHERE attempt_id=?",
+                    (ref.attempt_id,),
+                ).fetchone()[0]
+            )
 
     def test_create_requires_room_authority_and_future_aware_deadline(self):
         for user, room in [(None, "disk-full"), (self.alice, "other")]:
