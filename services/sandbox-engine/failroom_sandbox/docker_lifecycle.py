@@ -2,7 +2,8 @@
 
 import hashlib
 import re
-from contextlib import AbstractContextManager
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Protocol
@@ -13,6 +14,7 @@ from .docker_profile import (
     StrictDockerProfile,
     _cpu_nanocpus,
     compile_create_argv,
+    profile_fingerprint,
 )
 from .fingerprints import configuration_digest
 from .models import QualificationContext, QualificationReport
@@ -27,6 +29,13 @@ class PolicyStore(Protocol):
 
 @dataclass(frozen=True)
 class ContainerObservation:
+    container_id: str
+    running: bool
+    evidence_digest: str
+
+
+@dataclass(frozen=True)
+class CreatedContainer:
     container_id: str
     running: bool
 
@@ -189,6 +198,102 @@ def _verify_profile(
         raise DockerError("PROFILE_UNVERIFIED")
 
 
+def _verified_image(cli: DockerCli, profile: StrictDockerProfile) -> dict[str, object]:
+    image = cli.inspect_image(profile.image)
+    image_config = _object(image.get("Config"))
+    digests = image.get("RepoDigests")
+    if (
+        image.get("Os") != "linux"
+        or type(image.get("Id")) is not str
+        or re.fullmatch(r"sha256:[a-f0-9]{64}", str(image["Id"])) is None
+        or type(digests) is not list
+        or profile.image not in digests
+        or "Volumes" not in image_config
+        or not _empty(image_config["Volumes"])
+        or image_config["Volumes"] == []
+        or "Env" not in image_config
+    ):
+        raise DockerError("IMAGE_UNVERIFIED")
+    return image
+
+
+class PreparedDockerOperation:
+    def __init__(
+        self,
+        lifecycle: "DockerDiagnosticLifecycle",
+        profile: StrictDockerProfile,
+        binding: DockerBinding,
+        operation_id: str,
+        image: dict[str, object],
+        pinned: str,
+    ) -> None:
+        self._lifecycle = lifecycle
+        self._profile = profile
+        self._binding = binding
+        self._operation_id = operation_id
+        self._image = image
+        self._pinned = pinned
+        self._argv = tuple(
+            "seccomp=" + pinned if arg == "seccomp=" + profile.seccomp_path else arg
+            for arg in compile_create_argv(profile, binding, operation_id)
+        )
+        self._cleanup_id: str | None = None
+
+    def create_verified(self) -> CreatedContainer:
+        name = self._argv[4]
+        data = self._lifecycle._cli.inspect_container(name)
+        if data is None:
+            cid = self._lifecycle._cli.create(self._argv)
+            self._cleanup_id = cid
+            data = self._lifecycle._cli.inspect_container(cid)
+            if data is None:
+                raise DockerError("PROFILE_UNVERIFIED")
+        else:
+            raw_cid = data.get("Id")
+            if type(raw_cid) is not str:
+                raise DockerError("OWNERSHIP_MISMATCH")
+            cid = raw_cid
+        _owned(data, self._binding, cid, self._operation_id)
+        _verify_profile(data, self._profile, self._image, self._pinned)
+        state = _object(data.get("State"))
+        if state.get("Running") is not True and state.get("Status") != "created":
+            raise DockerError("PROFILE_UNVERIFIED")
+        return CreatedContainer(cid, state.get("Running") is True)
+
+    def start_verified(self, created: CreatedContainer) -> ContainerObservation:
+        data = self._lifecycle._inspect_exact_created(self, created.container_id)
+        if not created.running:
+            try:
+                self._lifecycle._cli.start(created.container_id)
+            except DockerError:
+                # A daemon may have started the container before the response
+                # was lost. Reconcile exact ownership before retrying anything.
+                data = self._lifecycle._inspect_exact_created(
+                    self, created.container_id
+                )
+            else:
+                data = self._lifecycle._inspect_exact_created(
+                    self, created.container_id
+                )
+        if _object(data.get("State")).get("Running") is not True:
+            raise DockerError("PROFILE_UNVERIFIED")
+        return ContainerObservation(
+            created.container_id,
+            True,
+            self._lifecycle._running_evidence(self, data),
+        )
+
+    def cleanup_after_failure(self) -> None:
+        if self._cleanup_id is None:
+            return
+        try:
+            self._lifecycle.destroy(
+                self._binding, self._cleanup_id, operation_id=self._operation_id
+            )
+        except DockerError:
+            pass
+
+
 class DockerDiagnosticLifecycle:
     """Called only by a trusted operator/controller with preallocated identifiers.
 
@@ -201,70 +306,57 @@ class DockerDiagnosticLifecycle:
         self._cli = cli
         self._policies = policies
 
+    def _inspect_exact_created(
+        self, operation: PreparedDockerOperation, cid: str
+    ) -> dict[str, object]:
+        data = self._cli.inspect_container(cid)
+        if data is None:
+            raise DockerError("PROFILE_UNVERIFIED")
+        _owned(data, operation._binding, cid, operation._operation_id)
+        _verify_profile(data, operation._profile, operation._image, operation._pinned)
+        return data
+
+    def _running_evidence(
+        self, operation: PreparedDockerOperation, data: dict[str, object]
+    ) -> str:
+        return configuration_digest(
+            {
+                "schema": "failroom.diagnostic-running.v1",
+                "context": self._cli.context,
+                "labels": {
+                    **_labels(operation._binding),
+                    "failroom.operation_id": operation._operation_id,
+                },
+                "image_id": operation._image["Id"],
+                "profile": profile_fingerprint(operation._profile),
+                "container_id": data["Id"],
+                "running": True,
+            }
+        )
+
+    @contextmanager
+    def prepare(
+        self,
+        profile: StrictDockerProfile,
+        binding: DockerBinding,
+        operation_id: str,
+    ) -> Iterator[PreparedDockerOperation]:
+        image = _verified_image(self._cli, profile)
+        with self._policies.pin(profile.seccomp_path, profile.seccomp_digest) as pinned:
+            operation = PreparedDockerOperation(
+                self, profile, binding, operation_id, image, pinned
+            )
+            try:
+                yield operation
+            except Exception:
+                operation.cleanup_after_failure()
+                raise
+
     def create_diagnostic(
         self, profile: StrictDockerProfile, binding: DockerBinding, operation_id: str
     ) -> ContainerObservation:
-        argv = compile_create_argv(profile, binding, operation_id)
-        name = argv[4]
-        image = self._cli.inspect_image(profile.image)
-        image_config = _object(image.get("Config"))
-        digests = image.get("RepoDigests")
-        if (
-            image.get("Os") != "linux"
-            or type(image.get("Id")) is not str
-            or re.fullmatch(r"sha256:[a-f0-9]{64}", str(image["Id"])) is None
-            or type(digests) is not list
-            or profile.image not in digests
-            or "Volumes" not in image_config
-            or not _empty(image_config["Volumes"])
-            or image_config["Volumes"] == []
-            or "Env" not in image_config
-        ):
-            raise DockerError("IMAGE_UNVERIFIED")
-        cid: str | None = None
-        create_attempted = False
-        try:
-            with self._policies.pin(
-                profile.seccomp_path, profile.seccomp_digest
-            ) as pinned:
-                # Only the verified file argument changes; the profile fingerprint
-                # remains bound to the operator source path and content digest.
-                argv = tuple(
-                    "seccomp=" + pinned
-                    if arg == "seccomp=" + profile.seccomp_path
-                    else arg
-                    for arg in argv
-                )
-                data = self._cli.inspect_container(name)
-                if data is None:
-                    create_attempted = True
-                    cid = self._cli.create(argv)
-                    data = self._cli.inspect_container(cid)
-                    if data is None:
-                        raise DockerError("PROFILE_UNVERIFIED")
-                else:
-                    cid = str(data.get("Id"))
-                _owned(data, binding, cid, operation_id)
-                _verify_profile(data, profile, image, pinned)
-                state = _object(data.get("State"))
-                if state.get("Running") is not True:
-                    if state.get("Status") != "created":
-                        raise DockerError("PROFILE_UNVERIFIED")
-                    self._cli.start(cid)
-                data = self._cli.inspect_container(cid)
-                if data is None:
-                    raise DockerError("PROFILE_UNVERIFIED")
-                _owned(data, binding, cid, operation_id)
-                _verify_profile(data, profile, image, pinned)
-                if _object(data.get("State")).get("Running") is not True:
-                    raise DockerError("PROFILE_UNVERIFIED")
-                return ContainerObservation(cid, True)
-        except Exception:
-            # Only compensate after invoking create or obtaining the exact
-            # container ID. A failed preflight must not delete a prior attempt.
-            if create_attempted or cid is not None:
-                self.destroy(binding, cid, operation_id=operation_id)
-            raise
+        with self.prepare(profile, binding, operation_id) as operation:
+            return operation.start_verified(operation.create_verified())
 
     def destroy(
         self,
