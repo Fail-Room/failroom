@@ -36,6 +36,14 @@ def identifier(value: object) -> str:
     return value
 
 
+def runtime_operation_id(value: object, *, legacy: bool = False) -> str | None:
+    if legacy and value is None:
+        return None
+    if type(value) is not str or re.fullmatch(r"[0-9a-f]{32}", value) is None:
+        raise StoreError("INVALID_REQUEST")
+    return value
+
+
 def timestamp(value: datetime) -> int:
     try:
         if type(value) is not datetime or value.utcoffset() is None:

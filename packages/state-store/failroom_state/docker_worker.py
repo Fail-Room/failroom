@@ -42,6 +42,7 @@ _DEFERRED_STORE_ERRORS = frozenset(
 class CleanupTarget:
     ref: ResourceRef
     container_id: str | None
+    runtime_operation_id: str | None
     operation_id: str
 
 
@@ -198,7 +199,12 @@ class DockerCleanupWorker:
         try:
             evidence = digest(
                 self._runtime.destroy_and_verify_absent(
-                    CleanupTarget(task.ref, resource.container_id, task.operation_id)
+                    CleanupTarget(
+                        task.ref,
+                        resource.container_id,
+                        resource.runtime_operation_id,
+                        task.operation_id,
+                    )
                 )
             )
         except RuntimeCleanupError as error:

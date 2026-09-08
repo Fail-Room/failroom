@@ -10,8 +10,8 @@ with an injected runtime verifier. It is not a running Failroom application.
 
 | Table | Writer | Stored contract |
 | --- | --- | --- |
-| `room_attempts` | `BackendStore` | Room ownership, preallocated sandbox identity and generation, active binding, state/version, session epoch, immutable deadline and provisioning/expiry/destroy intents. |
-| `sandbox_resources` | `ControlPlaneStore` | Exact backend-reserved tuple, resource state/version, container identity, matching deadline, expiry/destroy intents and trusted evidence references. |
+| `room_attempts` | `BackendStore` | Room ownership, preallocated sandbox identity and generation, immutable runtime operation binding, active binding, state/version, session epoch, immutable deadline and provisioning/expiry/destroy intents. |
+| `sandbox_resources` | `ControlPlaneStore` | Exact backend-reserved tuple, immutable runtime operation binding, resource state/version, container identity, matching deadline, expiry/destroy intents and trusted evidence references. |
 | `terminal_capability_uses` | `BackendStore` | SHA-256 hash of consumed `jti`, attempt binding, consumed time and expiry. No raw `jti` or signed token. |
 | `lifecycle_operations` | Operation owner | Actor-scoped idempotency key, request fingerprint, prior receipt, exact tuple, cleanup retry time/count and fixed failure code. |
 
@@ -57,9 +57,14 @@ references. `FAILED` requires one of `CREATE_FAILED`, `START_FAILED`,
   generation 1, future absolute deadline and operation receipt before any resource
   record is accepted. Phase 1 has one immutable generation per attempt; reset and
   generation-changing retries require a later explicit schema/API change.
-- Initialization creates version 1 only in an empty database. Unknown application
+- Initialization creates version 2 only in an empty database. Unknown application
   IDs, existing unrelated objects, or unsupported schema versions are refused.
-  There are no destructive migrations or automatic schema resets.
+- An exact version 1 database is left untouched at startup and reports
+  `MIGRATION_REQUIRED`. An operator must call `Database.migrate_v1_to_v2()` with a
+  new absolute backup path; the method validates the legacy shape and integrity,
+  creates a committed pre-migration backup, then applies the atomic schema change.
+- Tampered, corrupt, or already-version-2 databases are rejected by the migration
+  entry point. There are no automatic migrations or schema resets.
 - Each call uses a fresh connection, foreign keys, `BEGIN IMMEDIATE`, full
   synchronization and bounded lock waiting. Initialization enables WAL. SQL
   triggers prevent extending deadlines, changing owners or tuples, lowering
@@ -112,9 +117,9 @@ records cannot exceed `limit` (1–1000). Before a runtime call, a fresh exact-t
 inspection must still match the task version, `STOPPING`, and destroy intent.
 
 The injected `CleanupRuntime.destroy_and_verify_absent(CleanupTarget)` receives
-the reserved `ResourceRef`, optional container ID and durable cleanup operation
-ID. A missing container ID still requires verification, including interrupted
-create discovery by exact tuple. The cleanup operation ID is **not** the original
+the reserved `ResourceRef`, optional container ID, nullable original `runtime_operation_id`,
+and durable cleanup operation ID. A missing container ID still requires verification,
+including interrupted create discovery by exact tuple. The cleanup operation ID is **not** the original
 create-operation label; the runtime must resolve and validate creation labels
 separately. The runtime must implement bounded, idempotent removal and verify
 absence of every owned container, process, PTY, volume, network and session before

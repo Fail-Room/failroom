@@ -97,6 +97,17 @@ prove absence before it returns canonical evidence. These checks do not qualify 
 image or runtime for learner use, and `create_qualified()` remains disabled after
 the qualification guard succeeds.
 
+`prepare()` keeps the verified image and one pinned seccomp snapshot alive for a
+single operation and returns a `PreparedDockerOperation`. Its
+`create_verified()` step may create or reuse only the deterministic,
+operation-owned container and verifies it in the stopped `created` state;
+it never starts a container. Its `start_verified()` step revalidates the exact
+container, starts it once, and reconciles a lost start response by inspecting
+the same owned container before deciding whether cleanup is required. A running
+result includes a canonical evidence digest bound to the Docker context,
+labels, image ID, profile fingerprint and container ID. `create_diagnostic()`
+is the compatibility facade that executes both verified steps in one call.
+
 The opt-in test `test_docker_diagnostic_integration.py` requires
 `FAILROOM_DOCKER_INTEGRATION=1`, a trusted Linux control-plane host, and every
 `FAILROOM_*` profile or adapter-bound limit. With any input missing, it reports

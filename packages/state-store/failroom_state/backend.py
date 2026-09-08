@@ -83,10 +83,12 @@ class BackendStore:
             if deadline <= clock:
                 raise StoreError("INVALID_REQUEST")
             ref = ResourceRef(str(uuid4()), str(uuid4()), 1)
+            runtime_id = uuid4().hex
             connection.execute(
                 """INSERT INTO room_attempts
-                (attempt_id,user_id,room_id,sandbox_id,generation,state,created_at,expires_at)
-                VALUES (?,?,?,?,1,'PROVISIONING',?,?)""",
+                (attempt_id,user_id,room_id,sandbox_id,generation,state,created_at,expires_at,
+                 runtime_operation_id)
+                VALUES (?,?,?,?,1,'PROVISIONING',?,?,?)""",
                 (
                     ref.attempt_id,
                     identity.user_id,
@@ -94,6 +96,7 @@ class BackendStore:
                     ref.sandbox_id,
                     clock,
                     deadline,
+                    runtime_id,
                 ),
             )
             return finish(

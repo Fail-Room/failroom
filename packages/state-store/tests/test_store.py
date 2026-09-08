@@ -17,6 +17,7 @@ from failroom_state import (
     CapabilityClaims,
     ControlPlaneStore,
     Database,
+    ResourceRef,
     ResourceState,
     Role,
     ServiceIdentity,
@@ -133,7 +134,7 @@ class StoreTests(unittest.TestCase):
                     "lifecycle_operations",
                 },
             )
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
             self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
 
     def test_preallocation_and_owner_filtered_inspect(self):
@@ -152,6 +153,65 @@ class StoreTests(unittest.TestCase):
                 receipt.attempt_id,
             ),
         )
+
+    def test_accepted_resource_exposes_preallocated_runtime_operation_id(self):
+        receipt = self.create()
+        self.accept(receipt)
+
+        resource = self.control.inspect(
+            self.service(Role.CONTROL_PLANE, Action.INSPECT), receipt.ref
+        )
+
+        self.assertRegex(
+            getattr(resource, "runtime_operation_id", ""), r"^[0-9a-f]{32}$"
+        )
+
+    def test_runtime_operation_id_cannot_change_at_sql_boundary(self):
+        receipt = self.create()
+        self.accept(receipt)
+
+        with closing(sqlite3.connect(self.path)) as connection:
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE sandbox_resources SET runtime_operation_id=? "
+                    "WHERE sandbox_id=?",
+                    ("f" * 32, receipt.ref.sandbox_id),
+                )
+
+    def test_legacy_runtime_binding_is_cleanup_only(self):
+        ref = ResourceRef("legacy-attempt", "legacy-sandbox", 1)
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                """INSERT INTO room_attempts
+                (attempt_id,user_id,room_id,sandbox_id,generation,state,created_at,expires_at,
+                 runtime_operation_id)
+                VALUES (?,?,?,?,1,'PROVISIONING',?,?,NULL)""",
+                (
+                    ref.attempt_id,
+                    "alice",
+                    "disk-full",
+                    ref.sandbox_id,
+                    int(self.now.timestamp() * 1_000_000),
+                    int(self.deadline.timestamp() * 1_000_000),
+                ),
+            )
+            connection.commit()
+        self.assert_error(
+            "LEGACY_RUNTIME_BINDING",
+            lambda: self.control.accept(
+                self.service(Role.BACKEND, Action.CREATE),
+                ref,
+                key="legacy-accept",
+                now=lambda: self.now,
+            ),
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT runtime_operation_id FROM room_attempts WHERE attempt_id=?",
+                    (ref.attempt_id,),
+                ).fetchone()[0]
+            )
 
     def test_create_requires_room_authority_and_future_aware_deadline(self):
         for user, room in [(None, "disk-full"), (self.alice, "other")]:

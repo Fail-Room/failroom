@@ -159,7 +159,14 @@ class DockerCleanupWorkerTests(unittest.TestCase):
         self.assert_counts(self.run_worker(), 1, 0, 1)
         self.assertEqual(
             self.runtime.targets,
-            [self.module.CleanupTarget(ref, "container-1", task.operation_id)],
+            [
+                self.module.CleanupTarget(
+                    ref,
+                    "container-1",
+                    self.resource(ref).runtime_operation_id,
+                    task.operation_id,
+                )
+            ],
         )
         self.assertEqual(
             self.resource(ref).cleanup_evidence_digest, "sha256:" + "b" * 64
@@ -474,6 +481,40 @@ class DockerCleanupWorkerTests(unittest.TestCase):
             )
         self.assertEqual(self.runtime.targets, [])
         self.assertIsNone(self.operation(ref))
+
+    def test_cleanup_target_keeps_original_runtime_operation_id(self):
+        ref = self.create(container_id="container-2")
+        task = self.cleanup_task()
+        with closing(sqlite3.connect(self.path)) as connection:
+            runtime_id = connection.execute(
+                "SELECT runtime_operation_id FROM room_attempts WHERE attempt_id=?",
+                (ref.attempt_id,),
+            ).fetchone()[0]
+
+        self.assertRegex(runtime_id or "", r"^[0-9a-f]{32}$")
+        self.assert_counts(self.run_worker(), 1, 0, 1)
+        target = self.runtime.targets[0]
+        self.assertEqual(target.runtime_operation_id, runtime_id)
+        self.assertNotEqual(target.runtime_operation_id, task.operation_id)
+
+    def test_legacy_cleanup_keeps_null_runtime_operation_id(self):
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                """INSERT INTO room_attempts
+                (attempt_id,user_id,room_id,sandbox_id,generation,state,created_at,expires_at,
+                 destroy_intent,runtime_operation_id)
+                VALUES ('legacy-cleanup-attempt','alice','disk-full',
+                'legacy-cleanup-sandbox',1,'STOPPING',?,?,1,NULL)""",
+                (
+                    int(self.current.timestamp() * 1_000_000),
+                    int((self.current + timedelta(minutes=30)).timestamp() * 1_000_000),
+                ),
+            )
+            connection.commit()
+
+        self.assert_counts(self.run_worker(), 1, 0, 1)
+        target = self.runtime.targets[0]
+        self.assertIsNone(target.runtime_operation_id)
 
 
 if __name__ == "__main__":

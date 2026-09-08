@@ -121,6 +121,7 @@ class Engine:
             "Config": {"Volumes": None, "Env": ["PATH=/usr/bin:/bin"]},
         }
         self.after_create = None
+        self.after_start = None
         self.keep_after_remove = False
 
     def __call__(self, argv, *, timeout, max_output_bytes):
@@ -143,6 +144,8 @@ class Engine:
             return ProcessResult(0, (CID if self.created else "").encode(), b"")
         if args[:2] == ("container", "start"):
             self.resource["State"] = {"Running": True, "Status": "running"}
+            if self.after_start:
+                self.after_start(self.resource)
         elif args[:2] == ("container", "stop"):
             self.resource["State"] = {"Running": False, "Status": "exited"}
         elif args[:2] == ("container", "rm"):
@@ -311,6 +314,60 @@ class DockerLifecycleTests(unittest.TestCase):
         self.create()
         self.assertRegex(self.lifecycle.destroy(BINDING, None), r"^sha256:")
         self.assertFalse(self.engine.created)
+
+    def test_prepared_operation_persists_pin_through_create_then_start(self):
+        with self.lifecycle.prepare(self.profile, BINDING, OP) as operation:
+            created = operation.create_verified()
+            self.assertEqual(created.container_id, CID)
+            self.assertFalse(created.running)
+            self.assertTrue(self.policy.active)
+            result = operation.start_verified(created)
+            self.assertTrue(result.running)
+            self.assertRegex(result.evidence_digest, r"^sha256:[0-9a-f]{64}$")
+        self.assertFalse(self.policy.active)
+
+    def test_start_response_loss_reconciles_running_container(self):
+        self.engine.after_start = lambda _: (_ for _ in ()).throw(
+            DockerError("RUNTIME_UNAVAILABLE")
+        )
+        with self.lifecycle.prepare(self.profile, BINDING, OP) as operation:
+            created = operation.create_verified()
+            result = operation.start_verified(created)
+        self.assertTrue(result.running)
+        self.assertTrue(self.engine.created)
+        self.assertEqual(
+            sum(call[3:5] == ("container", "start") for call in self.engine.calls),
+            1,
+        )
+
+    def test_preexisting_ownership_mismatch_is_not_started_or_removed(self):
+        self.engine.created = True
+        self.engine.resource["Config"]["Labels"]["failroom.operation_id"] = "other"
+        self.engine.calls.clear()
+        with self.assertRaisesRegex(DockerError, "^OWNERSHIP_MISMATCH$"):
+            with self.lifecycle.prepare(self.profile, BINDING, OP) as operation:
+                operation.create_verified()
+        self.assertFalse(
+            any(
+                call[3:5] in (("container", "start"), ("container", "rm"))
+                for call in self.engine.calls
+            )
+        )
+
+    def test_recovery_after_create_response_loss_reuses_exact_owned_container(self):
+        self.engine.after_create = lambda _: (_ for _ in ()).throw(
+            DockerError("RUNTIME_UNAVAILABLE")
+        )
+        with self.assertRaises(DockerError):
+            with self.lifecycle.prepare(self.profile, BINDING, OP) as operation:
+                operation.create_verified()
+        self.engine.after_create = None
+        with self.lifecycle.prepare(self.profile, BINDING, OP) as operation:
+            self.assertEqual(operation.create_verified().container_id, CID)
+        self.assertEqual(
+            sum(call[3:5] == ("container", "create") for call in self.engine.calls),
+            1,
+        )
 
     def test_qualification_denial_has_zero_docker_calls(self):
         context = QualificationContext(

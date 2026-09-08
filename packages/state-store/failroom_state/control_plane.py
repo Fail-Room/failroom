@@ -21,6 +21,7 @@ from .common import (
     replay,
     request_hash,
     row_ref,
+    runtime_operation_id,
     service,
     timestamp,
 )
@@ -67,6 +68,13 @@ def _resource(connection: sqlite3.Connection, ref: ResourceRef) -> sqlite3.Row:
     if row is None or row_ref(row) != ref:
         raise StoreError("STALE_BINDING")
     return row
+
+
+def _runtime_binding(row: sqlite3.Row, *, allow_legacy: bool) -> str | None:
+    raw = row["runtime_operation_id"]
+    if raw is None and not allow_legacy:
+        raise StoreError("LEGACY_RUNTIME_BINDING")
+    return runtime_operation_id(raw, legacy=allow_legacy)
 
 
 def _stop(connection: sqlite3.Connection, row: sqlite3.Row, expired: bool) -> None:
@@ -128,11 +136,18 @@ class ControlPlaneStore:
                 "SELECT 1 FROM sandbox_resources WHERE sandbox_id=?", (ref.sandbox_id,)
             ).fetchone():
                 raise StoreError("RESOURCE_EXISTS")
+            runtime_id = _runtime_binding(attempt, allow_legacy=False)
             connection.execute(
                 """INSERT INTO sandbox_resources
-                (sandbox_id,attempt_id,generation,state,expires_at)
-                VALUES (?,?,?,'REQUESTED',?)""",
-                (ref.sandbox_id, ref.attempt_id, ref.generation, attempt["expires_at"]),
+                (sandbox_id,attempt_id,generation,state,expires_at,runtime_operation_id)
+                VALUES (?,?,?,'REQUESTED',?,?)""",
+                (
+                    ref.sandbox_id,
+                    ref.attempt_id,
+                    ref.generation,
+                    attempt["expires_at"],
+                    runtime_id,
+                ),
             )
             return finish(
                 connection, actor, "accept", key, fingerprint, ref, "REQUESTED", 0
@@ -154,6 +169,7 @@ class ControlPlaneStore:
                 str(row["state"]),
                 int(row["version"]),
                 row["container_id"],
+                row["runtime_operation_id"],
                 instant(int(row["expires_at"])),
                 bool(row["expiry_intent"]),
                 bool(row["destroy_intent"]),
@@ -295,7 +311,7 @@ class ControlPlaneStore:
                 connection.execute(
                     """INSERT INTO sandbox_resources
                     (sandbox_id,attempt_id,generation,state,expires_at,destroy_intent,
-                     expiry_intent) VALUES (?,?,?,'STOPPING',?,1,?)
+                     expiry_intent,runtime_operation_id) VALUES (?,?,?,'STOPPING',?,1,?,?)
                     ON CONFLICT(sandbox_id) DO NOTHING""",
                     (
                         ref.sandbox_id,
@@ -303,6 +319,7 @@ class ControlPlaneStore:
                         ref.generation,
                         attempt["expires_at"],
                         int(expired),
+                        _runtime_binding(attempt, allow_legacy=True),
                     ),
                 )
                 _stop(connection, _resource(connection, ref), expired)
