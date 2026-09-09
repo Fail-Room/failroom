@@ -10,6 +10,12 @@ from .orchestrator import (
     phase_key,
 )
 from .runtime_docker import DockerCleanupRuntime, DockerProvisioningRuntime
+from .terminal import (
+    ControlPlaneTerminalService,
+    TerminalError,
+    TerminalRuntime,
+    TerminalSession,
+)
 
 __all__ = (
     "ConfigurationError",
@@ -22,4 +28,8 @@ __all__ = (
     "ProvisioningRuntime",
     "ProvisioningSession",
     "phase_key",
+    "ControlPlaneTerminalService",
+    "TerminalError",
+    "TerminalRuntime",
+    "TerminalSession",
 )
