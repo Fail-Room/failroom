@@ -23,13 +23,7 @@ except ImportError:  # pragma: no cover - exercised by non-Linux interpreters
 _CONTAINER_ID = re.compile(r"^[a-f0-9]{64}$")
 _CONTEXT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _COMMAND = ("/bin/bash",)
-_SIGNALS = frozenset(
-    {
-        getattr(signal, "SIGHUP", signal.SIGINT),
-        signal.SIGINT,
-        signal.SIGTERM,
-    }
-)
+_SIGNALS = frozenset({int(signal.SIGINT)})
 
 
 class PtyError(RuntimeError):
@@ -181,16 +175,9 @@ class _SubprocessPtySession:
         self._ensure_active()
         if type(value) is not int or value not in _SIGNALS:
             raise PtyError("INVALID_REQUEST")
-        try:
-            os.killpg(  # type: ignore[attr-defined]
-                os.getpgid(self._process.pid),  # type: ignore[attr-defined]
-                value,
-            )
-        except ProcessLookupError:
-            return
-        except OSError:
-            self.close()
-            raise PtyError("PTY_UNAVAILABLE") from None
+        # Write the terminal interrupt byte so the remote PTY line discipline
+        # signals its foreground process group without killing docker exec.
+        self.write(b"\x03")
 
     def close(self) -> None:
         if self._closed:

@@ -71,6 +71,10 @@ Phase 1 vertical slice: production identity verification, browser terminal UI,
 multi-tenant deployment, and independent runtime attestation remain planned
 until trusted deployment evidence exists.
 
+The Linux PTY adapter currently accepts only signal value `2` (`SIGINT`/Ctrl+C)
+and delivers it through the remote PTY line discipline; other signal values are
+rejected without terminating the `docker exec` client.
+
 ## Operator migration
 
 The only CLI surface is the explicit `migrate` command. It requires absolute

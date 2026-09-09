@@ -124,7 +124,7 @@ Phase 1 may implement internal calls as in-process interfaces, but it must prese
 
 ## Terminal Session Contract
 
-The terminal is a real PTY attached to `/bin/bash` inside the sandbox. It supports stdin, combined PTY output from stdout and stderr, ANSI sequences, colors, shell history within the attempt, terminal resize, Ctrl+C and allowed signals, interactive programs, and long-running commands.
+The terminal is a real PTY attached to `/bin/bash` inside the sandbox. It supports stdin, combined PTY output from stdout and stderr, ANSI sequences, colors, shell history within the attempt, terminal resize, Ctrl+C (`SIGINT`), interactive programs, and long-running commands. The current signal contract permits only `SIGINT`; additional signal types require a separately reviewed PTY contract.
 
 The protocol distinguishes input bytes, output bytes, resize requests, permitted signal requests, readiness, closure, and errors. Resize dimensions, message size, output buffering, rate, and concurrent connection and session counts are bounded. Malformed or unauthorized control messages are rejected.
 

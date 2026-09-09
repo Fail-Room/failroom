@@ -132,11 +132,13 @@ docker --context <context> exec --interactive --tty <container_id> /bin/bash
 ```
 
 The session enforces explicit input, cumulative output, wall-clock session,
-terminal row/column, and signal bounds. `close()` is idempotent and terminates
-the process group. Non-Linux interpreters fail closed; the Windows unit suite
-does not claim Linux PTY or Docker isolation evidence. The primitive never
-exposes a host runtime socket, host shell, or host filesystem to the learner
-sandbox.
+terminal row/column, and signal bounds. The current signal contract permits
+only `SIGINT` (`Ctrl+C`) and writes the PTY interrupt byte so the remote
+foreground process is interrupted without killing the local `docker exec`
+client. `close()` is idempotent and terminates the process group. Non-Linux
+interpreters fail closed; the Windows unit suite does not claim Linux PTY or
+Docker isolation evidence. The primitive never exposes a host runtime socket,
+host shell, or host filesystem to the learner sandbox.
 
 ## Trust and integration boundary
 

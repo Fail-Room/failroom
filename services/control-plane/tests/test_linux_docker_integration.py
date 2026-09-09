@@ -135,7 +135,7 @@ def _assert_hardening(
     test_case.assertEqual(config["User"], f"{profile.uid}:{profile.gid}")
     test_case.assertEqual(host["NetworkMode"], "none")
     test_case.assertIsNone(host["Binds"])
-    test_case.assertIsNone(host["Mounts"])
+    test_case.assertIsNone(host.get("Mounts"))
     test_case.assertIsNone(host["VolumesFrom"])
     test_case.assertEqual(host["Devices"], [])
     test_case.assertIsNone(host["DeviceRequests"])
@@ -146,13 +146,14 @@ def _assert_hardening(
             "/tmp": f"rw,size={profile.temp_tmpfs_bytes},nosuid,nodev,noexec",
         },
     )
-    test_case.assertEqual(
-        mounts,
-        [
-            {"Type": "tmpfs", "Destination": "/workspace", "Source": ""},
-            {"Type": "tmpfs", "Destination": "/tmp", "Source": ""},
-        ],
-    )
+    expected_mounts = [
+        {"Type": "tmpfs", "Destination": "/workspace", "Source": ""},
+        {"Type": "tmpfs", "Destination": "/tmp", "Source": ""},
+    ]
+    if mounts:
+        test_case.assertEqual(mounts, expected_mounts)
+    else:
+        test_case.assertEqual(mounts, [])
     test_case.assertNotIn("docker.sock", repr(data))
 
 

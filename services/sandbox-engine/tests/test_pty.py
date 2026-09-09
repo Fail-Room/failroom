@@ -1,7 +1,15 @@
+import os
+import select
+import signal
 import sys
 import unittest
 
-from failroom_sandbox.pty import DockerPtyRuntime, PtyError, PtyLimits
+from failroom_sandbox.pty import (
+    DockerPtyRuntime,
+    PtyError,
+    PtyLimits,
+    _SubprocessPtySession,
+)
 
 
 class PtyRuntimeTests(unittest.TestCase):
@@ -41,6 +49,56 @@ class PtyRuntimeTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.code, "INVALID_CONFIGURATION")
+
+    @unittest.skipUnless(sys.platform == "linux", "UNVERIFIED: Linux PTY required")
+    def test_sigint_writes_ctrl_c_without_killing_docker_exec_client(self):
+        read_fd, write_fd = os.pipe()
+
+        class Process:
+            pid = 99_999_999
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                return None
+
+        session = _SubprocessPtySession(write_fd, Process(), self.limits())
+        try:
+            session.signal(int(signal.SIGINT))
+            ready, _, _ = select.select([read_fd], [], [], 0.1)
+            self.assertEqual(os.read(read_fd, 1) if ready else b"", b"\x03")
+        finally:
+            session.close()
+            os.close(read_fd)
+
+    @unittest.skipUnless(sys.platform == "linux", "UNVERIFIED: Linux PTY required")
+    def test_non_interrupt_signals_are_rejected_without_killing_session(self):
+        read_fd, write_fd = os.pipe()
+
+        class Process:
+            pid = 99_999_999
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                return None
+
+        session = _SubprocessPtySession(write_fd, Process(), self.limits())
+        try:
+            with self.assertRaises(PtyError) as raised:
+                session.signal(int(signal.SIGTERM))
+            self.assertEqual(raised.exception.code, "INVALID_REQUEST")
+        finally:
+            session.close()
+            os.close(read_fd)
 
     @unittest.skipUnless(sys.platform == "linux", "UNVERIFIED: Linux PTY required")
     def test_linux_open_uses_exact_docker_exec_argv(self):

@@ -1,6 +1,7 @@
 """Operator diagnostic lifecycle only; this module never admits learner Rooms."""
 
 import hashlib
+import json
 import re
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
@@ -50,6 +51,38 @@ def _empty(value: object) -> bool:
     return value is None or value == {} or value == []
 
 
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError
+        value[key] = item
+    return value
+
+
+def _json_document(raw: bytes | str) -> object:
+    return json.loads(
+        raw,
+        object_pairs_hook=_unique_json_object,
+        parse_constant=lambda _: (_ for _ in ()).throw(ValueError()),
+    )
+
+
+def _seccomp_option_matches(option: str, pinned_path: str) -> bool:
+    if option == "seccomp=" + pinned_path:
+        return True
+    prefix = "seccomp="
+    if not option.startswith(prefix):
+        return False
+    try:
+        with open(pinned_path, "rb") as policy_file:
+            expected = _json_document(policy_file.read())
+        observed = _json_document(option.removeprefix(prefix))
+    except (OSError, ValueError, UnicodeError, RecursionError):
+        return False
+    return type(expected) is dict and type(observed) is dict and observed == expected
+
+
 def _labels(binding: DockerBinding) -> dict[str, str]:
     # Revalidate a trusted input before constructing Docker selectors.
     DockerBinding(binding.attempt_id, binding.sandbox_id, binding.generation)
@@ -91,9 +124,13 @@ def _cleanable_mounts(data: dict[str, object]) -> set[str]:
     config, host = _object(data.get("Config")), _object(data.get("HostConfig"))
     if "Volumes" not in config or not _empty(config["Volumes"]):
         raise DockerError("CLEANUP_INCOMPLETE")
-    for key in ("Binds", "Mounts", "VolumesFrom"):
+    for key in ("Binds", "VolumesFrom"):
         if key not in host or not _empty(host[key]):
             raise DockerError("CLEANUP_INCOMPLETE")
+    # Docker Desktop omits the nullable HostConfig.Mounts field when it is
+    # empty; a present non-empty value remains forbidden.
+    if "Mounts" in host and not _empty(host["Mounts"]):
+        raise DockerError("CLEANUP_INCOMPLETE")
     mounts = data.get("Mounts")
     if type(mounts) is not list:
         raise DockerError("CLEANUP_INCOMPLETE")
@@ -109,6 +146,17 @@ def _cleanable_mounts(data: dict[str, object]) -> set[str]:
         ):
             raise DockerError("CLEANUP_INCOMPLETE")
         destinations.add(str(dest))
+    if not destinations:
+        # Docker Desktop omits tmpfs entries from the top-level Mounts list.
+        # HostConfig.Tmpfs remains the authoritative daemon response for these
+        # anonymous in-memory mounts when no host-backed mount fields are set.
+        tmpfs = host.get("Tmpfs")
+        if (
+            type(tmpfs) is dict
+            and set(tmpfs) == {"/workspace", "/tmp"}
+            and all(type(value) is str for value in tmpfs.values())
+        ):
+            destinations = set(tmpfs)
     return destinations
 
 
@@ -188,12 +236,16 @@ def _verify_profile(
     ]:
         raise DockerError("PROFILE_UNVERIFIED")
     options = host.get("SecurityOpt")
-    expected_options = {"no-new-privileges", "seccomp=" + pinned_seccomp_path}
     if (
         type(options) is not list
         or len(options) != 2
         or any(type(option) is not str for option in options)
-        or set(options) != expected_options
+        or options.count("no-new-privileges") != 1
+        or len([option for option in options if option != "no-new-privileges"]) != 1
+        or not _seccomp_option_matches(
+            next(option for option in options if option != "no-new-privileges"),
+            pinned_seccomp_path,
+        )
     ):
         raise DockerError("PROFILE_UNVERIFIED")
 
@@ -202,15 +254,14 @@ def _verified_image(cli: DockerCli, profile: StrictDockerProfile) -> dict[str, o
     image = cli.inspect_image(profile.image)
     image_config = _object(image.get("Config"))
     digests = image.get("RepoDigests")
+    volumes = image_config.get("Volumes")
     if (
         image.get("Os") != "linux"
         or type(image.get("Id")) is not str
         or re.fullmatch(r"sha256:[a-f0-9]{64}", str(image["Id"])) is None
         or type(digests) is not list
         or profile.image not in digests
-        or "Volumes" not in image_config
-        or not _empty(image_config["Volumes"])
-        or image_config["Volumes"] == []
+        or ("Volumes" in image_config and (not _empty(volumes) or volumes == []))
         or "Env" not in image_config
     ):
         raise DockerError("IMAGE_UNVERIFIED")

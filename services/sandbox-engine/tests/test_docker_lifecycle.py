@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import tempfile
 import unittest
 from contextlib import contextmanager
 from dataclasses import replace
@@ -190,16 +191,71 @@ class DockerLifecycleTests(unittest.TestCase):
             sum(call[3:5] == ("container", "create") for call in self.engine.calls), 1
         )
 
-    def test_declared_image_volume_or_missing_metadata_denies_without_create(self):
+    def test_declared_image_volume_or_malformed_metadata_denies_without_create(self):
         for value in ({"/data": {}}, [], "bad"):
             with self.subTest(value=value):
                 self.engine.image["Config"]["Volumes"] = value
                 with self.assertRaises(DockerError):
                     self.create()
                 self.assertFalse(self.engine.created)
+
+    def test_missing_image_volume_metadata_is_treated_as_no_declared_volume(self):
         del self.engine.image["Config"]["Volumes"]
-        with self.assertRaises(DockerError):
-            self.create()
+        result = self.create()
+        self.assertEqual(result.container_id, CID)
+        self.assertTrue(result.running)
+
+    def test_explicit_null_image_volume_metadata_is_treated_as_no_declared_volume(self):
+        self.engine.image["Config"]["Volumes"] = None
+        result = self.create()
+        self.assertEqual(result.container_id, CID)
+        self.assertTrue(result.running)
+
+    def test_explicit_empty_image_volume_metadata_is_treated_as_no_declared_volume(
+        self,
+    ):
+        self.engine.image["Config"]["Volumes"] = {}
+        result = self.create()
+        self.assertEqual(result.container_id, CID)
+        self.assertTrue(result.running)
+
+    def test_docker_desktop_may_omit_tmpfs_entries_from_mounts(self):
+        self.engine.resource["Mounts"] = []
+        del self.engine.resource["HostConfig"]["Mounts"]
+        result = self.create()
+        self.assertEqual(result.container_id, CID)
+        self.assertTrue(result.running)
+
+    def test_docker_desktop_omitted_tmpfs_entries_are_cleanup_safe(self):
+        self.engine.resource["Mounts"] = []
+        del self.engine.resource["HostConfig"]["Mounts"]
+        self.create()
+        result = self.lifecycle.destroy(BINDING, CID, operation_id=OP)
+        self.assertRegex(result, r"^sha256:[0-9a-f]{64}$")
+
+    def test_docker_desktop_inline_seccomp_matches_pinned_policy(self):
+        with tempfile.NamedTemporaryFile("wb") as policy_file:
+            policy_file.write(self.seccomp_policy.encode("utf-8"))
+            policy_file.flush()
+            self.policy.path = policy_file.name
+            self.engine.resource["HostConfig"]["SecurityOpt"][1] = (
+                "seccomp="
+                + json.dumps(json.loads(self.seccomp_policy), separators=(",", ":"))
+            )
+            result = self.create()
+        self.assertEqual(result.container_id, CID)
+        self.assertTrue(result.running)
+
+    def test_docker_desktop_inline_seccomp_drift_is_rejected(self):
+        with tempfile.NamedTemporaryFile("wb") as policy_file:
+            policy_file.write(self.seccomp_policy.encode("utf-8"))
+            policy_file.flush()
+            self.policy.path = policy_file.name
+            self.engine.resource["HostConfig"]["SecurityOpt"][1] = (
+                'seccomp={"defaultAction":"SCMP_ACT_ALLOW"}'
+            )
+            with self.assertRaises(DockerError):
+                self.create()
 
     def test_wrong_image_digest_os_or_env_denies(self):
         for field, value in (("RepoDigests", []), ("Id", "short"), ("Os", "windows")):
