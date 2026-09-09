@@ -16,6 +16,7 @@ from .terminal import (
     TerminalRuntime,
     TerminalSession,
 )
+from .websocket import TerminalGatewayProtocol, WebSocketLimits, serve_terminal
 
 __all__ = (
     "ConfigurationError",
@@ -32,4 +33,7 @@ __all__ = (
     "TerminalError",
     "TerminalRuntime",
     "TerminalSession",
+    "TerminalGatewayProtocol",
+    "WebSocketLimits",
+    "serve_terminal",
 )

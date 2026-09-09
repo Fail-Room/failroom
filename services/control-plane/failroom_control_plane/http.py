@@ -12,6 +12,13 @@ from failroom_api import (
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from .terminal import ControlPlaneTerminalService
+from .websocket import (
+    TerminalGatewayProtocol,
+    WebSocketLimits,
+    mount_terminal_route,
+)
+
 _AUTHORITY_STATUS = {
     "ATTEMPT_UNAVAILABLE": 409,
     "NOT_AUTHORIZED": 403,
@@ -29,6 +36,9 @@ def create_app(
     authority: BackendCapabilityAuthority,
     verifier: IdentityVerifier,
     now: Callable[[], datetime],
+    gateway: TerminalGatewayProtocol | None = None,
+    terminal: ControlPlaneTerminalService | None = None,
+    terminal_limits: WebSocketLimits | None = None,
 ) -> FastAPI:
     """Build an API app with all trust dependencies supplied by the caller."""
 
@@ -56,6 +66,17 @@ def create_app(
                 "capability": issued.token,
                 "expires_at": issued.expires_at.isoformat(),
             },
+        )
+
+    if any(value is not None for value in (gateway, terminal, terminal_limits)):
+        if gateway is None or terminal is None or terminal_limits is None:
+            raise ValueError("terminal dependencies must be configured together")
+        mount_terminal_route(
+            app,
+            gateway=gateway,
+            terminal=terminal,
+            limits=terminal_limits,
+            now=now,
         )
 
     return app
