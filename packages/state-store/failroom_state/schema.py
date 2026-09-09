@@ -1,10 +1,11 @@
-"""Version 2. No destructive or implicit migration is supported."""
+"""Version 3. No destructive or implicit migration is supported."""
 
 APPLICATION_ID = 0x4641494C
 LEGACY_VERSION = 1
-VERSION = 2
+PREVIOUS_VERSION = 2
+VERSION = 3
 
-STATEMENTS = (
+_BASE_STATEMENTS = (
     """CREATE TABLE room_attempts (
         attempt_id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,
@@ -94,22 +95,49 @@ STATEMENTS = (
         BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_OWNER'); END""",
 )
 
+_ATTACHMENT_STATEMENTS = (
+    """CREATE TABLE terminal_attachment_leases (
+        lease_id TEXT PRIMARY KEY CHECK(length(lease_id) = 32),
+        jti_hash TEXT NOT NULL UNIQUE
+            REFERENCES terminal_capability_uses(jti_hash),
+        actor TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        request_hash TEXT NOT NULL CHECK(length(request_hash) = 64),
+        attempt_id TEXT NOT NULL REFERENCES room_attempts(attempt_id),
+        sandbox_id TEXT NOT NULL REFERENCES sandbox_resources(sandbox_id),
+        generation INTEGER NOT NULL CHECK(generation > 0),
+        session_epoch INTEGER NOT NULL CHECK(session_epoch >= 0),
+        gateway_session_hash TEXT NOT NULL
+            CHECK(length(gateway_session_hash) = 64),
+        issued_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL CHECK(expires_at > issued_at),
+        consumed_at INTEGER NOT NULL
+            CHECK(consumed_at >= issued_at AND consumed_at <= expires_at),
+        UNIQUE(actor, idempotency_key),
+        UNIQUE(gateway_session_hash)
+    ) STRICT""",
+    "CREATE INDEX attachment_leases_expiry ON terminal_attachment_leases(expires_at)",
+)
+
+V2_STATEMENTS = _BASE_STATEMENTS
+STATEMENTS = V2_STATEMENTS + _ATTACHMENT_STATEMENTS
+
 V1_STATEMENTS = tuple(
     statement.replace("        runtime_operation_id TEXT,\n", "").replace(
         "              OR NEW.runtime_operation_id IS NOT OLD.runtime_operation_id\n",
         "",
     )
-    for statement in STATEMENTS
+    for statement in V2_STATEMENTS
 )
 
 V2_ROOM_ATTEMPTS_IMMUTABLE_TRIGGER = next(
     statement
-    for statement in STATEMENTS
+    for statement in V2_STATEMENTS
     if statement.startswith("CREATE TRIGGER room_attempts_immutable")
 )
 V2_SANDBOX_RESOURCES_IMMUTABLE_TRIGGER = next(
     statement
-    for statement in STATEMENTS
+    for statement in V2_STATEMENTS
     if statement.startswith("CREATE TRIGGER sandbox_resources_immutable")
 )
 MIGRATE_V1_TO_V2 = (
@@ -120,3 +148,4 @@ MIGRATE_V1_TO_V2 = (
     V2_ROOM_ATTEMPTS_IMMUTABLE_TRIGGER,
     V2_SANDBOX_RESOURCES_IMMUTABLE_TRIGGER,
 )
+MIGRATE_V2_TO_V3 = _ATTACHMENT_STATEMENTS

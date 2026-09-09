@@ -11,6 +11,7 @@ from .common import (
     cas,
     finish,
     identifier,
+    instant,
     owned,
     positive,
     read_clock,
@@ -27,6 +28,7 @@ from .models import (
     Action,
     Attempt,
     CapabilityClaims,
+    CapabilityUse,
     Clock,
     Receipt,
     ResourceRef,
@@ -263,7 +265,7 @@ class BackendStore:
 
     def consume(
         self, identity: ServiceIdentity, claims: CapabilityClaims, *, now: Clock
-    ) -> None:
+    ) -> CapabilityUse:
         service(identity, Role.GATEWAY, Action.CONSUME)
         if type(claims) is not CapabilityClaims:
             raise StoreError("INVALID_REQUEST")
@@ -310,4 +312,10 @@ class BackendStore:
                 """INSERT INTO terminal_capability_uses
                 (jti_hash,attempt_id,consumed_at,expires_at) VALUES (?,?,?,?)""",
                 (hashed_jti, claims.ref.attempt_id, clock, deadline),
+            )
+            return CapabilityUse(
+                hashed_jti,
+                claims.ref,
+                claims.session_epoch,
+                instant(deadline),
             )

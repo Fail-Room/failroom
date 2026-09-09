@@ -1,0 +1,31 @@
+[project]
+name = "failroom-api"
+version = "0.1.0"
+description = "Trusted capability contract primitives for Failroom"
+requires-python = ">=3.12,<3.13"
+dependencies = ["failroom-state-store"]
+
+[dependency-groups]
+dev = [
+  "mypy==1.17.1",
+  "ruff==0.12.9",
+]
+
+[tool.uv.sources]
+failroom-state-store = { path = "../../packages/state-store" }
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = ["../../packages/state-store"]
+files = ["failroom_api"]

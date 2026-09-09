@@ -2,7 +2,7 @@
 
 ## Status and Scope
 
-This document is the planned lifecycle, terminal, isolation, and cleanup contract for Failroom sandboxes. Phase 1 now implements internal qualification, verified diagnostic Docker profile/lifecycle checks, authoritative persistence, a trusted in-process control-plane composition, explicit v1-to-v2 migration and an injected cleanup pass. It has not proved a learner terminal slice with browser authentication, one-time capability verification, attachment leasing, independent TTL scheduling, or full runtime isolation. The opt-in Linux Docker evidence remains UNVERIFIED in the current Windows environment. Phase 2 will generalize the lifecycle into reset, multiple concurrent sandboxes, the complete reusable state machine and transition/race matrices, and broader reconciliation.
+This document is the planned lifecycle, terminal, isolation, and cleanup contract for Failroom sandboxes. Phase 1 now implements internal qualification, verified diagnostic Docker profile/lifecycle checks, authoritative persistence, a trusted in-process control-plane composition, explicit v1-to-v2 and v2-to-v3 migrations, a bounded signed capability codec and an atomic attachment-lease contract. It has not proved a learner terminal slice with browser authentication endpoints, gateway transport, PTY attachment, independent TTL scheduling, or full runtime isolation. The opt-in Linux Docker evidence remains UNVERIFIED in the current Windows environment. Phase 2 will generalize the lifecycle into reset, multiple concurrent sandboxes, the complete reusable state machine and transition/race matrices, and broader reconciliation.
 
 A sandbox is an internal disposable runtime resource for one Room attempt. It is not a product identity, an authorization credential, or a durable user environment.
 
@@ -14,11 +14,11 @@ The qualification module is a pure evidence evaluator and raising guard. The sam
 
 ## Implemented Persistence Prerequisite
 
-The [state store](../packages/state-store/README.md) implements the Phase 1 database boundary: backend-preallocated tuple and immutable deadline, separate attempt/resource writers, ownership and service role/scope checks, resource state/version compare-and-set, actor-key/request-fingerprint idempotency, consumed-jti hashing, session revocation and durable cleanup intent. It does not execute lifecycle side effects or authenticate a transport.
+The [state store](../packages/state-store/README.md) implements the Phase 1 database boundary: backend-preallocated tuple and immutable deadline, separate attempt/resource writers, ownership and service role/scope checks, resource state/version compare-and-set, actor-key/request-fingerprint idempotency, consumed-jti hashing, session revocation, atomic consumed attachment leases and durable cleanup intent. It does not execute lifecycle side effects or authenticate a transport.
 
 Expiry is evaluated with a trusted clock after obtaining the database writer lock. Backend expiry/leave updates only attempt authority; control-plane transition and reconciliation update only resource authority. An expiry denial commits cleanup intent in the owner's existing record; a denied first resource acceptance leaves the reserved attempt/deadline for expiry and reconciliation. A `FAILED` transition stores a fixed failure code and permits cleanup only. Cleanup retry time/count and stable operation identity survive restart. Resource `DESTROYED` requires a trusted evidence reference, and backend completion independently checks that record. `pending_finalizations()` recovers a restart between these two commits.
 
-The supported resource transition matrix is tested as stored observations. `DockerCleanupWorker` can execute one injected verifier pass only after rechecking the exact tuple, version, `STOPPING` state and destroy intent; the trusted control-plane Docker adapter supplies exact binding and absence verification before it records `DESTROYED`, then backend finalization runs independently. Reset and new-generation retry are not implemented: Phase 1 tuples are immutable for an attempt. No passing database or Windows test proves learner Docker creation, PTY behavior, final attachment leasing, or an independent TTL deadline. These remain required runtime integration work.
+The supported resource transition matrix is tested as stored observations. `DockerCleanupWorker` can execute one injected verifier pass only after rechecking the exact tuple, version, `STOPPING` state and destroy intent; the trusted control-plane Docker adapter supplies exact binding and absence verification before it records `DESTROYED`, then backend finalization runs independently. Reset and new-generation retry are not implemented: Phase 1 tuples are immutable for an attempt. No passing database or Windows test proves learner Docker creation, gateway transport, PTY behavior, or an independent TTL deadline. The lease contract is tested as a trusted state boundary, but runtime attachment remains required integration work.
 
 ## Responsibilities
 
@@ -107,7 +107,7 @@ The conceptual browser-facing gateway endpoint is separate from those service-au
 WS /sandboxes/{sandbox_id}/terminal
 ```
 
-It is authenticated by a short-lived signed, single-use terminal capability containing unique `jti`, `user_id`, `attempt_id`, `sandbox_id`, `generation`, `session_epoch`, `expiry`, and `scope`. The gateway validates signature, expiry, and scope locally, then calls the authenticated verify-and-consume contract. The exact public route and WebSocket transport framing remain Phase 1 decisions.
+The API contract package can issue and verify a bounded HMAC terminal capability containing unique `jti`, `user_id`, `attempt_id`, `sandbox_id`, `generation`, `session_epoch`, `expiry`, and `scope`. The future gateway must validate signature, expiry, and scope locally, then call the authenticated verify-and-consume contract; no HTTP issuer or gateway transport exists yet. The exact public route and WebSocket transport framing remain Phase 1 decisions.
 
 The backend owns the learner-facing status and reset facades. Their exact public routes may change, but their conceptual contracts are:
 

@@ -163,6 +163,78 @@ class MigrationTests(unittest.TestCase):
                 },
             )
 
+    def test_explicit_v2_to_v3_migration_adds_lease_table_and_backup(self):
+        self.create_v1_database(self.path)
+        database = Database(self.path, busy_timeout_ms=5000)
+        database.migrate_v1_to_v2(self.backup)
+        v3_backup = Path(self.temp.name) / "state-before-v3.sqlite3"
+
+        with closing(sqlite3.connect(self.path)) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertNotIn(
+                "terminal_attachment_leases",
+                {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                },
+            )
+
+        database.migrate_v2_to_v3(v3_backup)
+        database.initialize()
+        with closing(sqlite3.connect(self.path)) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertIsNotNone(
+                connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='terminal_attachment_leases'"
+                ).fetchone()
+            )
+        with closing(sqlite3.connect(v3_backup)) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='terminal_attachment_leases'"
+                ).fetchone()
+            )
+
+    def test_v2_to_v3_migration_rejects_existing_or_relative_backup(self):
+        self.create_v1_database(self.path)
+        database = Database(self.path, busy_timeout_ms=5000)
+        database.migrate_v1_to_v2(self.backup)
+        v3_backup = Path(self.temp.name) / "state-before-v3.sqlite3"
+        v3_backup.touch()
+
+        self.assert_store_error(
+            "INVALID_CONFIGURATION",
+            lambda: database.migrate_v2_to_v3(v3_backup),
+        )
+        self.assert_store_error(
+            "INVALID_CONFIGURATION",
+            lambda: database.migrate_v2_to_v3(Path("relative-v3.sqlite3")),
+        )
+
+        with closing(sqlite3.connect(self.path)) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+
+    def test_v2_to_v3_migration_rejects_tampered_v2_without_mutation(self):
+        self.create_v1_database(self.path)
+        database = Database(self.path, busy_timeout_ms=5000)
+        database.migrate_v1_to_v2(self.backup)
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute("ALTER TABLE room_attempts ADD COLUMN unexpected TEXT")
+
+        v3_backup = Path(self.temp.name) / "state-before-v3.sqlite3"
+        self.assert_store_error(
+            "UNSUPPORTED_SCHEMA",
+            lambda: database.migrate_v2_to_v3(v3_backup),
+        )
+        self.assertFalse(v3_backup.exists())
+        with closing(sqlite3.connect(self.path)) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+
     def test_migration_rolls_back_after_a_migration_statement_failure(self):
         self.create_v1_database(self.path)
         database = Database(self.path, busy_timeout_ms=5000)

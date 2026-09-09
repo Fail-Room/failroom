@@ -63,6 +63,16 @@ failroom-control-plane migrate \
   --busy-timeout-ms 5000
 ```
 
+
+기본 대상 버전은 `2`이며 v1 데이터베이스를 v2로 올린다. v3 lease 스키마로
+올릴 때는 v2 데이터베이스와 새 백업 경로를 지정하고 `--target-version 3`을
+명시한다. 마이그레이션은 기존 파일을 덮어쓰지 않고 새 절대 백업 경로에
+SQLite 백업을 먼저 만든 뒤 원본의 무결성과 스키마를 검증한다.
+
+```text
+failroom-control-plane migrate --database /var/lib/failroom/state.sqlite3 --backup /var/lib/failroom/state-before-v3.sqlite3 --target-version 3 --busy-timeout-ms 5000
+```
+
 ## Linux Docker integration evidence
 
 The real Docker lifecycle evidence test is opt-in and requires a trusted Linux

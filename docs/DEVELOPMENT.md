@@ -2,7 +2,7 @@
 
 ## Current Repository State
 
-Phase 0 established the product and engineering contracts. Phase 1 now includes profile qualification and a verified diagnostic Docker lifecycle in services/sandbox-engine/, SQLite repositories and an injected cleanup pass in packages/state-store/, and the trusted in-process control-plane composition in services/control-plane/, each with tests and a Python development manifest/lockfile. There is no runnable web/API application, learner terminal, authentication flow, deployment, or production service. No persistent service database is created by installing or testing these modules.
+Phase 0 established the product and engineering contracts. Phase 1 now includes profile qualification and a verified diagnostic Docker lifecycle in services/sandbox-engine/, SQLite repositories and an injected cleanup pass in packages/state-store/, the trusted in-process control-plane composition in services/control-plane/, and the bounded capability plus attachment-lease contract in services/api/ and state-store/, each with tests and a Python development manifest/lockfile. There is no runnable web/API application, learner terminal, authentication flow, deployment, or production service. No persistent service database is created by installing or testing these modules.
 
 Next.js, xterm.js, and FastAPI are the planned architecture choices. Phase 1 will select and lock their concrete versions, manifests, dependency tooling, and integration layout. Application setup commands will be documented only after those artifacts exist and are verified.
 
@@ -42,6 +42,17 @@ Commands:
 - uv run --locked ruff check .
 - uv run --locked ruff format --check .
 - uv run --locked mypy failroom_control_plane
+
+The API contract package uses Python 3.12.13 and has no HTTP listener. From services/api/, run:
+
+Commands:
+- uv sync --locked
+- uv run --locked python -m unittest discover -s tests -v
+- uv run --locked ruff check .
+- uv run --locked ruff format --check .
+- uv run --locked mypy failroom_api
+
+This package only issues and verifies bounded HMAC capability claims. The state-store v2-to-v3 migration must be run explicitly with a new absolute backup path before attachment leases are available.
 
 ## Delivery Principles
 
@@ -125,7 +136,7 @@ Sandbox-related changes must explicitly cover backend-preallocated identity, aut
 
 ## Local Validation
 
-Use the module checks above for the implemented qualification gate, diagnostic adapter, state worker and control-plane composition. The opt-in Docker integration tests must be run only from a trusted Linux control-plane host after explicit operator inputs are configured; Windows skips remain UNVERIFIED. Application integration and browser-to-PTY checks become available with their respective runtime components. Documentation-only changes should at minimum:
+Use the module checks above for the implemented qualification gate, diagnostic adapter, state worker, control-plane composition and capability/lease contract. The opt-in Docker integration tests must be run only from a trusted Linux control-plane host after explicit operator inputs are configured; Windows skips remain UNVERIFIED. Application integration and browser-to-PTY checks become available with their respective runtime components. Documentation-only changes should at minimum:
 
 1. Confirm every referenced local Markdown link resolves.
 2. Check headings, terminology, planned-status wording, and final newlines.
