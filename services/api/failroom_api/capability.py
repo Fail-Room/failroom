@@ -131,6 +131,10 @@ class CapabilityCodec:
         self._secret = secret
         self._max_lifetime = lifetime
 
+    @property
+    def max_lifetime(self) -> timedelta:
+        return timedelta(microseconds=self._max_lifetime)
+
     def issue(self, claims: CapabilityClaims, *, now: Clock) -> str:
         _validate_claims(claims)
         clock = _clock(now)

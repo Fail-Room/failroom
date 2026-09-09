@@ -3,6 +3,8 @@
 ## Current Repository State
 
 Phase 0 established the product and engineering contracts. Phase 1 now includes profile qualification and a verified diagnostic Docker lifecycle in services/sandbox-engine/, SQLite repositories and an injected cleanup pass in packages/state-store/, the trusted in-process control-plane composition in services/control-plane/, and the bounded capability plus attachment-lease contract in services/api/ and state-store/, each with tests and a Python development manifest/lockfile. There is no runnable web/API application, learner terminal, authentication flow, deployment, or production service. No persistent service database is created by installing or testing these modules.
+The backend capability authority facade is implemented as an in-process contract:
+it issues only for attachable owned attempts and introspects through atomic state-store consumption. HTTP authentication and gateway transport remain future integration work.
 
 Next.js, xterm.js, and FastAPI are the planned architecture choices. Phase 1 will select and lock their concrete versions, manifests, dependency tooling, and integration layout. Application setup commands will be documented only after those artifacts exist and are verified.
 

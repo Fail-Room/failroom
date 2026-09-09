@@ -30,6 +30,20 @@ Those checks, key custody, HTTP issuance and gateway transport remain planned.
 Never put the key, raw capability or decoded claims in a learner sandbox, URL, log,
 metric label or terminal output.
 
+## Backend authority facade
+
+`BackendCapabilityAuthority` composes an already authenticated `UserIdentity`,
+the owner-filtered state store and `CapabilityCodec`. `issue()` only emits a
+capability for the current attempt when its active sandbox is `READY` or
+`RUNNING`, its session epoch and immutable deadline are current, and no expiry
+or destroy intent exists. `introspect_and_consume()` verifies the token and
+delegates atomic `jti` consumption to the gateway-scoped backend contract.
+
+The facade returns fixed `AuthorityError` codes and never logs or persists the
+raw capability. Browser-provided identity objects, HTTP listeners, service
+authentication middleware and WebSocket/PTY transport remain outside this
+package.
+
 ## Checks
 
 From this directory:
