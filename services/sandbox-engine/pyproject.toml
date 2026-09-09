@@ -3,13 +3,17 @@ name = "failroom-sandbox-engine"
 version = "0.1.0"
 description = "Internal sandbox control-plane primitives for Failroom"
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = ["failroom-api", "failroom-state-store"]
 
 [dependency-groups]
 dev = [
   "mypy==1.17.1",
   "ruff==0.12.9",
 ]
+
+[tool.uv.sources]
+failroom-api = { path = "../api" }
+failroom-state-store = { path = "../../packages/state-store" }
 
 [tool.uv]
 package = false
@@ -24,4 +28,5 @@ select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
+mypy_path = ["../api", "../../packages/state-store"]
 files = ["failroom_sandbox"]

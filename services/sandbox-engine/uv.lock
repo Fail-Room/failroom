@@ -3,15 +3,53 @@ revision = 3
 requires-python = "==3.12.*"
 
 [[package]]
+name = "failroom-api"
+version = "0.1.0"
+source = { virtual = "../api" }
+dependencies = [
+    { name = "failroom-state-store" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "failroom-state-store", virtual = "../../packages/state-store" }]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "mypy", specifier = "==1.17.1" },
+    { name = "ruff", specifier = "==0.12.9" },
+]
+
+[[package]]
 name = "failroom-sandbox-engine"
 version = "0.1.0"
 source = { virtual = "." }
+dependencies = [
+    { name = "failroom-api" },
+    { name = "failroom-state-store" },
+]
 
 [package.dev-dependencies]
 dev = [
     { name = "mypy" },
     { name = "ruff" },
 ]
+
+[package.metadata]
+requires-dist = [
+    { name = "failroom-api", virtual = "../api" },
+    { name = "failroom-state-store", virtual = "../../packages/state-store" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "mypy", specifier = "==1.17.1" },
+    { name = "ruff", specifier = "==0.12.9" },
+]
+
+[[package]]
+name = "failroom-state-store"
+version = "0.1.0"
+source = { virtual = "../../packages/state-store" }
 
 [package.metadata]
 
