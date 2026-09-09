@@ -132,9 +132,10 @@ class StoreTests(unittest.TestCase):
                     "sandbox_resources",
                     "terminal_capability_uses",
                     "lifecycle_operations",
+                    "terminal_attachment_leases",
                 },
             )
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
             self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
 
     def test_preallocation_and_owner_filtered_inspect(self):

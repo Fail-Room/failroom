@@ -34,7 +34,7 @@ The intended terminal path is:
 
 `Browser → xterm.js → authorized WebSocket → terminal gateway → PTY → isolated Linux sandbox`
 
-The planned architecture uses Next.js with xterm.js for the browser interface and FastAPI for backend authorization and control. It separates those layers from the terminal gateway, trusted sandbox control plane, untrusted user sandbox, and Room scenario definitions. Internal profile qualification, a diagnostic-only Docker adapter, and SQLite state modules are implemented; learner runtime components are not connected.
+The planned architecture uses Next.js with xterm.js for the browser interface and FastAPI for backend authorization and control. It separates those layers from the terminal gateway, trusted sandbox control plane, untrusted user sandbox, and Room scenario definitions. Internal profile qualification, the verified diagnostic Docker lifecycle, the trusted in-process control-plane composition, the bounded signed capability codec, the consumed attachment-lease contract, and SQLite state modules are implemented. The control plane enforces explicit configuration, state-before-runtime ordering, persisted runtime bindings, operator-only migration, and evidence-gated cleanup for the diagnostic slice; no HTTP authentication or learner runtime is connected.
 
 ## Security Boundary
 
@@ -44,7 +44,7 @@ As a product design objective, failures should have real consequences inside a R
 
 ## Current Development Status
 
-Phase 0 established documentation and repository rules. Phase 1 includes a tested profile qualification gate, a diagnostic-only Docker lifecycle adapter, and a transactional SQLite state store for ownership, lifecycle records, single-use identifier consumption, durable cleanup intent and injected cleanup passes. The diagnostic adapter does not authorize or create learner Rooms. There is still no runnable web application, real learner terminal, authentication flow, or deployment.
+Phase 0 established documentation and repository rules. Phase 1 now includes a tested profile qualification gate, a verified diagnostic Docker lifecycle, a transactional SQLite state store, a trusted in-process control-plane composition, a bounded capability codec, and an atomic attachment-lease contract with explicit v2-to-v3 migration. These are internal contracts, not a public HTTP API or learner allocator. Real Docker integration remains opt-in and UNVERIFIED in the current Windows environment; there is still no runnable web application, learner terminal, authentication endpoint, or deployment.
 
 ## Roadmap
 
@@ -64,7 +64,7 @@ Phase 0 established documentation and repository rules. Phase 1 includes a teste
 
 ## Local Development
 
-The [sandbox engine](services/sandbox-engine/README.md) and [state store](packages/state-store/README.md) are Python 3.12 modules with no runtime dependencies and reproducible test, lint, format, and type checks. The Docker diagnostic adapter is opt-in and requires a trusted Linux control-plane host with explicit operator profile inputs. Web, API, learner runtime and terminal setup remain planned.
+The [sandbox engine](services/sandbox-engine/README.md), [state store](packages/state-store/README.md), [control plane](services/control-plane/README.md), and [API contract package](services/api/README.md) are Python 3.12 modules with reproducible test, lint, format, and type checks. Docker and control-plane integration are opt-in and require a trusted Linux host with explicit operator inputs. Web, HTTP API, learner runtime and terminal setup remain planned.
 
 ## Contributing
 

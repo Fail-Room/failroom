@@ -35,6 +35,7 @@ def _parser() -> argparse.ArgumentParser:
     migrate.add_argument("--database", required=True)
     migrate.add_argument("--backup", required=True)
     migrate.add_argument("--busy-timeout-ms", required=True, type=int)
+    migrate.add_argument("--target-version", choices=("2", "3"), default="2")
     return parser
 
 
@@ -52,7 +53,10 @@ def main(
         if args.command != "migrate":
             raise ValueError("INVALID_CONFIGURATION")
         database = factory(Path(args.database), busy_timeout_ms=args.busy_timeout_ms)
-        database.migrate_v1_to_v2(Path(args.backup))
+        if args.target_version == "2":
+            database.migrate_v1_to_v2(Path(args.backup))
+        else:
+            database.migrate_v2_to_v3(Path(args.backup))
     except StoreError as error:
         code = error.code if error.code in _SAFE_STORE_CODES else "STORE_FAILURE"
         stderr.write(code + "\n")

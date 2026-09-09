@@ -4,8 +4,10 @@ No method here allocates, inspects or deletes a container. Evidence references
 must come from trusted runtime verifiers; accepting a hash does not verify it.
 """
 
+import hashlib
+import re
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 from .common import (
@@ -28,6 +30,8 @@ from .common import (
 from .database import CommitDenial, Database
 from .models import (
     Action,
+    AttachmentLease,
+    CapabilityUse,
     CleanupTask,
     Clock,
     Receipt,
@@ -75,6 +79,23 @@ def _runtime_binding(row: sqlite3.Row, *, allow_legacy: bool) -> str | None:
     if raw is None and not allow_legacy:
         raise StoreError("LEGACY_RUNTIME_BINDING")
     return runtime_operation_id(raw, legacy=allow_legacy)
+
+
+def _attachment_lease(row: sqlite3.Row) -> AttachmentLease:
+    return AttachmentLease(
+        str(row["lease_id"]),
+        ResourceRef(
+            str(row["attempt_id"]),
+            str(row["sandbox_id"]),
+            int(row["generation"]),
+        ),
+        str(row["jti_hash"]),
+        str(row["gateway_session_hash"]),
+        int(row["session_epoch"]),
+        instant(int(row["issued_at"])),
+        instant(int(row["expires_at"])),
+        instant(int(row["consumed_at"])),
+    )
 
 
 def _stop(connection: sqlite3.Connection, row: sqlite3.Row, expired: bool) -> None:
@@ -281,6 +302,142 @@ class ControlPlaneStore:
                 expected_version + 1,
                 error_code,
             )
+
+    def grant_attachment_lease(
+        self,
+        identity: ServiceIdentity,
+        ref: ResourceRef,
+        *,
+        consumed: CapabilityUse,
+        gateway_session_id: str,
+        lease_duration: timedelta,
+        key: str,
+        now: Clock,
+    ) -> AttachmentLease:
+        actor = service(identity, Role.GATEWAY, Action.ATTACH)
+        ref_valid(ref)
+        if type(consumed) is not CapabilityUse or consumed.ref != ref:
+            raise StoreError("CAPABILITY_INVALID")
+        if (
+            type(consumed.jti_hash) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", consumed.jti_hash) is None
+            or type(consumed.session_epoch) is not int
+            or consumed.session_epoch < 0
+        ):
+            raise StoreError("CAPABILITY_INVALID")
+        identifier(gateway_session_id)
+        identifier(key)
+        if type(lease_duration) is not timedelta:
+            raise StoreError("INVALID_REQUEST")
+        duration_micros = (
+            lease_duration.days * 86_400_000_000
+            + lease_duration.seconds * 1_000_000
+            + lease_duration.microseconds
+        )
+        if not 1 <= duration_micros <= 60_000_000:
+            raise StoreError("INVALID_REQUEST")
+        try:
+            consumed_expires_at = timestamp(consumed.expires_at)
+        except StoreError:
+            raise StoreError("CAPABILITY_INVALID") from None
+        session_hash = hashlib.sha256(gateway_session_id.encode("utf-8")).hexdigest()
+        fingerprint = request_hash(
+            "attachment-lease",
+            [
+                ref.attempt_id,
+                ref.sandbox_id,
+                ref.generation,
+                consumed.jti_hash,
+                consumed.session_epoch,
+                session_hash,
+                duration_micros,
+            ],
+        )
+        with self._database._transaction() as connection:
+            clock = read_clock(now)
+            attempt = binding(connection, ref)
+            resource = _resource(connection, ref)
+            _live(connection, attempt, resource, clock)
+            if (
+                resource["state"] not in ("READY", "RUNNING")
+                or attempt["active_sandbox_id"] != ref.sandbox_id
+                or resource["destroy_intent"]
+                or resource["expiry_intent"]
+                or attempt["session_epoch"] != consumed.session_epoch
+            ):
+                raise StoreError("ATTEMPT_UNAVAILABLE")
+            capability = connection.execute(
+                """SELECT * FROM terminal_capability_uses
+                WHERE jti_hash=? AND attempt_id=?""",
+                (consumed.jti_hash, ref.attempt_id),
+            ).fetchone()
+            if (
+                capability is None
+                or int(capability["expires_at"]) <= clock
+                or int(capability["expires_at"]) != consumed_expires_at
+            ):
+                raise StoreError("CAPABILITY_INVALID")
+            existing_key = connection.execute(
+                """SELECT * FROM terminal_attachment_leases
+                WHERE actor=? AND idempotency_key=?""",
+                (actor, key),
+            ).fetchone()
+            if existing_key is not None:
+                if existing_key["request_hash"] != fingerprint:
+                    raise StoreError("IDEMPOTENCY_CONFLICT")
+                return _attachment_lease(existing_key)
+            existing_jti = connection.execute(
+                "SELECT * FROM terminal_attachment_leases WHERE jti_hash=?",
+                (consumed.jti_hash,),
+            ).fetchone()
+            if existing_jti is not None:
+                if existing_jti["request_hash"] == fingerprint:
+                    return _attachment_lease(existing_jti)
+                raise StoreError("CAPABILITY_REPLAY")
+            existing_session = connection.execute(
+                """SELECT 1 FROM terminal_attachment_leases
+                WHERE gateway_session_hash=?""",
+                (session_hash,),
+            ).fetchone()
+            if existing_session is not None:
+                raise StoreError("CAPABILITY_REPLAY")
+            expires_at = min(
+                int(capability["expires_at"]),
+                int(attempt["expires_at"]),
+                clock + duration_micros,
+            )
+            if expires_at <= clock:
+                raise StoreError("CAPABILITY_INVALID")
+            lease_id = uuid4().hex
+            connection.execute(
+                """INSERT INTO terminal_attachment_leases
+                (lease_id,jti_hash,actor,idempotency_key,request_hash,attempt_id,
+                 sandbox_id,generation,session_epoch,gateway_session_hash,
+                 issued_at,expires_at,consumed_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    lease_id,
+                    consumed.jti_hash,
+                    actor,
+                    key,
+                    fingerprint,
+                    ref.attempt_id,
+                    ref.sandbox_id,
+                    ref.generation,
+                    consumed.session_epoch,
+                    session_hash,
+                    clock,
+                    expires_at,
+                    clock,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM terminal_attachment_leases WHERE lease_id=?",
+                (lease_id,),
+            ).fetchone()
+            if row is None:
+                raise StoreError("STORE_FAILURE")
+            return _attachment_lease(row)
 
     def reconcile(
         self, identity: ServiceIdentity, *, now: Clock, limit: int

@@ -26,6 +26,7 @@ class Action(StrEnum):
     TRANSITION = "transition"
     PUBLISH = "publish"
     CONSUME = "consume"
+    ATTACH = "attach"
     EXPIRE = "expire"
     RECONCILE = "reconcile"
 
@@ -126,3 +127,27 @@ class CapabilityClaims:
     session_epoch: int
     expires_at: datetime
     scope: str
+
+
+@dataclass(frozen=True)
+class CapabilityUse:
+    """The backend's non-secret receipt after atomically consuming a capability."""
+
+    jti_hash: str
+    ref: ResourceRef
+    session_epoch: int
+    expires_at: datetime
+
+
+@dataclass(frozen=True)
+class AttachmentLease:
+    """A consumed, short-lived lease for one immediate PTY attachment."""
+
+    lease_id: str
+    ref: ResourceRef
+    jti_hash: str
+    gateway_session_hash: str
+    session_epoch: int
+    issued_at: datetime
+    expires_at: datetime
+    consumed_at: datetime

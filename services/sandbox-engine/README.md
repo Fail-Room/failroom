@@ -1,12 +1,15 @@
 # Sandbox Engine
 
 This component implements a profile qualification evidence evaluator and raising
-guard, plus a trusted, diagnostic-only Docker lifecycle adapter. It has no HTTP
-service, database, terminal gateway, learner sandbox creation endpoint, or PTY.
+guard, plus a trusted, diagnostic-only Docker lifecycle adapter and an in-process
+terminal gateway authority coordinator. It has no HTTP service, learner sandbox
+creation endpoint, WebSocket transport, or PTY.
 
-The package uses Python 3.12.13 and the standard library. Ruff and mypy are pinned
+The package uses Python 3.12.13 and repository-local runtime packages only. Ruff and mypy are pinned
 development tools; `uv.lock` locks their transitive dependencies. Commands below
 run from this directory with uv installed:
+Gateway tests compose sibling source packages. In a source checkout, set
+`PYTHONPATH=../api:../../packages/state-store` before the unittest command (PowerShell uses `;`).
 
 ```sh
 uv sync --locked
@@ -113,6 +116,9 @@ The opt-in test `test_docker_diagnostic_integration.py` requires
 `FAILROOM_*` profile or adapter-bound limit. With any input missing, it reports
 `UNVERIFIED` by skipping rather than supplying source defaults. It is not run by
 default.
+
+The trusted control-plane package is the only in-repository composition boundary for these primitives. It supplies authoritative state and exact runtime bindings; this package does not authenticate callers, allocate learner Rooms or expose a transport.
+The terminal gateway authority coordinator composes backend capability consumption and control-plane lease issuance in-process without taking over Docker lifecycle ownership.
 
 ## Trust and integration boundary
 

@@ -1,10 +1,13 @@
 # Failroom State Store
 
 Internal Phase 1 SQLite persistence for trusted services. This package stores
-authority, lifecycle observations and recovery work. It does not implement an
-HTTP API, authentication, signed capabilities, Docker operations, attachment
-leases, a PTY, or a background scheduler. It includes a synchronous cleanup pass
-with an injected runtime verifier. It is not a running Failroom application.
+authority, lifecycle observations and recovery work. It owns immutable runtime
+operation bindings and explicit v1-to-v2 and v2-to-v3 migrations. The trusted
+attachment-lease state contract is implemented here; it does not implement an HTTP
+API, authentication, signed-capability transport, Docker operations, a PTY, or a
+background scheduler. The trusted control-plane package
+consumes these records but owns Docker side effects; this package never imports
+or invokes a Docker client. It includes a synchronous cleanup pass with an injected runtime verifier. It is not a running Failroom application.
 
 ## Ownership
 
@@ -13,6 +16,7 @@ with an injected runtime verifier. It is not a running Failroom application.
 | `room_attempts` | `BackendStore` | Room ownership, preallocated sandbox identity and generation, immutable runtime operation binding, active binding, state/version, session epoch, immutable deadline and provisioning/expiry/destroy intents. |
 | `sandbox_resources` | `ControlPlaneStore` | Exact backend-reserved tuple, immutable runtime operation binding, resource state/version, container identity, matching deadline, expiry/destroy intents and trusted evidence references. |
 | `terminal_capability_uses` | `BackendStore` | SHA-256 hash of consumed `jti`, attempt binding, consumed time and expiry. No raw `jti` or signed token. |
+| `terminal_attachment_leases` | `ControlPlaneStore` | Consumed short-lived lease bound to a consumed `jti` hash, exact tuple, session epoch and hashed gateway session. No raw token or session ID. |
 | `lifecycle_operations` | Operation owner | Actor-scoped idempotency key, request fingerprint, prior receipt, exact tuple, cleanup retry time/count and fixed failure code. |
 
 Physical storage is shared; record ownership is not. Backend code cannot mutate
@@ -32,9 +36,10 @@ not credentials. Transport authentication remains unimplemented.
 capability. `consume()` rechecks owner, active tuple, generation, session epoch,
 both records' attachable states, scope and expiry, then inserts the `jti` hash in
 one write transaction. Only one concurrent consumption succeeds. This does not
-open a WebSocket or authorize a PTY: a final control-plane attachment lease and
-runtime check are still mandatory. Signing, signature verification, issuance
-lifetime policy, and replay-record retention are not implemented here.
+open a WebSocket or authorize a PTY: the lease contract is a trusted state boundary,
+but transport authentication, PTY runtime checks and lease invalidation are still
+mandatory. The bounded signing/verification codec lives in `services/api/`; HTTP
+issuance, key distribution and replay-record retention policy are not implemented here.
 
 Every time-dependent method requires `now`, a trusted zero-argument clock callable
 returning an aware `datetime`, such as `lambda: datetime.now(UTC)`. It is invoked
@@ -51,13 +56,17 @@ calling them. A digest's syntax is not proof, and these tests use synthetic
 references. `FAILED` requires one of `CREATE_FAILED`, `START_FAILED`,
 `RUNTIME_UNAVAILABLE`, or `CLEANUP_INCOMPLETE`; raw exception messages are rejected.
 
+## Schema and migration contract
+
+Fresh databases use schema v3. Existing v2 databases remain usable for state operations but require the operator-only `Database.migrate_v2_to_v3()` command with a new absolute backup path before attachment-lease operations are available. Migration adds the lease table without changing existing rows or issuing runtime identities.
+
 ## Transaction and replay contract
 
 - `create()` atomically persists the backend-generated attempt/sandbox tuple,
   generation 1, future absolute deadline and operation receipt before any resource
   record is accepted. Phase 1 has one immutable generation per attempt; reset and
   generation-changing retries require a later explicit schema/API change.
-- Initialization creates version 2 only in an empty database. Unknown application
+- Initialization creates version 3 only in an empty database. Unknown application
   IDs, existing unrelated objects, or unsupported schema versions are refused.
 - An exact version 1 database is left untouched at startup and reports
   `MIGRATION_REQUIRED`. An operator must call `Database.migrate_v1_to_v2()` with a
@@ -147,7 +156,7 @@ loop, sleep or automatic retry runs after the pass returns. The injected-runtime
 tests establish SQLite orchestration behavior, not actual Docker removal or
 isolation evidence.
 
-Independent TTL enforcement, runtime inventory/orphan detection, attachment
+Independent TTL enforcement, runtime inventory/orphan detection, runtime attachment
 lease races, reset, final-image qualification and actual cleanup remain required
 before learner sandbox creation can be enabled.
 

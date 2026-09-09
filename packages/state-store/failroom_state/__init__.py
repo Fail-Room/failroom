@@ -12,8 +12,10 @@ from .docker_worker import (
 )
 from .models import (
     Action,
+    AttachmentLease,
     Attempt,
     CapabilityClaims,
+    CapabilityUse,
     CleanupTask,
     Clock,
     Receipt,
@@ -29,8 +31,10 @@ from .models import (
 __all__ = [
     "Action",
     "Attempt",
+    "AttachmentLease",
     "BackendStore",
     "CapabilityClaims",
+    "CapabilityUse",
     "CleanupRun",
     "CleanupRuntime",
     "CleanupTarget",

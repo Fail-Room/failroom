@@ -3,6 +3,8 @@
 `failroom_control_plane` is a trusted, in-process composition package for the
 Failroom state store and sandbox-engine primitives. It is not an HTTP service,
 learner allocation endpoint, terminal gateway, or deployment process.
+It is the only in-repository package that composes state-store authority with
+sandbox-engine Docker primitives; it does not expose transport authentication or learner access.
 
 ## Configuration
 
@@ -60,3 +62,65 @@ failroom-control-plane migrate \
   --backup /var/lib/failroom/state-before-v2.sqlite3 \
   --busy-timeout-ms 5000
 ```
+
+
+기본 대상 버전은 `2`이며 v1 데이터베이스를 v2로 올린다. v3 lease 스키마로
+올릴 때는 v2 데이터베이스와 새 백업 경로를 지정하고 `--target-version 3`을
+명시한다. 마이그레이션은 기존 파일을 덮어쓰지 않고 새 절대 백업 경로에
+SQLite 백업을 먼저 만든 뒤 원본의 무결성과 스키마를 검증한다.
+
+```text
+failroom-control-plane migrate --database /var/lib/failroom/state.sqlite3 --backup /var/lib/failroom/state-before-v3.sqlite3 --target-version 3 --busy-timeout-ms 5000
+```
+
+## Linux Docker integration evidence
+
+The real Docker lifecycle evidence test is opt-in and requires a trusted Linux
+controller. It provisions a disposable sandbox through the control-plane
+orchestrator, verifies the resulting container hardening, leaves the Room, and
+runs durable cleanup before checking that the exact four-label binding is gone.
+The test does not use Docker mocks.
+
+Run it only when Docker is available and every value below has been reviewed by
+the operator:
+
+The image, seccomp path/digest, UID/GID, and I/O device shown below are
+placeholders; replace them with values verified for the trusted Linux host.
+
+```text
+export FAILROOM_DOCKER_INTEGRATION=1
+export FAILROOM_DATABASE_DIR=/var/lib/failroom/integration
+export FAILROOM_DATABASE_BUSY_TIMEOUT_MS=5000
+export FAILROOM_DOCKER_CONTEXT=default
+export FAILROOM_DOCKER_IMAGE=failroom/sandbox:local
+export FAILROOM_DOCKER_UID=1000
+export FAILROOM_DOCKER_GID=1000
+export FAILROOM_SECCOMP_PATH=/etc/failroom/seccomp/default.json
+export FAILROOM_SECCOMP_DIGEST=sha256:REVIEWED_POLICY_DIGEST
+export FAILROOM_SECCOMP_STORE=/etc/failroom/seccomp.json
+export FAILROOM_SECCOMP_MAX_BYTES=1048576
+export FAILROOM_DOCKER_TIMEOUT_SECONDS=10
+export FAILROOM_DOCKER_MAX_OUTPUT_BYTES=65536
+export FAILROOM_CPU_LIMIT=1
+export FAILROOM_MEMORY_BYTES=536870912
+export FAILROOM_MEMORY_SWAP_BYTES=536870912
+export FAILROOM_PIDS_LIMIT=128
+export FAILROOM_WORKSPACE_TMPFS_BYTES=67108864
+export FAILROOM_TEMP_TMPFS_BYTES=67108864
+export FAILROOM_SHM_BYTES=67108864
+export FAILROOM_FD_LIMIT=1024
+export FAILROOM_IO_DEVICE=/dev/reviewed-device
+export FAILROOM_IO_READ_BPS=1048576
+export FAILROOM_IO_WRITE_BPS=1048576
+export FAILROOM_TERMINAL_OUTPUT_BYTES=1048576
+export FAILROOM_CONNECTION_LIMIT=4
+export FAILROOM_SESSION_LIMIT=1
+export FAILROOM_ABSOLUTE_TTL_SECONDS=300
+
+uv run --locked python -m unittest tests.test_linux_docker_integration -v
+```
+
+On Windows and when the opt-in flag or any explicit operator input is absent,
+the test is intentionally skipped with an `UNVERIFIED` reason. A skipped run
+is not Docker lifecycle evidence; the Linux command must complete successfully
+on the trusted controller before recording that evidence.
