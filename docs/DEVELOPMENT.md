@@ -2,7 +2,7 @@
 
 ## Current Repository State
 
-Phase 0 established the product and engineering contracts. Phase 1 has started with profile qualification and a diagnostic-only Docker adapter in `services/sandbox-engine/`, plus SQLite repositories and an injected cleanup pass in `packages/state-store/`, each with tests and a Python development manifest/lockfile. There is no runnable web/API application, learner terminal, authentication flow, deployment, or production service. No persistent service database is created by installing or testing these modules.
+Phase 0 established the product and engineering contracts. Phase 1 now includes profile qualification and a verified diagnostic Docker lifecycle in services/sandbox-engine/, SQLite repositories and an injected cleanup pass in packages/state-store/, and the trusted in-process control-plane composition in services/control-plane/, each with tests and a Python development manifest/lockfile. There is no runnable web/API application, learner terminal, authentication flow, deployment, or production service. No persistent service database is created by installing or testing these modules.
 
 Next.js, xterm.js, and FastAPI are the planned architecture choices. Phase 1 will select and lock their concrete versions, manifests, dependency tooling, and integration layout. Application setup commands will be documented only after those artifacts exist and are verified.
 
@@ -18,7 +18,7 @@ uv run --locked ruff format --check .
 uv run --locked mypy failroom_sandbox
 ```
 
-These checks cover evidence completeness, typing, duplication, context binding, age boundaries, deterministic safe errors, profile compilation, bounded Docker CLI transport, diagnostic ownership/mount checks, and seccomp snapshot handling. Default Docker lifecycle fixtures are synthetic. The opt-in diagnostic test is skipped unless a trusted Linux controller supplies every explicit `FAILROOM_*` profile input. Actual learner resource probes, allocation-path integration and browser-to-PTY end-to-end checks remain required. See the [component contract](../services/sandbox-engine/README.md) for the implemented boundary.
+These checks cover evidence completeness, typing, duplication, context binding, age boundaries, deterministic safe errors, profile compilation, bounded Docker CLI transport, diagnostic ownership/mount checks, and seccomp snapshot handling. Default Docker lifecycle fixtures are synthetic. The opt-in Docker integration tests are skipped unless a trusted Linux controller supplies every explicit FAILROOM_* input. Actual learner resource probes, allocation-path integration and browser-to-PTY end-to-end checks remain required. See the sandbox-engine and control-plane component contracts for the implemented boundaries.
 
 The state store also uses Python 3.12.13 with no runtime dependencies. From `packages/state-store/`, run:
 
@@ -33,6 +33,15 @@ uv run --locked mypy failroom_state
 Its tests use real SQLite files in OS temporary directories, independent connections, concurrent callers and child processes. They cover the four-table schema, ownership and scoped service contexts, immutable tuples/TTL/intents, 81 resource-state transition combinations, compare-and-set conflicts, duplicate requests, concurrent `jti` consumption, post-lock expiry, rollback, abrupt process exit and durable cleanup/finalization recovery. These are storage integration tests, not browser-to-PTY end-to-end or runtime-isolation tests.
 
 The [state-store contract](../packages/state-store/README.md) describes explicit private local database placement, recovery ordering, known limitations and rollback precautions. Runtime integration must run backend expiry, control-plane cleanup and backend pending-finalization recovery before accepting terminal traffic, then maintain independent TTL enforcement. Do not place service databases in synchronized source checkouts or treat a stored evidence digest as physical cleanup proof.
+
+The control-plane package uses the same Python 3.12.13 toolchain. From services/control-plane/, run:
+
+Commands:
+- uv sync --locked
+- uv run --locked python -m unittest discover -s tests -v
+- uv run --locked ruff check .
+- uv run --locked ruff format --check .
+- uv run --locked mypy failroom_control_plane
 
 ## Delivery Principles
 
@@ -116,7 +125,7 @@ Sandbox-related changes must explicitly cover backend-preallocated identity, aut
 
 ## Local Validation
 
-Use the module checks above for the implemented qualification gate, diagnostic adapter and state worker. The opt-in Docker diagnostic test must be run only from a trusted Linux control-plane host after explicit operator profile inputs are configured. Application integration and browser-to-PTY checks become available with their respective runtime components. Documentation-only changes should at minimum:
+Use the module checks above for the implemented qualification gate, diagnostic adapter, state worker and control-plane composition. The opt-in Docker integration tests must be run only from a trusted Linux control-plane host after explicit operator inputs are configured; Windows skips remain UNVERIFIED. Application integration and browser-to-PTY checks become available with their respective runtime components. Documentation-only changes should at minimum:
 
 1. Confirm every referenced local Markdown link resolves.
 2. Check headings, terminology, planned-status wording, and final newlines.

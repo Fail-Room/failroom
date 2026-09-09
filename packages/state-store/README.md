@@ -1,10 +1,12 @@
 # Failroom State Store
 
 Internal Phase 1 SQLite persistence for trusted services. This package stores
-authority, lifecycle observations and recovery work. It does not implement an
+authority, lifecycle observations and recovery work. It owns immutable runtime
+operation bindings and explicit v1-to-v2 migration. It does not implement an
 HTTP API, authentication, signed capabilities, Docker operations, attachment
-leases, a PTY, or a background scheduler. It includes a synchronous cleanup pass
-with an injected runtime verifier. It is not a running Failroom application.
+leases, a PTY, or a background scheduler. The trusted control-plane package
+consumes these records but owns Docker side effects; this package never imports
+or invokes a Docker client. It includes a synchronous cleanup pass with an injected runtime verifier. It is not a running Failroom application.
 
 ## Ownership
 

@@ -114,6 +114,8 @@ The opt-in test `test_docker_diagnostic_integration.py` requires
 `UNVERIFIED` by skipping rather than supplying source defaults. It is not run by
 default.
 
+The trusted control-plane package is the only in-repository composition boundary for these primitives. It supplies authoritative state and exact runtime bindings; this package does not authenticate callers, allocate learner Rooms or expose a transport.
+
 ## Trust and integration boundary
 
 Only the trusted control plane may assemble contexts and reports. Do not build

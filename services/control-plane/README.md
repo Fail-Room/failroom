@@ -3,6 +3,8 @@
 `failroom_control_plane` is a trusted, in-process composition package for the
 Failroom state store and sandbox-engine primitives. It is not an HTTP service,
 learner allocation endpoint, terminal gateway, or deployment process.
+It is the only in-repository package that composes state-store authority with
+sandbox-engine Docker primitives; it does not expose transport authentication or learner access.
 
 ## Configuration
 
