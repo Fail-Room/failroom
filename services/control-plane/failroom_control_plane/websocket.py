@@ -124,6 +124,7 @@ async def serve_terminal(
     close_lock = asyncio.Lock()
     close_sent = False
     disconnected = False
+    requested_close_code: int | None = None
     session: TerminalSession | None = None
     output_task: asyncio.Task[None] | None = None
 
@@ -229,7 +230,7 @@ async def serve_terminal(
 
             frame_type = frame.get("type")
             if frame_type == "close" and _exact_keys(frame, "type"):
-                await close_once(1000)
+                requested_close_code = 1000
                 break
             if frame_type == "input" and _exact_keys(frame, "type", "data"):
                 data = frame.get("data")
@@ -294,7 +295,7 @@ async def serve_terminal(
             except Exception:
                 pass
         if not disconnected:
-            await close_once(1000)
+            await close_once(requested_close_code or 1000)
 
 
 def mount_terminal_route(
