@@ -2,6 +2,11 @@
 
 from .config import ConfigurationError, ControllerConfig
 from .lifecycle import CleanupWorker, RoomLifecycleService, RoomStatus
+from .maintenance import (
+    LifecycleMaintenanceService,
+    MaintenanceError,
+    MaintenanceRun,
+)
 from .orchestrator import (
     LifecycleError,
     LifecycleOrchestrator,
@@ -26,7 +31,10 @@ __all__ = (
     "DockerProvisioningRuntime",
     "CleanupWorker",
     "LifecycleError",
+    "LifecycleMaintenanceService",
     "LifecycleOrchestrator",
+    "MaintenanceError",
+    "MaintenanceRun",
     "ProvisioningRequest",
     "ProvisioningRuntime",
     "ProvisioningSession",
