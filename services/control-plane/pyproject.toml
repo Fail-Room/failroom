@@ -3,13 +3,19 @@ name = "failroom-control-plane"
 version = "0.1.0"
 description = "Trusted in-process lifecycle composition for Failroom"
 requires-python = ">=3.12,<3.13"
-dependencies = ["failroom-state-store", "failroom-sandbox-engine"]
+dependencies = [
+    "failroom-state-store",
+    "failroom-sandbox-engine",
+    "fastapi==0.116.1",
+    "uvicorn==0.35.0",
+]
 
 [project.scripts]
 failroom-control-plane = "failroom_control_plane.cli:main"
 
 [dependency-groups]
 dev = [
+  "httpx==0.28.1",
   "mypy==1.17.1",
   "ruff==0.12.9",
 ]
@@ -31,5 +37,5 @@ select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-mypy_path = ["../sandbox-engine", "../../packages/state-store"]
+mypy_path = ["../sandbox-engine", "../api", "../../packages/state-store"]
 files = ["failroom_control_plane"]

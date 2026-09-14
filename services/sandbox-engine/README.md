@@ -1,9 +1,9 @@
 # Sandbox Engine
 
 This component implements a profile qualification evidence evaluator and raising
-guard, plus a trusted, diagnostic-only Docker lifecycle adapter and an in-process
-terminal gateway authority coordinator. It has no HTTP service, learner sandbox
-creation endpoint, WebSocket transport, or PTY.
+guard, a trusted diagnostic-only Docker lifecycle adapter, an in-process
+terminal gateway authority coordinator, and a bounded Docker PTY primitive. It
+has no HTTP service, learner sandbox creation endpoint, or WebSocket transport.
 
 The package uses Python 3.12.13 and repository-local runtime packages only. Ruff and mypy are pinned
 development tools; `uv.lock` locks their transitive dependencies. Commands below
@@ -119,6 +119,26 @@ default.
 
 The trusted control-plane package is the only in-repository composition boundary for these primitives. It supplies authoritative state and exact runtime bindings; this package does not authenticate callers, allocate learner Rooms or expose a transport.
 The terminal gateway authority coordinator composes backend capability consumption and control-plane lease issuance in-process without taking over Docker lifecycle ownership.
+
+## Bounded Docker PTY primitive
+
+`DockerPtyRuntime` is a trusted adapter used only after the control plane has
+validated an attachment lease and exact container binding. It accepts only a
+64-character lowercase hexadecimal container ID and the fixed `/bin/bash`
+command, then invokes the exact Docker CLI form:
+
+```text
+docker --context <context> exec --interactive --tty <container_id> /bin/bash
+```
+
+The session enforces explicit input, cumulative output, wall-clock session,
+terminal row/column, and signal bounds. The current signal contract permits
+only `SIGINT` (`Ctrl+C`) and writes the PTY interrupt byte so the remote
+foreground process is interrupted without killing the local `docker exec`
+client. `close()` is idempotent and terminates the process group. Non-Linux
+interpreters fail closed; the Windows unit suite does not claim Linux PTY or
+Docker isolation evidence. The primitive never exposes a host runtime socket,
+host shell, or host filesystem to the learner sandbox.
 
 ## Trust and integration boundary
 

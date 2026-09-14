@@ -10,6 +10,13 @@ from .orchestrator import (
     phase_key,
 )
 from .runtime_docker import DockerCleanupRuntime, DockerProvisioningRuntime
+from .terminal import (
+    ControlPlaneTerminalService,
+    TerminalError,
+    TerminalRuntime,
+    TerminalSession,
+)
+from .websocket import TerminalGatewayProtocol, WebSocketLimits, serve_terminal
 
 __all__ = (
     "ConfigurationError",
@@ -22,4 +29,11 @@ __all__ = (
     "ProvisioningRuntime",
     "ProvisioningSession",
     "phase_key",
+    "ControlPlaneTerminalService",
+    "TerminalError",
+    "TerminalRuntime",
+    "TerminalSession",
+    "TerminalGatewayProtocol",
+    "WebSocketLimits",
+    "serve_terminal",
 )

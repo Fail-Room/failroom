@@ -1,10 +1,12 @@
 # Control Plane
 
 `failroom_control_plane` is a trusted, in-process composition package for the
-Failroom state store and sandbox-engine primitives. It is not an HTTP service,
-learner allocation endpoint, terminal gateway, or deployment process.
+Failroom state store and sandbox-engine primitives. It owns lifecycle ordering,
+attachment-lease-to-PTY binding, and the optional capability HTTP/WebSocket
+route composition; it is not a deployment process or a production listener.
 It is the only in-repository package that composes state-store authority with
-sandbox-engine Docker primitives; it does not expose transport authentication or learner access.
+sandbox-engine Docker primitives. Transport authentication and external service
+identity remain injected dependencies.
 
 ## Configuration
 
@@ -47,9 +49,31 @@ state-store's exact `CleanupTarget` into a `DockerBinding`, preserves the
 persisted runtime operation ID (including legacy `None`), and exposes only fixed
 cleanup error codes.
 
-There are no environment defaults, config-file fallbacks, HTTP listeners,
-background workers, shell execution paths, or learner-facing commands in this
-package.
+There are no environment defaults, config-file fallbacks, process listeners,
+background workers, or learner-facing commands in this package. The HTTP and
+WebSocket route factories do not start a server; callers must explicitly inject
+all authority, gateway, terminal, and limit dependencies.
+
+## Terminal vertical slice
+
+`ControlPlaneTerminalService` re-inspects the exact `ResourceRef` associated
+with a consumed `AttachmentLease` immediately before opening `/bin/bash`. It
+rejects expired leases, stale references, non-`READY`/`RUNNING` resources,
+expiry or destroy intent, and missing container identity. The WebSocket route
+accepts one bounded JSON authorization frame, calls the gateway once, and then
+relays only bounded `input`, `resize`, `signal`, and `close` frames. It closes
+the PTY on every disconnect and never returns capability or provider details in
+WebSocket errors.
+
+The route is available only when `create_app()` receives the optional terminal
+dependencies (or when `mount_terminal_route()` is called directly). This is a
+Phase 1 vertical slice: production identity verification, browser terminal UI,
+multi-tenant deployment, and independent runtime attestation remain planned
+until trusted deployment evidence exists.
+
+The Linux PTY adapter currently accepts only signal value `2` (`SIGINT`/Ctrl+C)
+and delivers it through the remote PTY line discipline; other signal values are
+rejected without terminating the `docker exec` client.
 
 ## Operator migration
 
@@ -124,3 +148,25 @@ On Windows and when the opt-in flag or any explicit operator input is absent,
 the test is intentionally skipped with an `UNVERIFIED` reason. A skipped run
 is not Docker lifecycle evidence; the Linux command must complete successfully
 on the trusted controller before recording that evidence.
+
+## Linux terminal integration evidence
+
+The real terminal path is separately gated by
+`FAILROOM_TERMINAL_INTEGRATION=1` and `sys.platform == "linux"`. In addition to
+the Docker lifecycle inputs above, it requires explicit values for
+`FAILROOM_CAPABILITY_SECRET`, `FAILROOM_CAPABILITY_LIFETIME_SECONDS`,
+`FAILROOM_TERMINAL_INPUT_BYTES`, `FAILROOM_TERMINAL_SESSION_SECONDS`,
+`FAILROOM_TERMINAL_ROWS`, `FAILROOM_TERMINAL_COLUMNS`,
+`FAILROOM_TERMINAL_LEASE_SECONDS`, `FAILROOM_TERMINAL_AUTH_TIMEOUT_SECONDS`,
+`FAILROOM_TERMINAL_FRAME_BYTES`, and
+`FAILROOM_TERMINAL_POLL_INTERVAL_SECONDS`.
+
+When enabled, the test uses a real Docker PTY through the capability gateway
+and control-plane lease service. It verifies input/output, ANSI bytes, resize,
+signal interruption, one-time capability replay denial, container hardening,
+and cleanup. Missing inputs or a non-Linux controller produce `UNVERIFIED`
+skips; those skips are not evidence.
+
+```text
+uv run --locked python -m unittest tests.test_linux_terminal_integration -v
+```
