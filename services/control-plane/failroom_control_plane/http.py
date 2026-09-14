@@ -13,6 +13,7 @@ from failroom_state import UserIdentity
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from .entry import EntryError, RoomEntry, RoomEntryService
 from .lifecycle import LifecycleError, RoomLifecycleService, RoomStatus
 from .terminal import ControlPlaneTerminalService
 from .websocket import (
@@ -75,6 +76,22 @@ def _status_response(status: RoomStatus, *, code: int = 200) -> JSONResponse:
     )
 
 
+def _entry_response(entry: RoomEntry) -> JSONResponse:
+    return JSONResponse(
+        status_code=201,
+        content={
+            "attempt_id": entry.attempt_id,
+            "room_id": entry.room_id,
+            "state": entry.state,
+            "expires_at": entry.expires_at.isoformat(),
+        },
+    )
+
+
+def _entry_error(error: EntryError) -> JSONResponse:
+    return _error(error.code, 503)
+
+
 def _lifecycle_error(error: LifecycleError) -> JSONResponse:
     if error.code in {"AUTHENTICATION_REQUIRED", "AUTHENTICATION_EXPIRED"}:
         return _error(error.code, 401)
@@ -92,10 +109,31 @@ def create_app(
     terminal: ControlPlaneTerminalService | None = None,
     terminal_limits: WebSocketLimits | None = None,
     lifecycle: RoomLifecycleService | None = None,
+    entry: RoomEntryService | None = None,
 ) -> FastAPI:
     """Build an API app with all trust dependencies supplied by the caller."""
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+    if entry is not None:
+
+        @app.post("/v1/rooms/{room_id}/attempts")
+        def enter_room(room_id: str, request: Request) -> JSONResponse:
+            key = request.headers.get("idempotency-key", "")
+            if not key:
+                return _error("INVALID_REQUEST", 400)
+            try:
+                return _entry_response(
+                    entry.enter(
+                        _authenticated_identity(verifier, request), room_id, key=key
+                    )
+                )
+            except _AuthenticationFailure as error:
+                return _error(error.code, 401)
+            except EntryError as error:
+                return _entry_error(error)
+            except Exception:
+                return _error("ENTRY_FAILED", 503)
 
     @app.post("/v1/attempts/{attempt_id}/terminal-capability")
     def issue_terminal_capability(attempt_id: str, request: Request) -> JSONResponse:

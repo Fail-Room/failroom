@@ -24,6 +24,7 @@ from failroom_state import (
 )
 from fastapi.testclient import TestClient
 
+from failroom_control_plane.entry import RoomEntryService
 from failroom_control_plane.http import create_app
 from failroom_control_plane.lifecycle import RoomLifecycleService
 
@@ -43,6 +44,27 @@ class RecordingCleanupWorker:
         self.calls += 1
         now()
         return CleanupRun(destroyed=0, deferred=0, finalized=0)
+
+
+class RecordingProvisioner:
+    def __init__(self) -> None:
+        self.keys: list[str] = []
+        self.failure: Exception | None = None
+
+    def provision(
+        self,
+        receipt,
+        *,
+        backend_identity,
+        control_identity,
+        key,
+        now,
+    ) -> None:
+        del receipt, backend_identity, control_identity
+        self.keys.append(key)
+        now()
+        if self.failure is not None:
+            raise self.failure
 
 
 class CapabilityHttpTests(unittest.TestCase):
@@ -83,6 +105,19 @@ class CapabilityHttpTests(unittest.TestCase):
             cleanup_limit=10,
             now=lambda: self.now,
         )
+        self.provisioner = RecordingProvisioner()
+        self.entry = RoomEntryService(
+            self.backend,
+            self.provisioner,
+            backend_identity=self.backend_identity,
+            control_identity=ServiceIdentity(
+                "entry-control",
+                Role.CONTROL_PLANE,
+                frozenset({Action.INSPECT, Action.TRANSITION}),
+            ),
+            attempt_ttl=timedelta(minutes=15),
+            now=lambda: self.now,
+        )
         self.token = "local-token-with-at-least-32-bytes-0001"
         self.other_token = "other-token-with-at-least-32-bytes-0001"
         verifier = BearerIdentityVerifier(
@@ -108,6 +143,7 @@ class CapabilityHttpTests(unittest.TestCase):
                 verifier=verifier,
                 now=lambda: self.now,
                 lifecycle=self.lifecycle,
+                entry=self.entry,
             )
         )
 
@@ -182,6 +218,50 @@ class CapabilityHttpTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json(), {"code": "AUTHENTICATION_REQUIRED"})
+
+    def test_enter_room_creates_a_safe_owned_attempt(self) -> None:
+        response = self.client.post(
+            "/v1/rooms/room-1/attempts",
+            headers={
+                "Authorization": "Bearer " + self.token,
+                "Idempotency-Key": "enter-room",
+            },
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(
+            set(response.json()),
+            {"attempt_id", "room_id", "state", "expires_at"},
+        )
+        self.assertEqual(response.json()["room_id"], "room-1")
+        self.assertEqual(response.json()["state"], "PROVISIONING")
+        self.assertEqual(self.provisioner.keys, ["enter-room"])
+        self.assertNotIn("sandbox_id", response.json())
+        self.assertNotIn("generation", response.json())
+
+    def test_enter_room_requires_an_idempotency_key(self) -> None:
+        response = self.client.post(
+            "/v1/rooms/room-1/attempts",
+            headers={"Authorization": "Bearer " + self.token},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"code": "INVALID_REQUEST"})
+        self.assertEqual(self.provisioner.keys, [])
+
+    def test_enter_room_reduces_provisioning_failure(self) -> None:
+        self.provisioner.failure = RuntimeError("runtime detail must not escape")
+
+        response = self.client.post(
+            "/v1/rooms/room-1/attempts",
+            headers={
+                "Authorization": "Bearer " + self.token,
+                "Idempotency-Key": "failed-enter-room",
+            },
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json(), {"code": "ENTRY_FAILED"})
 
     def test_status_endpoint_returns_only_safe_owned_attempt_fields(self) -> None:
         attempt_id = self._ready()
