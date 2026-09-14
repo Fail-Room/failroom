@@ -1,6 +1,7 @@
 """Trusted in-process composition for the Failroom control plane."""
 
 from .config import ConfigurationError, ControllerConfig
+from .lifecycle import CleanupWorker, RoomLifecycleService, RoomStatus
 from .orchestrator import (
     LifecycleError,
     LifecycleOrchestrator,
@@ -23,6 +24,7 @@ __all__ = (
     "ControllerConfig",
     "DockerCleanupRuntime",
     "DockerProvisioningRuntime",
+    "CleanupWorker",
     "LifecycleError",
     "LifecycleOrchestrator",
     "ProvisioningRequest",
@@ -30,6 +32,8 @@ __all__ = (
     "ProvisioningSession",
     "phase_key",
     "ControlPlaneTerminalService",
+    "RoomLifecycleService",
+    "RoomStatus",
     "TerminalError",
     "TerminalRuntime",
     "TerminalSession",
