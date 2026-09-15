@@ -27,6 +27,7 @@ from fastapi.testclient import TestClient
 from failroom_control_plane.entry import RoomEntryService
 from failroom_control_plane.http import create_app
 from failroom_control_plane.lifecycle import RoomLifecycleService
+from failroom_control_plane.reset import RoomResetService
 
 
 class RecordingCleanupWorker:
@@ -118,6 +119,7 @@ class CapabilityHttpTests(unittest.TestCase):
             attempt_ttl=timedelta(minutes=15),
             now=lambda: self.now,
         )
+        self.reset = RoomResetService(self.backend, now=lambda: self.now)
         self.token = "local-token-with-at-least-32-bytes-0001"
         self.other_token = "other-token-with-at-least-32-bytes-0001"
         verifier = BearerIdentityVerifier(
@@ -144,6 +146,7 @@ class CapabilityHttpTests(unittest.TestCase):
                 now=lambda: self.now,
                 lifecycle=self.lifecycle,
                 entry=self.entry,
+                reset=self.reset,
             )
         )
 
@@ -306,6 +309,52 @@ class CapabilityHttpTests(unittest.TestCase):
         self.assertEqual(accepted.json()["state"], "STOPPING")
         self.assertTrue(accepted.json()["destroy_intent"])
         self.assertEqual(self.cleanup.calls, 1)
+
+    def test_reset_endpoint_returns_safe_owned_resetting_attempt(self) -> None:
+        attempt_id = self._ready()
+
+        missing = self.client.post(
+            f"/v1/attempts/{attempt_id}/reset",
+            headers={"Authorization": "Bearer " + self.token},
+        )
+        accepted = self.client.post(
+            f"/v1/attempts/{attempt_id}/reset",
+            headers={
+                "Authorization": "Bearer " + self.token,
+                "Idempotency-Key": "reset-attempt",
+            },
+        )
+
+        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(missing.json(), {"code": "INVALID_REQUEST"})
+        self.assertEqual(accepted.status_code, 202)
+        self.assertEqual(
+            accepted.json(),
+            {
+                "attempt_id": attempt_id,
+                "room_id": "room-1",
+                "state": "RESETTING",
+                "expires_at": self.deadline.isoformat(),
+                "destroy_intent": False,
+            },
+        )
+        self.assertNotIn("sandbox_id", accepted.json())
+        self.assertNotIn("generation", accepted.json())
+
+    def test_reset_endpoint_reduces_foreign_owner_denial(self) -> None:
+        attempt_id = self._ready()
+
+        response = self.client.post(
+            f"/v1/attempts/{attempt_id}/reset",
+            headers={
+                "Authorization": "Bearer " + self.other_token,
+                "Idempotency-Key": "foreign-reset",
+            },
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json(), {"code": "AUTHORIZATION_FAILED"})
+        self.assertEqual(self.backend.inspect(self.user, attempt_id).state, "READY")
 
     def test_status_endpoint_reduces_authentication_and_ownership_failures(
         self,

@@ -11,8 +11,10 @@ from .schema import (
     LEGACY_VERSION,
     MIGRATE_V1_TO_V2,
     MIGRATE_V2_TO_V3,
+    MIGRATE_V3_TO_V4,
     PREVIOUS_VERSION,
     STATEMENTS,
+    V2_VERSION,
     VERSION,
 )
 
@@ -93,6 +95,50 @@ _V3_COLUMNS = {
         "consumed_at",
     ),
 }
+_V3_FRESH_COLUMNS = {
+    **_V3_COLUMNS,
+    "sandbox_resources": (
+        "sandbox_id",
+        "attempt_id",
+        "generation",
+        "state",
+        "version",
+        "container_id",
+        "runtime_operation_id",
+        "expires_at",
+        "expiry_intent",
+        "destroy_intent",
+        "evidence_digest",
+        "cleanup_evidence_digest",
+    ),
+}
+_V4_COLUMNS = {
+    "room_attempts": (
+        "attempt_id",
+        "user_id",
+        "room_id",
+        "sandbox_id",
+        "generation",
+        "active_sandbox_id",
+        "active_generation",
+        "candidate_sandbox_id",
+        "candidate_generation",
+        "state",
+        "session_epoch",
+        "version",
+        "created_at",
+        "expires_at",
+        "provisioning_intent",
+        "reset_intent",
+        "expiry_intent",
+        "destroy_intent",
+        "runtime_operation_id",
+    ),
+    "sandbox_resources": _V3_FRESH_COLUMNS["sandbox_resources"],
+    "terminal_capability_uses": _V1_COLUMNS["terminal_capability_uses"],
+    "lifecycle_operations": _V1_COLUMNS["lifecycle_operations"],
+    "terminal_attachment_leases": _V3_COLUMNS["terminal_attachment_leases"],
+}
 _V1_OBJECTS = {("table", table) for table in _V1_COLUMNS} | {
     ("index", "attempts_expiry"),
     ("index", "operations_retry"),
@@ -105,6 +151,7 @@ _V3_OBJECTS = _V2_OBJECTS | {
     ("table", "terminal_attachment_leases"),
     ("index", "attachment_leases_expiry"),
 }
+_V4_OBJECTS = _V3_OBJECTS
 
 
 class CommitDenial(StoreError):
@@ -171,7 +218,7 @@ class Database:
     def _require_exact_v2(connection: sqlite3.Connection) -> None:
         application_id = connection.execute("PRAGMA application_id").fetchone()[0]
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if application_id != APPLICATION_ID or version != PREVIOUS_VERSION:
+        if application_id != APPLICATION_ID or version != V2_VERSION:
             raise StoreError("UNSUPPORTED_SCHEMA")
         Database._require_shape(connection, _V2_OBJECTS, _V2_COLUMNS)
 
@@ -179,9 +226,30 @@ class Database:
     def _require_exact_v3(connection: sqlite3.Connection) -> None:
         application_id = connection.execute("PRAGMA application_id").fetchone()[0]
         version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if application_id != APPLICATION_ID or version != PREVIOUS_VERSION:
+            raise StoreError("UNSUPPORTED_SCHEMA")
+        actual_objects = {
+            (row[0], row[1])
+            for row in connection.execute(
+                "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+            )
+        }
+        if actual_objects != _V3_OBJECTS:
+            raise StoreError("UNSUPPORTED_SCHEMA")
+        for table, expected in _V3_COLUMNS.items():
+            columns = tuple(
+                row[1] for row in connection.execute(f"PRAGMA table_info({table})")
+            )
+            if columns != expected and columns != _V3_FRESH_COLUMNS[table]:
+                raise StoreError("UNSUPPORTED_SCHEMA")
+
+    @staticmethod
+    def _require_exact_v4(connection: sqlite3.Connection) -> None:
+        application_id = connection.execute("PRAGMA application_id").fetchone()[0]
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
         if application_id != APPLICATION_ID or version != VERSION:
             raise StoreError("UNSUPPORTED_SCHEMA")
-        Database._require_shape(connection, _V3_OBJECTS, _V3_COLUMNS)
+        Database._require_shape(connection, _V4_OBJECTS, _V4_COLUMNS)
 
     @staticmethod
     def _check_integrity(connection: sqlite3.Connection) -> None:
@@ -229,7 +297,7 @@ class Database:
             for statement in MIGRATE_V1_TO_V2:
                 connection.execute(statement)
             self._check_integrity(connection)
-            connection.execute(f"PRAGMA user_version={PREVIOUS_VERSION}")
+            connection.execute(f"PRAGMA user_version={V2_VERSION}")
 
     def migrate_v2_to_v3(self, backup_path: Path) -> None:
         self._validate_backup_path(backup_path)
@@ -240,7 +308,42 @@ class Database:
             for statement in MIGRATE_V2_TO_V3:
                 connection.execute(statement)
             self._check_integrity(connection)
-            connection.execute(f"PRAGMA user_version={VERSION}")
+            connection.execute(f"PRAGMA user_version={PREVIOUS_VERSION}")
+
+    def migrate_v3_to_v4(self, backup_path: Path) -> None:
+        self._validate_backup_path(backup_path)
+        connection = self._connect()
+        try:
+            self._require_exact_v3(connection)
+            self._check_integrity(connection)
+            self._backup_to(connection, backup_path)
+            connection.execute("PRAGMA foreign_keys=OFF")
+            connection.execute("BEGIN")
+            try:
+                for statement in MIGRATE_V3_TO_V4:
+                    connection.execute(statement)
+                self._check_integrity(connection)
+                connection.execute(f"PRAGMA user_version={VERSION}")
+            except Exception:
+                connection.rollback()
+                raise
+            connection.commit()
+        except StoreError:
+            raise
+        except sqlite3.Error as error:
+            code = (
+                "STORE_BUSY"
+                if getattr(error, "sqlite_errorcode", None)
+                in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+                else "STORE_FAILURE"
+            )
+            raise StoreError(code) from None
+        finally:
+            try:
+                connection.execute("PRAGMA foreign_keys=ON")
+            except sqlite3.Error:
+                pass
+            connection.close()
 
     @staticmethod
     def _check_schema(connection: sqlite3.Connection) -> None:
@@ -251,7 +354,7 @@ class Database:
         if version == LEGACY_VERSION:
             Database._require_exact_v1(connection)
             raise StoreError("MIGRATION_REQUIRED")
-        if version in (PREVIOUS_VERSION, VERSION):
+        if version in (V2_VERSION, PREVIOUS_VERSION, VERSION):
             return
         raise StoreError("UNSUPPORTED_SCHEMA")
 

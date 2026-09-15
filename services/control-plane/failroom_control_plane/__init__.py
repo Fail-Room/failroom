@@ -15,6 +15,7 @@ from .orchestrator import (
     ProvisioningSession,
     phase_key,
 )
+from .reset import ResetError, RoomResetService
 from .runtime_docker import DockerCleanupRuntime, DockerProvisioningRuntime
 from .terminal import (
     ControlPlaneTerminalService,
@@ -41,7 +42,9 @@ __all__ = (
     "phase_key",
     "ControlPlaneTerminalService",
     "RoomLifecycleService",
+    "RoomResetService",
     "RoomStatus",
+    "ResetError",
     "TerminalError",
     "TerminalRuntime",
     "TerminalSession",

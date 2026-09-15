@@ -200,6 +200,47 @@ class MigrationTests(unittest.TestCase):
                 ).fetchone()
             )
 
+    def test_explicit_v3_to_v4_migration_preserves_active_binding(self):
+        with closing(sqlite3.connect(self.path)) as connection:
+            for statement in schema.V3_STATEMENTS:
+                connection.execute(statement)
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute(
+                """INSERT INTO room_attempts
+                (attempt_id,user_id,room_id,sandbox_id,generation,active_sandbox_id,
+                 state,created_at,expires_at,runtime_operation_id)
+                VALUES ('attempt-v3','alice','disk-full','sandbox-v3',1,'sandbox-v3',
+                        'READY',1,100,'runtime-v3')"""
+            )
+            connection.execute(
+                """INSERT INTO sandbox_resources
+                (sandbox_id,attempt_id,generation,state,container_id,runtime_operation_id,
+                 expires_at)
+                VALUES ('sandbox-v3','attempt-v3',1,'READY','container-v3','runtime-v3',100)"""
+            )
+            connection.execute(f"PRAGMA application_id={schema.APPLICATION_ID}")
+            connection.execute("PRAGMA user_version=3")
+            connection.commit()
+
+        database = Database(self.path, busy_timeout_ms=5000)
+        v4_backup = Path(self.temp.name) / "state-before-v4.sqlite3"
+        if not hasattr(database, "migrate_v3_to_v4"):
+            self.fail("Database must expose explicit v3-to-v4 migration")
+        database.migrate_v3_to_v4(v4_backup)
+        database.initialize()
+
+        with closing(sqlite3.connect(self.path)) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(
+                connection.execute(
+                    """SELECT active_sandbox_id,active_generation,candidate_sandbox_id
+                    FROM room_attempts WHERE attempt_id='attempt-v3'"""
+                ).fetchone(),
+                ("sandbox-v3", 1, None),
+            )
+        with closing(sqlite3.connect(v4_backup)) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
+
     def test_v2_to_v3_migration_rejects_existing_or_relative_backup(self):
         self.create_v1_database(self.path)
         database = Database(self.path, busy_timeout_ms=5000)

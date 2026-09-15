@@ -81,10 +81,14 @@ class Attempt:
     room_id: str
     state: str
     active_sandbox_id: str | None
+    active_generation: int | None
+    candidate_sandbox_id: str | None
+    candidate_generation: int | None
     session_epoch: int
     version: int
     expires_at: datetime
     provisioning_intent: bool
+    reset_intent: bool
     expiry_intent: bool
     destroy_intent: bool
 
@@ -95,6 +99,22 @@ class Attempt:
     @property
     def generation(self) -> int:
         return self.ref.generation
+
+    @property
+    def active_ref(self) -> ResourceRef | None:
+        if self.active_sandbox_id is None or self.active_generation is None:
+            return None
+        return ResourceRef(
+            self.ref.attempt_id, self.active_sandbox_id, self.active_generation
+        )
+
+    @property
+    def candidate_ref(self) -> ResourceRef | None:
+        if self.candidate_sandbox_id is None or self.candidate_generation is None:
+            return None
+        return ResourceRef(
+            self.ref.attempt_id, self.candidate_sandbox_id, self.candidate_generation
+        )
 
 
 @dataclass(frozen=True)

@@ -91,6 +91,32 @@ class MigrationCliTests(unittest.TestCase):
         database.migrate_v2_to_v3.assert_called_once_with(self.backup)
         database.migrate_v1_to_v2.assert_not_called()
 
+    def test_migrate_target_v4_delegates_to_v3_to_v4(self) -> None:
+        database = Mock()
+        factory = Mock(return_value=database)
+
+        result, stdout, stderr = self.run_cli(
+            [
+                "migrate",
+                "--database",
+                str(self.database),
+                "--backup",
+                str(self.backup),
+                "--busy-timeout-ms",
+                "5000",
+                "--target-version",
+                "4",
+            ],
+            database_factory=factory,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stdout, "MIGRATION_COMPLETED\n")
+        self.assertEqual(stderr, "")
+        database.migrate_v3_to_v4.assert_called_once_with(self.backup)
+        database.migrate_v1_to_v2.assert_not_called()
+        database.migrate_v2_to_v3.assert_not_called()
+
     def test_migrate_preserves_safe_store_error_codes(self) -> None:
         for code in (
             "MIGRATION_REQUIRED",

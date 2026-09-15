@@ -112,16 +112,24 @@ def owned(
     return row  # type: ignore[no-any-return]
 
 
-def binding(connection: sqlite3.Connection, ref: ResourceRef) -> sqlite3.Row:
+def binding(
+    connection: sqlite3.Connection, ref: ResourceRef, *, allow_active: bool = False
+) -> sqlite3.Row:
     ref_valid(ref)
     row = connection.execute(
         "SELECT * FROM room_attempts WHERE attempt_id=?", (ref.attempt_id,)
     ).fetchone()
-    if (
-        row is None
-        or row["sandbox_id"] != ref.sandbox_id
-        or row["generation"] != ref.generation
-    ):
+    current = (
+        row is not None
+        and row["sandbox_id"] == ref.sandbox_id
+        and row["generation"] == ref.generation
+    )
+    active = (
+        row is not None
+        and row["active_sandbox_id"] == ref.sandbox_id
+        and row["active_generation"] == ref.generation
+    )
+    if not current and (not allow_active or not active):
         raise StoreError("STALE_BINDING")
     return row  # type: ignore[no-any-return]
 
@@ -138,10 +146,14 @@ def attempt_record(row: sqlite3.Row) -> Attempt:
         str(row["room_id"]),
         str(row["state"]),
         str(row["active_sandbox_id"]) if row["active_sandbox_id"] else None,
+        int(row["active_generation"]) if row["active_generation"] else None,
+        str(row["candidate_sandbox_id"]) if row["candidate_sandbox_id"] else None,
+        int(row["candidate_generation"]) if row["candidate_generation"] else None,
         int(row["session_epoch"]),
         int(row["version"]),
         instant(int(row["expires_at"])),
         bool(row["provisioning_intent"]),
+        bool(row["reset_intent"]),
         bool(row["expiry_intent"]),
         bool(row["destroy_intent"]),
     )

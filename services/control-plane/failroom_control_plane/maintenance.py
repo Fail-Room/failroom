@@ -3,11 +3,13 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Protocol, runtime_checkable
 
 from failroom_state import (
     Action,
     BackendStore,
     CleanupRun,
+    Receipt,
     Role,
     ServiceIdentity,
 )
@@ -15,6 +17,19 @@ from failroom_state import (
 from .lifecycle import CleanupWorker
 
 Clock = Callable[[], datetime]
+
+
+@runtime_checkable
+class ResetProvisioner(Protocol):
+    def provision(
+        self,
+        receipt: Receipt,
+        *,
+        backend_identity: ServiceIdentity,
+        control_identity: ServiceIdentity,
+        key: str,
+        now: Clock,
+    ) -> None: ...
 
 
 class MaintenanceError(RuntimeError):
@@ -49,6 +64,7 @@ class LifecycleMaintenanceService:
         backend_identity: ServiceIdentity,
         limit: int,
         now: Clock,
+        reset_provisioner: ResetProvisioner | None = None,
     ) -> None:
         if (
             type(backend) is not BackendStore
@@ -60,12 +76,17 @@ class LifecycleMaintenanceService:
             )
             or type(backend_identity) is not ServiceIdentity
             or backend_identity.role is not Role.BACKEND
-            or not {Action.EXPIRE, Action.RECONCILE, Action.PUBLISH}.issubset(
-                backend_identity.scopes
-            )
+            or not (
+                {Action.EXPIRE, Action.RECONCILE, Action.PUBLISH}
+                | ({Action.CREATE} if reset_provisioner is not None else set())
+            ).issubset(backend_identity.scopes)
             or type(limit) is not int
             or not 1 <= limit <= 1000
             or not callable(now)
+            or (
+                reset_provisioner is not None
+                and not isinstance(reset_provisioner, ResetProvisioner)
+            )
         ):
             raise MaintenanceError("INVALID_CONFIGURATION")
         self._backend = backend
@@ -74,6 +95,7 @@ class LifecycleMaintenanceService:
         self._backend_identity = backend_identity
         self._limit = limit
         self._now = now
+        self._reset_provisioner = reset_provisioner
 
     def run_once(self) -> MaintenanceRun:
         try:
@@ -90,6 +112,18 @@ class LifecycleMaintenanceService:
             )
             if type(cleanup) is not CleanupRun:
                 raise TypeError
+            if self._reset_provisioner is not None:
+                for receipt in self._backend.pending_reset_provisioning(
+                    self._backend_identity,
+                    limit=self._limit,
+                ):
+                    self._reset_provisioner.provision(
+                        receipt,
+                        backend_identity=self._backend_identity,
+                        control_identity=self._control_identity,
+                        key="reset-resume:" + receipt.operation_id,
+                        now=self._now,
+                    )
         except Exception:
             raise MaintenanceError("MAINTENANCE_INCOMPLETE") from None
         return MaintenanceRun(expired=len(expired), cleanup=cleanup)

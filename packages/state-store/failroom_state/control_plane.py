@@ -151,8 +151,34 @@ class ControlPlaneStore:
             previous = replay(connection, actor, key, fingerprint)
             if previous is not None:
                 return previous
-            if attempt["state"] != "PROVISIONING" or not attempt["provisioning_intent"]:
+            initial_provisioning = (
+                attempt["state"] == "PROVISIONING" and attempt["provisioning_intent"]
+            )
+            reset_provisioning = (
+                attempt["state"] == "RESETTING"
+                and attempt["provisioning_intent"]
+                and attempt["reset_intent"]
+                and attempt["candidate_sandbox_id"] == ref.sandbox_id
+                and attempt["candidate_generation"] == ref.generation
+            )
+            if not initial_provisioning and not reset_provisioning:
                 raise StoreError("INVALID_TRANSITION")
+            if reset_provisioning:
+                old = connection.execute(
+                    """SELECT state,cleanup_evidence_digest FROM sandbox_resources
+                    WHERE sandbox_id=? AND attempt_id=? AND generation=?""",
+                    (
+                        attempt["active_sandbox_id"],
+                        ref.attempt_id,
+                        attempt["active_generation"],
+                    ),
+                ).fetchone()
+                if (
+                    old is None
+                    or old["state"] != "DESTROYED"
+                    or old["cleanup_evidence_digest"] is None
+                ):
+                    raise StoreError("INVALID_TRANSITION")
             if connection.execute(
                 "SELECT 1 FROM sandbox_resources WHERE sandbox_id=?", (ref.sandbox_id,)
             ).fetchone():
@@ -183,7 +209,7 @@ class ControlPlaneStore:
             raise StoreError("NOT_AUTHORIZED")
         service(identity, identity.role, Action.INSPECT)
         with self._database._transaction() as connection:
-            binding(connection, ref)
+            binding(connection, ref, allow_active=True)
             row = _resource(connection, ref)
             return Resource(
                 ref,
@@ -248,11 +274,21 @@ class ControlPlaneStore:
         )
         with self._database._transaction() as connection:
             clock = read_clock(now)
-            attempt = binding(connection, ref)
+            attempt = binding(connection, ref, allow_active=True)
             resource = _resource(connection, ref)
             cleanup = state in (ResourceState.STOPPING, ResourceState.DESTROYED) or (
                 state == ResourceState.FAILED and resource["destroy_intent"]
             )
+            active = (
+                attempt["active_sandbox_id"] == ref.sandbox_id
+                and attempt["active_generation"] == ref.generation
+            )
+            current = (
+                attempt["sandbox_id"] == ref.sandbox_id
+                and attempt["generation"] == ref.generation
+            )
+            if active and not current and not cleanup:
+                raise StoreError("INVALID_TRANSITION")
             if not cleanup:
                 _live(connection, attempt, resource, clock)
             previous = replay(connection, actor, key, fingerprint)
@@ -448,37 +484,66 @@ class ControlPlaneStore:
         with self._database._transaction() as connection:
             clock = read_clock(now)
             rows = connection.execute(
-                """SELECT a.* FROM room_attempts a
-                LEFT JOIN sandbox_resources r ON r.sandbox_id=a.sandbox_id
-                LEFT JOIN lifecycle_operations o ON o.actor='internal:cleanup'
+                """SELECT * FROM (
+                    SELECT a.*,r.sandbox_id AS cleanup_sandbox_id,
+                    r.generation AS cleanup_generation
+                    FROM room_attempts a JOIN sandbox_resources r
+                    ON r.attempt_id=a.attempt_id
+                    LEFT JOIN lifecycle_operations o ON o.actor='internal:cleanup'
+                    AND o.idempotency_key=r.sandbox_id
+                    WHERE a.state!='DESTROYED' AND r.state!='DESTROYED'
+                    AND (
+                        a.destroy_intent=1 OR a.expires_at<=? OR r.destroy_intent=1
+                        OR (
+                            a.reset_intent=1
+                            AND r.sandbox_id=a.active_sandbox_id
+                            AND r.generation=a.active_generation
+                        )
+                    )
+                    AND (o.operation_id IS NULL OR o.retry_at<=?)
+                    UNION ALL
+                    SELECT a.*,NULL AS cleanup_sandbox_id,
+                    NULL AS cleanup_generation
+                    FROM room_attempts a
+                    LEFT JOIN sandbox_resources r ON r.sandbox_id=a.sandbox_id
+                    LEFT JOIN lifecycle_operations o ON o.actor='internal:cleanup'
                     AND o.idempotency_key=a.sandbox_id
-                WHERE a.state!='DESTROYED' AND (r.state IS NULL OR r.state!='DESTROYED')
-                AND (a.destroy_intent=1 OR a.expires_at<=? OR r.destroy_intent=1)
-                AND (o.operation_id IS NULL OR o.retry_at<=?)
-                ORDER BY a.expires_at,a.attempt_id LIMIT ?""",
-                (clock, clock, limit),
+                    WHERE a.state!='DESTROYED' AND r.sandbox_id IS NULL
+                    AND (a.destroy_intent=1 OR a.expires_at<=?)
+                    AND (o.operation_id IS NULL OR o.retry_at<=?)
+                ) cleanup_candidates
+                ORDER BY expires_at,attempt_id,cleanup_sandbox_id LIMIT ?""",
+                (clock, clock, clock, clock, limit),
             ).fetchall()
             for attempt in rows:
-                ref = row_ref(attempt)
+                if attempt["cleanup_sandbox_id"] is None:
+                    ref = row_ref(attempt)
+                else:
+                    ref = ResourceRef(
+                        str(attempt["attempt_id"]),
+                        str(attempt["cleanup_sandbox_id"]),
+                        int(attempt["cleanup_generation"]),
+                    )
                 expired = clock >= attempt["expires_at"] or bool(
                     attempt["expiry_intent"]
                 )
                 # Even an interrupted create with no resource row has a reserved
                 # identity to inspect for absence. Do not silently mark it destroyed.
-                connection.execute(
-                    """INSERT INTO sandbox_resources
-                    (sandbox_id,attempt_id,generation,state,expires_at,destroy_intent,
-                     expiry_intent,runtime_operation_id) VALUES (?,?,?,'STOPPING',?,1,?,?)
-                    ON CONFLICT(sandbox_id) DO NOTHING""",
-                    (
-                        ref.sandbox_id,
-                        ref.attempt_id,
-                        ref.generation,
-                        attempt["expires_at"],
-                        int(expired),
-                        _runtime_binding(attempt, allow_legacy=True),
-                    ),
-                )
+                if attempt["cleanup_sandbox_id"] is None:
+                    connection.execute(
+                        """INSERT INTO sandbox_resources
+                        (sandbox_id,attempt_id,generation,state,expires_at,destroy_intent,
+                         expiry_intent,runtime_operation_id) VALUES (?,?,?,'STOPPING',?,1,?,?)
+                        ON CONFLICT(sandbox_id) DO NOTHING""",
+                        (
+                            ref.sandbox_id,
+                            ref.attempt_id,
+                            ref.generation,
+                            attempt["expires_at"],
+                            int(expired),
+                            _runtime_binding(attempt, allow_legacy=True),
+                        ),
+                    )
                 _stop(connection, _resource(connection, ref), expired)
                 resource = _resource(connection, ref)
                 connection.execute(
@@ -548,7 +613,7 @@ class ControlPlaneStore:
         )
         with self._database._transaction() as connection:
             clock = read_clock(now)
-            binding(connection, ref)
+            binding(connection, ref, allow_active=True)
             resource = _resource(connection, ref)
             previous = replay(connection, actor, key, fingerprint)
             if previous is not None:

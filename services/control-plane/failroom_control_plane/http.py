@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 
 from .entry import EntryError, RoomEntry, RoomEntryService
 from .lifecycle import LifecycleError, RoomLifecycleService, RoomStatus
+from .reset import ResetError, RoomResetService
 from .terminal import ControlPlaneTerminalService
 from .websocket import (
     TerminalGatewayProtocol,
@@ -100,6 +101,12 @@ def _lifecycle_error(error: LifecycleError) -> JSONResponse:
     return _error(code, status)
 
 
+def _reset_error(error: ResetError) -> JSONResponse:
+    status = _LIFECYCLE_STATUS.get(error.code, 500)
+    code = error.code if status != 403 else "AUTHORIZATION_FAILED"
+    return _error(code, status)
+
+
 def create_app(
     *,
     authority: BackendCapabilityAuthority,
@@ -110,6 +117,7 @@ def create_app(
     terminal_limits: WebSocketLimits | None = None,
     lifecycle: RoomLifecycleService | None = None,
     entry: RoomEntryService | None = None,
+    reset: RoomResetService | None = None,
 ) -> FastAPI:
     """Build an API app with all trust dependencies supplied by the caller."""
 
@@ -190,6 +198,25 @@ def create_app(
                 return _error(error.code, 401)
             except LifecycleError as error:
                 return _lifecycle_error(error)
+
+    if reset is not None:
+
+        @app.post("/v1/attempts/{attempt_id}/reset")
+        def reset_room(attempt_id: str, request: Request) -> JSONResponse:
+            key = request.headers.get("idempotency-key", "")
+            if not key:
+                return _error("INVALID_REQUEST", 400)
+            try:
+                return _status_response(
+                    reset.reset(
+                        _authenticated_identity(verifier, request), attempt_id, key=key
+                    ),
+                    code=202,
+                )
+            except _AuthenticationFailure as error:
+                return _error(error.code, 401)
+            except ResetError as error:
+                return _reset_error(error)
 
     if any(value is not None for value in (gateway, terminal, terminal_limits)):
         if gateway is None or terminal is None or terminal_limits is None:

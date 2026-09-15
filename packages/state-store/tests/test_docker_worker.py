@@ -193,6 +193,70 @@ class DockerCleanupWorkerTests(unittest.TestCase):
         self.assertTrue(self.resource(ref).expiry_intent)
         self.assertTrue(self.backend.inspect(self.alice, ref.attempt_id).expiry_intent)
 
+    def test_reset_cleanup_finalizes_old_resource_without_destroying_attempt(self):
+        receipt = self.backend.create(
+            self.alice,
+            "disk-full",
+            key="reset-ready",
+            expires_at=self.current + timedelta(minutes=30),
+            now=lambda: self.current,
+        )
+        resource = self.control.accept(
+            ServiceIdentity("creator", Role.BACKEND, frozenset({Action.CREATE})),
+            receipt.ref,
+            key="accept-reset-ready",
+            now=lambda: self.current,
+        )
+        resource = self.control.transition(
+            self.control_identity,
+            receipt.ref,
+            expected_version=resource.version,
+            state=ResourceState.CREATING,
+            key="create-reset-ready",
+            now=lambda: self.current,
+        )
+        resource = self.control.transition(
+            self.control_identity,
+            receipt.ref,
+            expected_version=resource.version,
+            state=ResourceState.STARTING,
+            key="start-reset-ready",
+            now=lambda: self.current,
+            container_id="reset-container",
+        )
+        resource = self.control.transition(
+            self.control_identity,
+            receipt.ref,
+            expected_version=resource.version,
+            state=ResourceState.READY,
+            key="ready-reset-ready",
+            now=lambda: self.current,
+            evidence_digest="sha256:" + "a" * 64,
+        )
+        self.backend.publish_ready(
+            ServiceIdentity("publisher", Role.BACKEND, frozenset({Action.PUBLISH})),
+            receipt.ref,
+            expected_version=0,
+            key="publish-reset-ready",
+            now=lambda: self.current,
+        )
+        attempt = self.backend.inspect(self.alice, receipt.attempt_id)
+        candidate = self.backend.begin_reset(
+            self.alice,
+            attempt.ref,
+            key="begin-worker-reset",
+            now=lambda: self.current,
+        )
+
+        self.assert_counts(self.run_worker(), 1, 0, 1)
+
+        resetting = self.backend.inspect(self.alice, receipt.attempt_id)
+        self.assertEqual(resetting.state, "RESETTING")
+        self.assertEqual(resetting.active_ref, receipt.ref)
+        self.assertEqual(resetting.candidate_ref, candidate.ref)
+        self.assertEqual(self.resource(receipt.ref).state, ResourceState.DESTROYED)
+        self.assertEqual(self.runtime.targets[0].ref, receipt.ref)
+
     def test_runtime_failure_persists_fixed_code_and_future_backoff(self):
         for code in ("RUNTIME_UNAVAILABLE", "CLEANUP_INCOMPLETE"):
             with self.subTest(code=code):

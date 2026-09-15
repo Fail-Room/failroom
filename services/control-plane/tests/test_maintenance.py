@@ -2,12 +2,15 @@ import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from failroom_state import (
     Action,
     BackendStore,
     CleanupRun,
     Database,
+    Receipt,
+    ResourceRef,
     Role,
     ServiceIdentity,
     UserIdentity,
@@ -39,6 +42,24 @@ class RecordingCleanupWorker:
         return CleanupRun(destroyed=0, deferred=0, finalized=0)
 
 
+class RecordingResetProvisioner:
+    def __init__(self) -> None:
+        self.calls: list[tuple[Receipt, str]] = []
+
+    def provision(
+        self,
+        receipt: Receipt,
+        *,
+        backend_identity: ServiceIdentity,
+        control_identity: ServiceIdentity,
+        key: str,
+        now,
+    ) -> None:
+        del backend_identity, control_identity
+        now()
+        self.calls.append((receipt, key))
+
+
 class LifecycleMaintenanceServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -58,7 +79,7 @@ class LifecycleMaintenanceServiceTests(unittest.TestCase):
         self.backend_identity = ServiceIdentity(
             "maintenance-backend",
             Role.BACKEND,
-            frozenset({Action.EXPIRE, Action.RECONCILE, Action.PUBLISH}),
+            frozenset({Action.CREATE, Action.EXPIRE, Action.RECONCILE, Action.PUBLISH}),
         )
         self.cleanup = RecordingCleanupWorker()
 
@@ -116,6 +137,36 @@ class LifecycleMaintenanceServiceTests(unittest.TestCase):
         attempt = self.backend.inspect(self.user, attempt_id)
         self.assertEqual(attempt.state, "STOPPING")
         self.assertTrue(attempt.expiry_intent)
+
+    def test_run_once_resumes_exact_reset_candidate_after_cleanup(self) -> None:
+        candidate = Receipt(
+            "reset-operation",
+            ResourceRef("attempt-reset", "sandbox-reset", 2),
+            "RESETTING",
+            3,
+        )
+        provisioner = RecordingResetProvisioner()
+        service = LifecycleMaintenanceService(
+            self.backend,
+            self.cleanup,
+            control_identity=self.control_identity,
+            backend_identity=self.backend_identity,
+            limit=10,
+            now=lambda: self.now,
+            reset_provisioner=provisioner,
+        )
+
+        with patch.object(
+            self.backend,
+            "pending_reset_provisioning",
+            return_value=(candidate,),
+        ) as pending:
+            service.run_once()
+
+        pending.assert_called_once_with(self.backend_identity, limit=10)
+        self.assertEqual(len(provisioner.calls), 1)
+        self.assertEqual(provisioner.calls[0][0], candidate)
+        self.assertTrue(provisioner.calls[0][1].startswith("reset-resume:"))
 
 
 if __name__ == "__main__":

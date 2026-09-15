@@ -89,7 +89,10 @@ class LifecycleOrchestrator:
         key: str,
         now: Clock,
     ) -> None:
-        if type(receipt) is not Receipt or receipt.state != "PROVISIONING":
+        if type(receipt) is not Receipt or receipt.state not in (
+            "PROVISIONING",
+            "RESETTING",
+        ):
             raise LifecycleError("INVALID_REQUEST")
         try:
             accepted = self._control.accept(
@@ -100,6 +103,7 @@ class LifecycleOrchestrator:
             )
             current = self._control.inspect(control_identity, receipt.ref)
             if current.state == ResourceState.READY:
+                self._publish_ready(receipt, backend_identity, key, now)
                 return
             self._require_runtime_binding(current)
             if current.state != ResourceState.REQUESTED:
@@ -150,6 +154,8 @@ class LifecycleOrchestrator:
                     self._fail(
                         current,
                         control_identity,
+                        backend_identity,
+                        receipt,
                         key,
                         now,
                         error,
@@ -177,6 +183,8 @@ class LifecycleOrchestrator:
                     self._fail(
                         current,
                         control_identity,
+                        backend_identity,
+                        receipt,
                         key,
                         now,
                         error,
@@ -189,6 +197,8 @@ class LifecycleOrchestrator:
             self._fail(
                 current,
                 control_identity,
+                backend_identity,
+                receipt,
                 key,
                 now,
                 error,
@@ -208,7 +218,21 @@ class LifecycleOrchestrator:
         current = self._control.inspect(control_identity, current.ref)
         if current.version != ready.version:
             raise StoreError("STALE_BINDING")
-        self._backend.publish_ready(
+        self._publish_ready(receipt, backend_identity, key, now)
+
+    def _publish_ready(
+        self,
+        receipt: Receipt,
+        backend_identity: ServiceIdentity,
+        key: str,
+        now: Clock,
+    ) -> None:
+        publish = (
+            self._backend.publish_ready
+            if receipt.state == "PROVISIONING"
+            else self._backend.publish_reset_ready
+        )
+        publish(
             backend_identity,
             receipt.ref,
             expected_version=receipt.version,
@@ -231,7 +255,9 @@ class LifecycleOrchestrator:
     def _fail(
         self,
         resource: Resource,
-        identity: ServiceIdentity,
+        control_identity: ServiceIdentity,
+        backend_identity: ServiceIdentity,
+        receipt: Receipt,
         root_key: str,
         now: Clock,
         error: DockerError,
@@ -239,7 +265,7 @@ class LifecycleOrchestrator:
         phase: str,
     ) -> None:
         self._control.transition(
-            identity,
+            control_identity,
             resource.ref,
             expected_version=resource.version,
             state=ResourceState.FAILED,
@@ -247,3 +273,11 @@ class LifecycleOrchestrator:
             now=now,
             error_code=self._failure_code(error, phase),
         )
+        if receipt.state == "RESETTING":
+            self._backend.fail_reset(
+                backend_identity,
+                receipt.ref,
+                expected_version=receipt.version,
+                key=phase_key(root_key, "reset-failed", receipt.ref, receipt.version),
+                now=now,
+            )
