@@ -93,6 +93,18 @@ class LocalRuntimeConfigTests(unittest.TestCase):
                 LocalRuntimeConfig.from_environment()
         self.assertEqual(raised.exception.code, "INVALID_CONFIGURATION")
 
+    def test_rejects_expired_bearer_token_before_listener_starts(self) -> None:
+        environment = dict(self.environment)
+        environment["FAILROOM_LOCAL_TOKEN_EXPIRES_AT"] = "2030-01-01T00:00:00+00:00"
+
+        with self.assertRaises(LocalRuntimeError) as raised:
+            LocalRuntimeConfig.from_environment(
+                environment,
+                now=lambda: datetime(2030, 1, 1, tzinfo=UTC),
+            )
+
+        self.assertEqual(raised.exception.code, "INVALID_CONFIGURATION")
+
     def test_keeps_only_bearer_digest(self) -> None:
         with patch.dict(os.environ, self.environment, clear=True):
             config = LocalRuntimeConfig.from_environment()

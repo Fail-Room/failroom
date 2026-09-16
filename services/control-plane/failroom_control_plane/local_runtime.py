@@ -97,6 +97,10 @@ def _float(environment: Mapping[str, str], name: str) -> float:
     return value
 
 
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
 @dataclass(frozen=True)
 class LocalRuntimeConfig:
     bind_host: str
@@ -115,9 +119,17 @@ class LocalRuntimeConfig:
     maintenance_limit: int
 
     @classmethod
-    def from_environment(cls, environment: Mapping[str, str] | None = None) -> Self:
+    def from_environment(
+        cls,
+        environment: Mapping[str, str] | None = None,
+        *,
+        now: Clock | None = None,
+    ) -> Self:
         values = os.environ if environment is None else environment
         try:
+            clock: Clock = _utc_now if now is None else now
+            if not callable(clock):
+                raise LocalRuntimeError()
             host = _required(values, "FAILROOM_LOCAL_BIND_HOST")
             if host not in {"127.0.0.1", "::1"}:
                 raise LocalRuntimeError()
@@ -137,6 +149,11 @@ class LocalRuntimeConfig:
                 _required(values, "FAILROOM_LOCAL_TOKEN_EXPIRES_AT")
             )
             if expires_at.tzinfo is None:
+                raise LocalRuntimeError()
+            current_time = clock()
+            if not isinstance(current_time, datetime) or current_time.tzinfo is None:
+                raise LocalRuntimeError()
+            if expires_at.astimezone(UTC) <= current_time.astimezone(UTC):
                 raise LocalRuntimeError()
             profile = StrictDockerProfile(
                 image=_required(values, "FAILROOM_DOCKER_IMAGE"),
