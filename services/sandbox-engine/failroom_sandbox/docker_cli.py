@@ -215,6 +215,38 @@ class DockerCli:
             raise DockerError("INVALID_DOCKER_RESPONSE")
         return ids
 
+    def allocate_workspace_file(
+        self, container_id: str, *, uid: int, gid: int, size_bytes: int, path: str
+    ) -> None:
+        """Allocate one bounded file through a fixed trusted Docker argv."""
+
+        _container_selector(container_id)
+        if (
+            type(uid) is not int
+            or type(gid) is not int
+            or not 1 <= uid <= 2_147_483_647
+            or not 1 <= gid <= 2_147_483_647
+            or type(size_bytes) is not int
+            or not 1 <= size_bytes <= 1 << 40
+            or type(path) is not str
+            or re.fullmatch(r"/workspace/[a-zA-Z0-9._-]{1,128}", path) is None
+            or ".." in path
+        ):
+            raise DockerError("INVALID_DOCKER_REQUEST")
+        self._call(
+            (
+                "container",
+                "exec",
+                "--user",
+                f"{uid}:{gid}",
+                container_id,
+                "/usr/bin/fallocate",
+                "-l",
+                str(size_bytes),
+                path,
+            )
+        )
+
     def create(self, argv: tuple[str, ...]) -> str:
         if argv[:3] != ("docker", "container", "create"):
             raise DockerError("INVALID_DOCKER_REQUEST")
