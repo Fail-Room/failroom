@@ -287,6 +287,85 @@ class LinuxControlPlaneIntegrationTests(unittest.TestCase):
                 )
                 self.cleanup.destroy_and_verify_absent(target)
 
+    def test_reset_leave_cleans_every_generation_from_docker_inventory(self) -> None:
+        receipt = None
+        old_resource = None
+        try:
+            receipt = self.backend.create(
+                self.user,
+                "disk-full",
+                key=uuid4().hex,
+                expires_at=self.deadline,
+                now=lambda: self.now,
+            )
+            self.orchestrator.provision(
+                receipt,
+                backend_identity=self.backend_identity,
+                control_identity=self.control_identity,
+                key=uuid4().hex,
+                now=lambda: self.now,
+            )
+            old_resource = self.control.inspect(self.control_identity, receipt.ref)
+            candidate = self.backend.begin_reset(
+                self.user,
+                receipt.ref,
+                key=uuid4().hex,
+                now=lambda: self.now,
+            )
+            self.backend.leave(
+                self.user,
+                candidate.ref,
+                key=uuid4().hex,
+                now=lambda: self.now,
+            )
+
+            first = self.worker.run_once(
+                self.control_identity,
+                self.cleanup_backend_identity,
+                now=lambda: self.now,
+                limit=10,
+            )
+            self.assertEqual(first.destroyed, 2)
+            self.assertEqual(first.finalized, 0)
+            second = self.worker.run_once(
+                self.control_identity,
+                self.cleanup_backend_identity,
+                now=lambda: self.now,
+                limit=10,
+            )
+            self.assertEqual(second.destroyed, 0)
+            self.assertEqual(second.finalized, 1)
+            self.assertEqual(
+                self.backend.inspect(self.user, receipt.attempt_id).state, "DESTROYED"
+            )
+
+            old_binding = DockerBinding(
+                receipt.ref.attempt_id,
+                receipt.ref.sandbox_id,
+                receipt.ref.generation,
+            )
+            candidate_binding = DockerBinding(
+                candidate.ref.attempt_id,
+                candidate.ref.sandbox_id,
+                candidate.ref.generation,
+            )
+            self.assertEqual(
+                self.inspect_cli.list_containers(_exact_label_filters(old_binding)), ()
+            )
+            self.assertEqual(
+                self.inspect_cli.list_containers(_exact_label_filters(candidate_binding)),
+                (),
+            )
+        finally:
+            if receipt is not None and old_resource is not None:
+                target = CleanupTarget(
+                    receipt.ref,
+                    old_resource.container_id,
+                    old_resource.runtime_operation_id,
+                    "linux-reset-leave-finally",
+                )
+                self.cleanup.destroy_and_verify_absent(target)
+
 
 if __name__ == "__main__":
     unittest.main()
