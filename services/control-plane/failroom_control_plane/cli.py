@@ -2,7 +2,7 @@
 
 import argparse
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import NoReturn, TextIO
@@ -10,6 +10,7 @@ from typing import NoReturn, TextIO
 import uvicorn
 from failroom_state import Database, StoreError
 
+from .local_environment import load_operator_environment
 from .local_runtime import (
     LocalRuntimeConfig,
     LocalRuntimeError,
@@ -45,13 +46,27 @@ def _parser() -> argparse.ArgumentParser:
     migrate.add_argument("--backup", required=True)
     migrate.add_argument("--busy-timeout-ms", required=True, type=int)
     migrate.add_argument("--target-version", choices=("2", "3", "4"), default="2")
-    subparsers.add_parser("serve-local", add_help=False)
-    subparsers.add_parser("verify-local", add_help=False)
+    serve_local = subparsers.add_parser("serve-local", add_help=False)
+    serve_local.add_argument("--environment-file")
+    verify_local = subparsers.add_parser("verify-local", add_help=False)
+    verify_local.add_argument("--environment-file")
     return parser
 
 
-def _serve_local() -> None:
-    config = LocalRuntimeConfig.from_environment()
+def _runtime_config(environment: Mapping[str, str] | None) -> LocalRuntimeConfig:
+    if environment is None:
+        return LocalRuntimeConfig.from_environment()
+    return LocalRuntimeConfig.from_environment(environment)
+
+
+def _operator_environment(environment_file: str | None) -> Mapping[str, str] | None:
+    if environment_file is None:
+        return None
+    return load_operator_environment(environment_file)
+
+
+def _serve_local(environment: Mapping[str, str] | None = None) -> None:
+    config = _runtime_config(environment)
     runtime = build_runtime(config, now=lambda: datetime.now(UTC))
     uvicorn.run(
         runtime.app,
@@ -62,9 +77,9 @@ def _serve_local() -> None:
     )
 
 
-def _verify_local() -> None:
+def _verify_local(environment: Mapping[str, str] | None = None) -> None:
     """Validate local Docker and seccomp prerequisites without starting a runtime."""
-    config = LocalRuntimeConfig.from_environment()
+    config = _runtime_config(environment)
     preflight_runtime(config)
 
 
@@ -72,8 +87,8 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     database_factory: type[Database] | None = None,
-    local_runner: Callable[[], None] | None = None,
-    local_verifier: Callable[[], None] | None = None,
+    local_runner: Callable[[Mapping[str, str] | None], None] | None = None,
+    local_verifier: Callable[[Mapping[str, str] | None], None] | None = None,
     stdout: TextIO = sys.stdout,
     stderr: TextIO = sys.stderr,
 ) -> int:
@@ -82,13 +97,15 @@ def main(
     try:
         args = _parser().parse_args(argv)
         if args.command == "serve-local":
+            environment = _operator_environment(args.environment_file)
             runner = _serve_local if local_runner is None else local_runner
-            runner()
+            runner(environment)
             stdout.write("LOCAL_RUNTIME_STOPPED\n")
             return 0
         if args.command == "verify-local":
+            environment = _operator_environment(args.environment_file)
             verifier = _verify_local if local_verifier is None else local_verifier
-            verifier()
+            verifier(environment)
             stdout.write("LOCAL_RUNTIME_VERIFIED\n")
             return 0
         if args.command != "migrate":
@@ -115,3 +132,7 @@ def main(
         return 2
     stdout.write("MIGRATION_COMPLETED\n")
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
