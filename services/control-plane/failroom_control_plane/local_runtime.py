@@ -18,9 +18,11 @@ from failroom_api import (
     BearerIdentityVerifier,
     CapabilityCodec,
 )
+from failroom_sandbox.docker_cli import DockerCli
 from failroom_sandbox.docker_lifecycle import DockerDiagnosticLifecycle
 from failroom_sandbox.docker_profile import StrictDockerProfile
 from failroom_sandbox.pty import DockerPtyRuntime, PtyLimits
+from failroom_sandbox.seccomp import SeccompPolicyStore
 from failroom_sandbox.terminal_gateway import TerminalGatewayAuthority
 from failroom_state import (
     Action,
@@ -258,6 +260,30 @@ class LocalRuntime:
     gateway_identity: ServiceIdentity
 
 
+def preflight_runtime(
+    config: LocalRuntimeConfig,
+    *,
+    docker: DockerCli | None = None,
+    policies: SeccompPolicyStore | None = None,
+) -> None:
+    """Verify trusted Docker and seccomp inputs before opening a listener."""
+    if type(config) is not LocalRuntimeConfig:
+        raise LocalRuntimeError()
+    try:
+        cli = config.controller.docker_cli() if docker is None else docker
+        store = (
+            config.controller.seccomp_policy_store() if policies is None else policies
+        )
+        cli.inspect_image(config.controller.profile.image)
+        with store.pin(
+            config.controller.profile.seccomp_path,
+            config.controller.profile.seccomp_digest,
+        ):
+            pass
+    except Exception:
+        raise LocalRuntimeError("RUNTIME_UNAVAILABLE") from None
+
+
 async def _maintenance_loop(
     maintenance: LifecycleMaintenanceService, interval: timedelta
 ) -> None:
@@ -306,6 +332,7 @@ def build_runtime(config: LocalRuntimeConfig, *, now: Clock) -> LocalRuntime:
     if type(config) is not LocalRuntimeConfig or not callable(now):
         raise LocalRuntimeError()
     try:
+        preflight_runtime(config)
         database = Database(
             config.controller.database_path,
             busy_timeout_ms=config.database_busy_timeout_ms,

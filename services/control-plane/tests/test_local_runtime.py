@@ -2,6 +2,7 @@ import hashlib
 import os
 import tempfile
 import unittest
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -118,7 +119,10 @@ class LocalRuntimeConfigTests(unittest.TestCase):
     def test_builds_distinct_service_identities(self) -> None:
         with patch.dict(os.environ, self.environment, clear=True):
             config = LocalRuntimeConfig.from_environment()
-        runtime = build_runtime(config, now=lambda: datetime(2026, 9, 15, tzinfo=UTC))
+        with patch("failroom_control_plane.local_runtime.preflight_runtime"):
+            runtime = build_runtime(
+                config, now=lambda: datetime(2026, 9, 15, tzinfo=UTC)
+            )
         self.assertEqual(
             {
                 runtime.backend_identity.service_id,
@@ -137,15 +141,60 @@ class LocalRuntimeConfigTests(unittest.TestCase):
     def test_runtime_app_runs_maintenance_at_listener_boundaries(self) -> None:
         with patch.dict(os.environ, self.environment, clear=True):
             config = LocalRuntimeConfig.from_environment()
-        with patch.object(
-            LifecycleMaintenanceService, "run_once", autospec=True
-        ) as run_once:
+        with (
+            patch("failroom_control_plane.local_runtime.preflight_runtime"),
+            patch.object(
+                LifecycleMaintenanceService, "run_once", autospec=True
+            ) as run_once,
+        ):
             runtime = build_runtime(
                 config, now=lambda: datetime(2026, 9, 15, tzinfo=UTC)
             )
             with TestClient(runtime.app):
                 self.assertEqual(run_once.call_count, 1)
         self.assertEqual(run_once.call_count, 2)
+
+    def test_preflight_verifies_image_before_pinning_seccomp_policy(self) -> None:
+        from failroom_control_plane.local_runtime import preflight_runtime
+
+        with patch.dict(os.environ, self.environment, clear=True):
+            config = LocalRuntimeConfig.from_environment()
+        events: list[str] = []
+
+        class Docker:
+            def inspect_image(self, image: str) -> dict[str, object]:
+                events.append("image:" + image)
+                return {"Id": "sha256:" + "b" * 64}
+
+        class Policies:
+            @contextmanager
+            def pin(self, source_path: str, expected_digest: str):
+                events.append("pin:" + source_path + ":" + expected_digest)
+                yield "/trusted/pinned-policy.json"
+
+        preflight_runtime(config, docker=Docker(), policies=Policies())
+
+        self.assertEqual(
+            events,
+            [
+                "image:" + config.controller.profile.image,
+                "pin:"
+                + config.controller.profile.seccomp_path
+                + ":"
+                + config.controller.profile.seccomp_digest,
+            ],
+        )
+
+    def test_build_runtime_runs_preflight_before_constructing_application(self) -> None:
+        with patch.dict(os.environ, self.environment, clear=True):
+            config = LocalRuntimeConfig.from_environment()
+
+        with patch(
+            "failroom_control_plane.local_runtime.preflight_runtime"
+        ) as preflight:
+            build_runtime(config, now=lambda: datetime(2026, 9, 15, tzinfo=UTC))
+
+        preflight.assert_called_once_with(config)
 
 
 if __name__ == "__main__":
