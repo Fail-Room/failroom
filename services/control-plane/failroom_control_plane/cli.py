@@ -2,11 +2,15 @@
 
 import argparse
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import NoReturn, TextIO
 
+import uvicorn
 from failroom_state import Database, StoreError
+
+from .local_runtime import LocalRuntimeConfig, LocalRuntimeError, build_runtime
 
 __all__ = ("main",)
 
@@ -36,13 +40,27 @@ def _parser() -> argparse.ArgumentParser:
     migrate.add_argument("--backup", required=True)
     migrate.add_argument("--busy-timeout-ms", required=True, type=int)
     migrate.add_argument("--target-version", choices=("2", "3", "4"), default="2")
+    subparsers.add_parser("serve-local", add_help=False)
     return parser
+
+
+def _serve_local() -> None:
+    config = LocalRuntimeConfig.from_environment()
+    runtime = build_runtime(config, now=lambda: datetime.now(UTC))
+    uvicorn.run(
+        runtime.app,
+        host=config.bind_host,
+        port=config.bind_port,
+        log_config=None,
+        access_log=False,
+    )
 
 
 def main(
     argv: Sequence[str] | None = None,
     *,
     database_factory: type[Database] | None = None,
+    local_runner: Callable[[], None] | None = None,
     stdout: TextIO = sys.stdout,
     stderr: TextIO = sys.stderr,
 ) -> int:
@@ -50,6 +68,11 @@ def main(
     factory = Database if database_factory is None else database_factory
     try:
         args = _parser().parse_args(argv)
+        if args.command == "serve-local":
+            runner = _serve_local if local_runner is None else local_runner
+            runner()
+            stdout.write("LOCAL_RUNTIME_STOPPED\n")
+            return 0
         if args.command != "migrate":
             raise ValueError("INVALID_CONFIGURATION")
         database = factory(Path(args.database), busy_timeout_ms=args.busy_timeout_ms)
@@ -62,6 +85,9 @@ def main(
     except StoreError as error:
         code = error.code if error.code in _SAFE_STORE_CODES else "STORE_FAILURE"
         stderr.write(code + "\n")
+        return 2
+    except LocalRuntimeError as error:
+        stderr.write(error.code + "\n")
         return 2
     except (SystemExit, ValueError, TypeError, OSError):
         stderr.write("INVALID_CONFIGURATION\n")

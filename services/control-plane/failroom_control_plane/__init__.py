@@ -2,6 +2,12 @@
 
 from .config import ConfigurationError, ControllerConfig
 from .lifecycle import CleanupWorker, RoomLifecycleService, RoomStatus
+from .local_runtime import (
+    LocalRuntime,
+    LocalRuntimeConfig,
+    LocalRuntimeError,
+    build_runtime,
+)
 from .maintenance import (
     LifecycleMaintenanceService,
     MaintenanceError,
@@ -34,6 +40,9 @@ __all__ = (
     "LifecycleError",
     "LifecycleMaintenanceService",
     "LifecycleOrchestrator",
+    "LocalRuntime",
+    "LocalRuntimeConfig",
+    "LocalRuntimeError",
     "MaintenanceError",
     "MaintenanceRun",
     "ProvisioningRequest",
@@ -50,5 +59,6 @@ __all__ = (
     "TerminalSession",
     "TerminalGatewayProtocol",
     "WebSocketLimits",
+    "build_runtime",
     "serve_terminal",
 )

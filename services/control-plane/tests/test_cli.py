@@ -1,12 +1,16 @@
 import io
 import tempfile
 import unittest
+from datetime import UTC
 from pathlib import Path
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import ANY, Mock, patch
 
 from failroom_state import StoreError
 
+from failroom_control_plane import cli
 from failroom_control_plane.cli import main
+from failroom_control_plane.local_runtime import LocalRuntimeError
 
 
 class MigrationCliTests(unittest.TestCase):
@@ -17,14 +21,18 @@ class MigrationCliTests(unittest.TestCase):
         self.database = root / "state.sqlite3"
         self.backup = root / "state-before-v2.sqlite3"
 
-    def run_cli(self, argv: list[str], *, database_factory=None):
+    def run_cli(self, argv: list[str], *, database_factory=None, local_runner=None):
         stdout = io.StringIO()
         stderr = io.StringIO()
+        kwargs = {}
+        if local_runner is not None:
+            kwargs["local_runner"] = local_runner
         result = main(
             argv,
             database_factory=database_factory,
             stdout=stdout,
             stderr=stderr,
+            **kwargs,
         )
         return result, stdout.getvalue(), stderr.getvalue()
 
@@ -168,6 +176,49 @@ class MigrationCliTests(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertEqual(stderr, "INVALID_CONFIGURATION\n")
         factory.assert_not_called()
+
+    def test_serve_local_dispatches_injected_runner(self) -> None:
+        runner = Mock()
+
+        result, stdout, stderr = self.run_cli(["serve-local"], local_runner=runner)
+
+        self.assertEqual((result, stdout, stderr), (0, "LOCAL_RUNTIME_STOPPED\n", ""))
+        runner.assert_called_once()
+
+    def test_serve_local_reduces_runtime_failure(self) -> None:
+        result, stdout, stderr = self.run_cli(
+            ["serve-local"], local_runner=Mock(side_effect=LocalRuntimeError())
+        )
+
+        self.assertEqual((result, stdout, stderr), (2, "", "INVALID_CONFIGURATION\n"))
+
+    def test_default_local_runner_builds_loopback_uvicorn_server(self) -> None:
+        config = SimpleNamespace(bind_host="127.0.0.1", bind_port=8765)
+        runtime = SimpleNamespace(app=object())
+
+        with (
+            patch(
+                "failroom_control_plane.cli.LocalRuntimeConfig.from_environment",
+                return_value=config,
+            ) as from_environment,
+            patch(
+                "failroom_control_plane.cli.build_runtime", return_value=runtime
+            ) as build_runtime,
+            patch("failroom_control_plane.cli.uvicorn.run") as run_server,
+        ):
+            cli._serve_local()
+
+        from_environment.assert_called_once_with()
+        build_runtime.assert_called_once_with(config, now=ANY)
+        now = build_runtime.call_args.kwargs["now"]
+        self.assertEqual(now().tzinfo, UTC)
+        run_server.assert_called_once_with(
+            runtime.app,
+            host="127.0.0.1",
+            port=8765,
+            log_config=None,
+            access_log=False,
+        )
 
 
 if __name__ == "__main__":

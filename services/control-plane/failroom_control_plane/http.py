@@ -12,6 +12,7 @@ from failroom_api import (
 from failroom_state import UserIdentity
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.types import Lifespan
 
 from .entry import EntryError, RoomEntry, RoomEntryService
 from .lifecycle import LifecycleError, RoomLifecycleService, RoomStatus
@@ -118,10 +119,16 @@ def create_app(
     lifecycle: RoomLifecycleService | None = None,
     entry: RoomEntryService | None = None,
     reset: RoomResetService | None = None,
+    lifespan: Lifespan[FastAPI] | None = None,
 ) -> FastAPI:
     """Build an API app with all trust dependencies supplied by the caller."""
 
-    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        lifespan=lifespan,
+    )
 
     if entry is not None:
 

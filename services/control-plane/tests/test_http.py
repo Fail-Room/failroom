@@ -1,6 +1,7 @@
 import hashlib
 import tempfile
 import unittest
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -122,7 +123,7 @@ class CapabilityHttpTests(unittest.TestCase):
         self.reset = RoomResetService(self.backend, now=lambda: self.now)
         self.token = "local-token-with-at-least-32-bytes-0001"
         self.other_token = "other-token-with-at-least-32-bytes-0001"
-        verifier = BearerIdentityVerifier(
+        self.verifier = BearerIdentityVerifier(
             {
                 hashlib.sha256(
                     self.token.encode("ascii")
@@ -142,13 +143,33 @@ class CapabilityHttpTests(unittest.TestCase):
         self.client = TestClient(
             create_app(
                 authority=self.authority,
-                verifier=verifier,
+                verifier=self.verifier,
                 now=lambda: self.now,
                 lifecycle=self.lifecycle,
                 entry=self.entry,
                 reset=self.reset,
             )
         )
+
+    def test_create_app_runs_injected_lifespan(self) -> None:
+        events: list[str] = []
+
+        @asynccontextmanager
+        async def lifespan(_app):
+            events.append("started")
+            yield
+            events.append("stopped")
+
+        app = create_app(
+            authority=self.authority,
+            verifier=self.verifier,
+            now=lambda: self.now,
+            lifespan=lifespan,
+        )
+
+        with TestClient(app):
+            self.assertEqual(events, ["started"])
+        self.assertEqual(events, ["started", "stopped"])
 
     def _ready(self) -> str:
         receipt = self.backend.create(
