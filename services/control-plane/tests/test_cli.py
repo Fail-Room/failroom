@@ -1,4 +1,5 @@
 import io
+import os
 import subprocess
 import sys
 import tempfile
@@ -194,7 +195,7 @@ class MigrationCliTests(unittest.TestCase):
         result, stdout, stderr = self.run_cli(["serve-local"], local_runner=runner)
 
         self.assertEqual((result, stdout, stderr), (0, "LOCAL_RUNTIME_STOPPED\n", ""))
-        runner.assert_called_once()
+        runner.assert_called_once_with(None)
 
     def test_serve_local_reduces_runtime_failure(self) -> None:
         result, stdout, stderr = self.run_cli(
@@ -209,7 +210,7 @@ class MigrationCliTests(unittest.TestCase):
         result, stdout, stderr = self.run_cli(["verify-local"], local_verifier=verifier)
 
         self.assertEqual((result, stdout, stderr), (0, "LOCAL_RUNTIME_VERIFIED\n", ""))
-        verifier.assert_called_once()
+        verifier.assert_called_once_with(None)
 
     def test_verify_local_reduces_runtime_failure(self) -> None:
         result, stdout, stderr = self.run_cli(
@@ -218,6 +219,20 @@ class MigrationCliTests(unittest.TestCase):
         )
 
         self.assertEqual((result, stdout, stderr), (2, "", "RUNTIME_UNAVAILABLE\n"))
+
+    def test_verify_local_loads_explicit_operator_environment_file(self) -> None:
+        environment_file = Path(self.temp.name) / "operator.env"
+        environment_file.write_text("FAILROOM_LOCAL_BIND_HOST=127.0.0.1\n")
+        os.chmod(environment_file, 0o600)
+        verifier = Mock()
+
+        result, stdout, stderr = self.run_cli(
+            ["verify-local", "--environment-file", str(environment_file)],
+            local_verifier=verifier,
+        )
+
+        self.assertEqual((result, stdout, stderr), (0, "LOCAL_RUNTIME_VERIFIED\n", ""))
+        verifier.assert_called_once_with({"FAILROOM_LOCAL_BIND_HOST": "127.0.0.1"})
 
     def test_module_entrypoint_routes_verify_local_to_main(self) -> None:
         completed = subprocess.run(
