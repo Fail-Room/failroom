@@ -162,9 +162,9 @@ class _SubprocessPtySession:
         if fcntl is None or termios is None:
             raise PtyError("PTY_UNAVAILABLE")
         try:
-            fcntl.ioctl(  # type: ignore[attr-defined]
+            fcntl.ioctl(
                 self._master_fd,
-                termios.TIOCSWINSZ,  # type: ignore[attr-defined]
+                termios.TIOCSWINSZ,
                 struct.pack("HHHH", rows, columns, 0, 0),
             )
         except OSError:
@@ -185,8 +185,8 @@ class _SubprocessPtySession:
         self._closed = True
         try:
             try:
-                os.killpg(  # type: ignore[attr-defined]
-                    os.getpgid(self._process.pid),  # type: ignore[attr-defined]
+                os.killpg(
+                    os.getpgid(self._process.pid),
                     signal.SIGTERM,
                 )
             except (ProcessLookupError, OSError):

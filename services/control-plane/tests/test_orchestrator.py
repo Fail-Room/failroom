@@ -35,7 +35,7 @@ class FakeSession:
             error = self.runtime.create_error
             self.runtime.create_error = None
             raise error
-        return CreatedContainer("c" * 64, False)
+        return CreatedContainer(f"{len(self.runtime.bindings):064x}", False)
 
     def start_verified(self, created: CreatedContainer) -> ContainerObservation:
         self.runtime.calls.append("start:STARTING")
@@ -158,6 +158,96 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "START_FAILED")
         self.assertEqual(self.resource(receipt).state, ResourceState.FAILED)
         self.assertNotEqual(self.attempt(receipt).state, "READY")
+
+    def test_reset_provisions_exact_candidate_after_old_resource_destruction(self):
+        receipt = self.create_attempt()
+        self.provision(receipt)
+        attempt = self.attempt(receipt)
+        resource = self.resource(receipt)
+        candidate = self.backend.begin_reset(
+            self.user,
+            attempt.ref,
+            key="begin-reset",
+            now=lambda: self.now,
+        )
+        stopping = self.control.transition(
+            self.control_identity,
+            attempt.ref,
+            expected_version=resource.version,
+            state=ResourceState.STOPPING,
+            key="stop-reset-old",
+            now=lambda: self.now,
+        )
+        self.control.transition(
+            self.control_identity,
+            attempt.ref,
+            expected_version=stopping.version,
+            state=ResourceState.DESTROYED,
+            key="destroy-reset-old",
+            now=lambda: self.now,
+            evidence_digest="sha256:" + "b" * 64,
+        )
+
+        self.orchestrator.provision(
+            candidate,
+            backend_identity=self.backend_identity,
+            control_identity=self.control_identity,
+            key="root-reset",
+            now=lambda: self.now,
+        )
+
+        current = self.attempt(receipt)
+        self.assertEqual(current.state, "READY")
+        self.assertEqual(current.active_ref, candidate.ref)
+        self.assertIsNone(current.candidate_ref)
+        self.assertEqual(self.resource(candidate).state, ResourceState.READY)
+        self.assertEqual(self.runtime.bindings[-1].sandbox_id, candidate.ref.sandbox_id)
+
+    def test_reset_provisioning_failure_marks_attempt_failed(self) -> None:
+        receipt = self.create_attempt()
+        self.provision(receipt)
+        attempt = self.attempt(receipt)
+        resource = self.resource(receipt)
+        candidate = self.backend.begin_reset(
+            self.user,
+            attempt.ref,
+            key="begin-failing-reset",
+            now=lambda: self.now,
+        )
+        stopping = self.control.transition(
+            self.control_identity,
+            attempt.ref,
+            expected_version=resource.version,
+            state=ResourceState.STOPPING,
+            key="stop-failing-reset-old",
+            now=lambda: self.now,
+        )
+        self.control.transition(
+            self.control_identity,
+            attempt.ref,
+            expected_version=stopping.version,
+            state=ResourceState.DESTROYED,
+            key="destroy-failing-reset-old",
+            now=lambda: self.now,
+            evidence_digest="sha256:" + "b" * 64,
+        )
+        self.runtime.create_error = DockerError("RUNTIME_UNAVAILABLE")
+
+        with self.assertRaises(LifecycleError) as caught:
+            self.orchestrator.provision(
+                candidate,
+                backend_identity=self.backend_identity,
+                control_identity=self.control_identity,
+                key="root-failing-reset",
+                now=lambda: self.now,
+            )
+
+        current = self.attempt(receipt)
+        self.assertEqual(caught.exception.code, "RUNTIME_UNAVAILABLE")
+        self.assertEqual(current.state, "FAILED")
+        self.assertTrue(current.reset_intent)
+        self.assertEqual(current.candidate_ref, candidate.ref)
+        self.assertTrue(self.resource(candidate).destroy_intent)
 
 
 if __name__ == "__main__":

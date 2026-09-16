@@ -23,6 +23,7 @@ from failroom_state import (
     ServiceIdentity,
     StoreError,
     UserIdentity,
+    schema,
 )
 
 
@@ -135,7 +136,9 @@ class StoreTests(unittest.TestCase):
                     "terminal_attachment_leases",
                 },
             )
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(
+                conn.execute("PRAGMA user_version").fetchone()[0], schema.VERSION
+            )
             self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
 
     def test_preallocation_and_owner_filtered_inspect(self):
@@ -349,6 +352,356 @@ class StoreTests(unittest.TestCase):
         attempt = self.backend.inspect(self.alice, resource.attempt_id)
         self.assertEqual(attempt.state, "PROVISIONING")
         self.assertIsNone(attempt.active_sandbox_id)
+
+    def test_begin_reset_revokes_active_generation_and_reserves_candidate(self):
+        attempt, _ = self.ready()
+        claims = self.claims(attempt)
+
+        reset = self.backend.begin_reset(
+            self.alice,
+            attempt.ref,
+            key="reset-1",
+            now=lambda: self.now,
+        )
+
+        current = self.backend.inspect(self.alice, attempt.attempt_id)
+        self.assertEqual(current.state, "RESETTING")
+        self.assertTrue(current.reset_intent)
+        self.assertEqual(current.session_epoch, attempt.session_epoch + 1)
+        self.assertEqual(current.active_ref, attempt.ref)
+        self.assertEqual(current.candidate_ref, reset.ref)
+        self.assertNotEqual(reset.ref.sandbox_id, attempt.ref.sandbox_id)
+        self.assertEqual(reset.ref.generation, attempt.ref.generation + 1)
+        self.assertEqual(
+            reset,
+            self.backend.begin_reset(
+                self.alice,
+                attempt.ref,
+                key="reset-1",
+                now=lambda: self.now,
+            ),
+        )
+        self.assert_error("STALE_BINDING", lambda: self.consume(claims))
+
+    def test_reset_allows_cleanup_only_for_old_active_resource(self):
+        attempt, resource = self.ready()
+        self.backend.begin_reset(
+            self.alice,
+            attempt.ref,
+            key="reset-cleanup",
+            now=lambda: self.now,
+        )
+
+        stopping = self.control.transition(
+            self.service(Role.CONTROL_PLANE, Action.TRANSITION),
+            attempt.ref,
+            expected_version=resource.version,
+            state=ResourceState.STOPPING,
+            key="stop-old-for-reset",
+            now=lambda: self.now,
+        )
+
+        self.assertEqual(stopping.ref, attempt.ref)
+        self.assertEqual(stopping.state, "STOPPING")
+        self.assert_error(
+            "INVALID_TRANSITION",
+            lambda: self.control.transition(
+                self.service(Role.CONTROL_PLANE, Action.TRANSITION),
+                attempt.ref,
+                expected_version=stopping.version,
+                state=ResourceState.RUNNING,
+                key="run-old-for-reset",
+                now=lambda: self.now,
+            ),
+        )
+
+    def test_reset_accepts_candidate_only_after_old_resource_is_destroyed(self):
+        attempt, resource = self.ready()
+        candidate = self.backend.begin_reset(
+            self.alice,
+            attempt.ref,
+            key="reset-candidate",
+            now=lambda: self.now,
+        )
+        stopping = self.control.transition(
+            self.service(Role.CONTROL_PLANE, Action.TRANSITION),
+            attempt.ref,
+            expected_version=resource.version,
+            state=ResourceState.STOPPING,
+            key="stop-old-before-candidate",
+            now=lambda: self.now,
+        )
+        self.control.transition(
+            self.service(Role.CONTROL_PLANE, Action.TRANSITION),
+            attempt.ref,
+            expected_version=stopping.version,
+            state=ResourceState.DESTROYED,
+            key="destroy-old-before-candidate",
+            evidence_digest=self.evidence,
+            now=lambda: self.now,
+        )
+
+        accepted = self.control.accept(
+            self.service(Role.BACKEND, Action.CREATE),
+            candidate.ref,
+            key="accept-reset-candidate",
+            now=lambda: self.now,
+        )
+
+        self.assertEqual(accepted.ref, candidate.ref)
+        self.assertEqual(accepted.state, "REQUESTED")
+
+    def test_reset_promotes_only_ready_candidate_to_active_binding(self):
+        attempt, resource = self.ready()
+        candidate = self.backend.begin_reset(
+            self.alice,
+            attempt.ref,
+            key="reset-promote",
+            now=lambda: self.now,
+        )
+        stopping = self.control.transition(
+            self.service(Role.CONTROL_PLANE, Action.TRANSITION),
+            attempt.ref,
+            expected_version=resource.version,
+            state=ResourceState.STOPPING,
+            key="stop-old-for-promote",
+            now=lambda: self.now,
+        )
+        self.control.transition(
+            self.service(Role.CONTROL_PLANE, Action.TRANSITION),
+            attempt.ref,
+            expected_version=stopping.version,
+            state=ResourceState.DESTROYED,
+            key="destroy-old-for-promote",
+            evidence_digest=self.evidence,
+            now=lambda: self.now,
+        )
+        candidate_resource = self.control.accept(
+            self.service(Role.BACKEND, Action.CREATE),
+            candidate.ref,
+            key="accept-candidate-for-promote",
+            now=lambda: self.now,
+        )
+        candidate_resource = self.advance(
+            candidate_resource,
+            ResourceState.CREATING,
+            key="create-reset-candidate",
+        )
+        candidate_resource = self.advance(
+            candidate_resource,
+            ResourceState.STARTING,
+            key="start-reset-candidate",
+            container_id="candidate-container",
+        )
+        candidate_resource = self.advance(
+            candidate_resource,
+            ResourceState.READY,
+            key="ready-reset-candidate",
+            evidence_digest=self.evidence,
+        )
+        resetting = self.backend.inspect(self.alice, attempt.attempt_id)
+
+        published = self.backend.publish_reset_ready(
+            self.service(Role.BACKEND, Action.PUBLISH),
+            candidate_resource.ref,
+            expected_version=resetting.version,
+            key="publish-reset-candidate",
+            now=lambda: self.now,
+        )
+
+        current = self.backend.inspect(self.alice, attempt.attempt_id)
+        self.assertEqual(published.state, "READY")
+        self.assertEqual(current.state, "READY")
+        self.assertFalse(current.reset_intent)
+        self.assertEqual(current.active_ref, candidate.ref)
+        self.assertIsNone(current.candidate_ref)
+
+    def test_reset_reconcile_schedules_old_active_resource_cleanup(self):
+        attempt, resource = self.ready()
+        self.backend.begin_reset(
+            self.alice,
+            attempt.ref,
+            key="reset-reconcile-old",
+            now=lambda: self.now,
+        )
+        self.control.transition(
+            self.service(Role.CONTROL_PLANE, Action.TRANSITION),
+            attempt.ref,
+            expected_version=resource.version,
+            state=ResourceState.STOPPING,
+            key="stop-old-for-reconcile",
+            now=lambda: self.now,
+        )
+
+        tasks = self.control.reconcile(
+            self.service(Role.CONTROL_PLANE, Action.RECONCILE),
+            now=lambda: self.now,
+            limit=10,
+        )
+
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].ref, attempt.ref)
+        self.assertEqual(tasks[0].state, "STOPPING")
+
+    def test_reset_reconcile_recovers_cleanup_after_interrupted_coordinator(self):
+        attempt, _ = self.ready()
+        self.backend.begin_reset(
+            self.alice,
+            attempt.ref,
+            key="reset-interrupted-coordinator",
+            now=lambda: self.now,
+        )
+
+        tasks = self.control.reconcile(
+            self.service(Role.CONTROL_PLANE, Action.RECONCILE),
+            now=lambda: self.now,
+            limit=10,
+        )
+
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].ref, attempt.ref)
+        self.assertEqual(tasks[0].state, "STOPPING")
+        self.assertTrue(
+            self.control.inspect(
+                self.service(Role.CONTROL_PLANE, Action.INSPECT), attempt.ref
+            ).destroy_intent
+        )
+
+    def test_reset_old_cleanup_does_not_destroy_candidate_attempt(self):
+        attempt, resource = self.ready()
+        candidate = self.backend.begin_reset(
+            self.alice,
+            attempt.ref,
+            key="reset-finalize-old",
+            now=lambda: self.now,
+        )
+        stopping = self.control.transition(
+            self.service(Role.CONTROL_PLANE, Action.TRANSITION),
+            attempt.ref,
+            expected_version=resource.version,
+            state=ResourceState.STOPPING,
+            key="stop-old-for-finalize",
+            now=lambda: self.now,
+        )
+        self.control.transition(
+            self.service(Role.CONTROL_PLANE, Action.TRANSITION),
+            attempt.ref,
+            expected_version=stopping.version,
+            state=ResourceState.DESTROYED,
+            key="destroy-old-for-finalize",
+            evidence_digest=self.evidence,
+            now=lambda: self.now,
+        )
+
+        finalized = self.backend.complete_cleanup(
+            self.service(Role.BACKEND, Action.PUBLISH),
+            attempt.ref,
+            key="complete-old-reset-cleanup",
+            now=lambda: self.now,
+        )
+
+        current = self.backend.inspect(self.alice, attempt.attempt_id)
+        self.assertEqual(finalized.state, "DESTROYED")
+        self.assertEqual(current.state, "RESETTING")
+        self.assertEqual(current.active_ref, attempt.ref)
+        self.assertEqual(current.candidate_ref, candidate.ref)
+
+    def test_reset_candidate_failure_marks_attempt_failed_for_cleanup(self):
+        attempt, resource = self.ready()
+        candidate = self.backend.begin_reset(
+            self.alice,
+            attempt.ref,
+            key="reset-failed-candidate",
+            now=lambda: self.now,
+        )
+        stopping = self.control.transition(
+            self.service(Role.CONTROL_PLANE, Action.TRANSITION),
+            attempt.ref,
+            expected_version=resource.version,
+            state=ResourceState.STOPPING,
+            key="stop-old-for-failed-candidate",
+            now=lambda: self.now,
+        )
+        self.control.transition(
+            self.service(Role.CONTROL_PLANE, Action.TRANSITION),
+            attempt.ref,
+            expected_version=stopping.version,
+            state=ResourceState.DESTROYED,
+            key="destroy-old-for-failed-candidate",
+            evidence_digest=self.evidence,
+            now=lambda: self.now,
+        )
+        candidate_resource = self.control.accept(
+            self.service(Role.BACKEND, Action.CREATE),
+            candidate.ref,
+            key="accept-failed-candidate",
+            now=lambda: self.now,
+        )
+        candidate_resource = self.advance(
+            candidate_resource,
+            ResourceState.CREATING,
+            key="create-failed-candidate",
+        )
+        self.control.transition(
+            self.service(Role.CONTROL_PLANE, Action.TRANSITION),
+            candidate.ref,
+            expected_version=candidate_resource.version,
+            state=ResourceState.FAILED,
+            key="fail-reset-candidate",
+            error_code="CREATE_FAILED",
+            now=lambda: self.now,
+        )
+
+        failed = self.backend.fail_reset(
+            self.service(Role.BACKEND, Action.PUBLISH),
+            candidate.ref,
+            expected_version=candidate.version,
+            key="publish-reset-failure",
+            now=lambda: self.now,
+        )
+
+        current = self.backend.inspect(self.alice, attempt.attempt_id)
+        self.assertEqual(failed.state, "FAILED")
+        self.assertEqual(current.state, "FAILED")
+        self.assertTrue(current.reset_intent)
+        self.assertEqual(current.candidate_ref, candidate.ref)
+
+    def test_pending_reset_provisioning_requires_destroyed_old_resource(self):
+        attempt, resource = self.ready()
+        candidate = self.backend.begin_reset(
+            self.alice,
+            attempt.ref,
+            key="reset-pending-provisioning",
+            now=lambda: self.now,
+        )
+        identity = self.service(Role.BACKEND, Action.RECONCILE)
+
+        self.assertEqual(
+            self.backend.pending_reset_provisioning(identity, limit=10),
+            (),
+        )
+        stopping = self.control.transition(
+            self.service(Role.CONTROL_PLANE, Action.TRANSITION),
+            attempt.ref,
+            expected_version=resource.version,
+            state=ResourceState.STOPPING,
+            key="stop-old-for-pending-provisioning",
+            now=lambda: self.now,
+        )
+        self.control.transition(
+            self.service(Role.CONTROL_PLANE, Action.TRANSITION),
+            attempt.ref,
+            expected_version=stopping.version,
+            state=ResourceState.DESTROYED,
+            key="destroy-old-for-pending-provisioning",
+            evidence_digest=self.evidence,
+            now=lambda: self.now,
+        )
+
+        self.assertEqual(
+            self.backend.pending_reset_provisioning(identity, limit=10),
+            (candidate,),
+        )
 
     def test_capability_consumption_is_atomic_and_only_hash_is_stored(self):
         attempt, _ = self.ready()

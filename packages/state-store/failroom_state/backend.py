@@ -88,13 +88,14 @@ class BackendStore:
             runtime_id = uuid4().hex
             connection.execute(
                 """INSERT INTO room_attempts
-                (attempt_id,user_id,room_id,sandbox_id,generation,state,created_at,expires_at,
-                 runtime_operation_id)
-                VALUES (?,?,?,?,1,'PROVISIONING',?,?,?)""",
+                (attempt_id,user_id,room_id,sandbox_id,generation,candidate_sandbox_id,
+                 candidate_generation,state,created_at,expires_at,runtime_operation_id)
+                VALUES (?,?,?,?,1,?,1,'PROVISIONING',?,?,?)""",
                 (
                     ref.attempt_id,
                     identity.user_id,
                     room_id,
+                    ref.sandbox_id,
                     ref.sandbox_id,
                     clock,
                     deadline,
@@ -137,6 +138,60 @@ class BackendStore:
                 int(row["version"]),
             )
 
+    def begin_reset(
+        self, identity: UserIdentity, ref: ResourceRef, *, key: str, now: Clock
+    ) -> Receipt:
+        ref_valid(ref)
+        with self._database._transaction() as connection:
+            clock = read_clock(now)
+            row = owned(connection, identity, ref.attempt_id)
+            actor = user(identity, str(row["room_id"]))
+            fingerprint = request_hash(
+                "begin-reset", [ref.attempt_id, ref.sandbox_id, ref.generation]
+            )
+            previous = replay(connection, actor, key, fingerprint)
+            if previous is not None:
+                return previous
+            binding(connection, ref)
+            if clock >= row["expires_at"]:
+                _stop(connection, row, clock)
+                raise CommitDenial("ATTEMPT_UNAVAILABLE")
+            if (
+                row["state"] not in ("READY", "RUNNING", "RESOLVED")
+                or row["destroy_intent"]
+                or row["active_sandbox_id"] != ref.sandbox_id
+                or row["active_generation"] != ref.generation
+            ):
+                raise StoreError("INVALID_TRANSITION")
+            candidate = ResourceRef(ref.attempt_id, str(uuid4()), ref.generation + 1)
+            runtime_id = uuid4().hex
+            version = int(row["version"]) + 1
+            connection.execute(
+                """UPDATE room_attempts SET sandbox_id=?,generation=?,
+                candidate_sandbox_id=?,candidate_generation=?,state='RESETTING',
+                provisioning_intent=1,reset_intent=1,session_epoch=session_epoch+1,
+                version=?,runtime_operation_id=? WHERE attempt_id=?""",
+                (
+                    candidate.sandbox_id,
+                    candidate.generation,
+                    candidate.sandbox_id,
+                    candidate.generation,
+                    version,
+                    runtime_id,
+                    ref.attempt_id,
+                ),
+            )
+            return finish(
+                connection,
+                actor,
+                "begin-reset",
+                key,
+                fingerprint,
+                candidate,
+                "RESETTING",
+                version,
+            )
+
     def publish_ready(
         self,
         identity: ServiceIdentity,
@@ -173,7 +228,9 @@ class BackendStore:
                 raise StoreError("INVALID_TRANSITION")
             connection.execute(
                 """UPDATE room_attempts SET state='READY',active_sandbox_id=sandbox_id,
-                provisioning_intent=0,version=version+1 WHERE attempt_id=?""",
+                active_generation=generation,candidate_sandbox_id=NULL,
+                candidate_generation=NULL,provisioning_intent=0,version=version+1
+                WHERE attempt_id=?""",
                 (ref.attempt_id,),
             )
             return finish(
@@ -184,6 +241,131 @@ class BackendStore:
                 fingerprint,
                 ref,
                 "READY",
+                expected_version + 1,
+            )
+
+    def publish_reset_ready(
+        self,
+        identity: ServiceIdentity,
+        ref: ResourceRef,
+        *,
+        expected_version: int,
+        key: str,
+        now: Clock,
+    ) -> Receipt:
+        actor = service(identity, Role.BACKEND, Action.PUBLISH)
+        ref_valid(ref)
+        fingerprint = request_hash(
+            "publish-reset-ready",
+            [ref.attempt_id, ref.sandbox_id, ref.generation, expected_version],
+        )
+        with self._database._transaction() as connection:
+            clock = read_clock(now)
+            row = binding(connection, ref)
+            previous = replay(connection, actor, key, fingerprint)
+            if previous is not None:
+                return previous
+            if clock >= row["expires_at"]:
+                _stop(connection, row, clock)
+                raise CommitDenial("ATTEMPT_UNAVAILABLE")
+            if row["destroy_intent"]:
+                raise StoreError("ATTEMPT_UNAVAILABLE")
+            cas(row, expected_version)
+            candidate = connection.execute(
+                "SELECT * FROM sandbox_resources WHERE sandbox_id=?",
+                (ref.sandbox_id,),
+            ).fetchone()
+            active = connection.execute(
+                "SELECT * FROM sandbox_resources WHERE sandbox_id=?",
+                (row["active_sandbox_id"],),
+            ).fetchone()
+            if (
+                row["state"] != "RESETTING"
+                or not row["reset_intent"]
+                or not row["provisioning_intent"]
+                or row["candidate_sandbox_id"] != ref.sandbox_id
+                or row["candidate_generation"] != ref.generation
+                or candidate is None
+                or candidate["state"] != "READY"
+                or candidate["destroy_intent"]
+                or active is None
+                or active["state"] != "DESTROYED"
+                or active["cleanup_evidence_digest"] is None
+            ):
+                raise StoreError("INVALID_TRANSITION")
+            connection.execute(
+                """UPDATE room_attempts SET state='READY',active_sandbox_id=?,
+                active_generation=?,candidate_sandbox_id=NULL,candidate_generation=NULL,
+                provisioning_intent=0,reset_intent=0,version=version+1
+                WHERE attempt_id=?""",
+                (ref.sandbox_id, ref.generation, ref.attempt_id),
+            )
+            return finish(
+                connection,
+                actor,
+                "publish-reset-ready",
+                key,
+                fingerprint,
+                ref,
+                "READY",
+                expected_version + 1,
+            )
+
+    def fail_reset(
+        self,
+        identity: ServiceIdentity,
+        ref: ResourceRef,
+        *,
+        expected_version: int,
+        key: str,
+        now: Clock,
+    ) -> Receipt:
+        actor = service(identity, Role.BACKEND, Action.PUBLISH)
+        ref_valid(ref)
+        fingerprint = request_hash(
+            "fail-reset",
+            [ref.attempt_id, ref.sandbox_id, ref.generation, expected_version],
+        )
+        with self._database._transaction() as connection:
+            clock = read_clock(now)
+            row = binding(connection, ref)
+            previous = replay(connection, actor, key, fingerprint)
+            if previous is not None:
+                return previous
+            if clock >= row["expires_at"]:
+                _stop(connection, row, clock)
+                raise CommitDenial("ATTEMPT_UNAVAILABLE")
+            if row["destroy_intent"]:
+                raise StoreError("ATTEMPT_UNAVAILABLE")
+            cas(row, expected_version)
+            candidate = connection.execute(
+                "SELECT * FROM sandbox_resources WHERE sandbox_id=?",
+                (ref.sandbox_id,),
+            ).fetchone()
+            if (
+                row["state"] != "RESETTING"
+                or not row["reset_intent"]
+                or not row["provisioning_intent"]
+                or row["candidate_sandbox_id"] != ref.sandbox_id
+                or row["candidate_generation"] != ref.generation
+                or candidate is None
+                or candidate["state"] != "FAILED"
+                or not candidate["destroy_intent"]
+            ):
+                raise StoreError("INVALID_TRANSITION")
+            connection.execute(
+                """UPDATE room_attempts SET state='FAILED',provisioning_intent=0,
+                version=version+1 WHERE attempt_id=?""",
+                (ref.attempt_id,),
+            )
+            return finish(
+                connection,
+                actor,
+                "fail-reset",
+                key,
+                fingerprint,
+                ref,
+                "FAILED",
                 expected_version + 1,
             )
 
@@ -220,6 +402,43 @@ class BackendStore:
             ).fetchall()
             return tuple(row_ref(row) for row in rows)
 
+    def pending_reset_provisioning(
+        self, identity: ServiceIdentity, *, limit: int
+    ) -> tuple[Receipt, ...]:
+        service(identity, Role.BACKEND, Action.RECONCILE)
+        positive(limit, maximum=1000)
+        with self._database._transaction() as connection:
+            rows = connection.execute(
+                """SELECT a.*,o.operation_id,o.result_version
+                FROM room_attempts a
+                JOIN sandbox_resources old ON old.attempt_id=a.attempt_id
+                AND old.sandbox_id=a.active_sandbox_id
+                AND old.generation=a.active_generation
+                LEFT JOIN sandbox_resources candidate
+                ON candidate.attempt_id=a.attempt_id
+                AND candidate.sandbox_id=a.sandbox_id
+                AND candidate.generation=a.generation
+                JOIN lifecycle_operations o ON o.attempt_id=a.attempt_id
+                AND o.sandbox_id=a.sandbox_id AND o.generation=a.generation
+                AND o.action='begin-reset' AND o.result_state='RESETTING'
+                WHERE a.state='RESETTING' AND a.provisioning_intent=1
+                AND a.reset_intent=1 AND a.expiry_intent=0 AND a.destroy_intent=0
+                AND old.state='DESTROYED'
+                AND old.cleanup_evidence_digest IS NOT NULL
+                AND (candidate.sandbox_id IS NULL OR candidate.state IN ('REQUESTED','READY'))
+                ORDER BY a.expires_at,a.attempt_id LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            return tuple(
+                Receipt(
+                    str(row["operation_id"]),
+                    row_ref(row),
+                    "RESETTING",
+                    int(row["result_version"]),
+                )
+                for row in rows
+            )
+
     def complete_cleanup(
         self, identity: ServiceIdentity, ref: ResourceRef, *, key: str, now: Clock
     ) -> Receipt:
@@ -230,7 +449,7 @@ class BackendStore:
         )
         with self._database._transaction() as connection:
             clock = read_clock(now)
-            row = binding(connection, ref)
+            row = binding(connection, ref, allow_active=True)
             previous = replay(connection, actor, key, fingerprint)
             if previous is not None:
                 return previous
@@ -244,12 +463,29 @@ class BackendStore:
                 or resource["cleanup_evidence_digest"] is None
             ):
                 raise StoreError("CLEANUP_UNVERIFIED")
+            current = (
+                row["sandbox_id"] == ref.sandbox_id
+                and row["generation"] == ref.generation
+            )
+            if not current:
+                if row["state"] != "RESETTING" or not row["reset_intent"]:
+                    raise StoreError("INVALID_TRANSITION")
+                return finish(
+                    connection,
+                    actor,
+                    "complete-cleanup",
+                    key,
+                    fingerprint,
+                    ref,
+                    "DESTROYED",
+                    int(resource["version"]),
+                )
             _stop(connection, row, clock)
             row = binding(connection, ref)
             version = int(row["version"]) + int(row["state"] != "DESTROYED")
             connection.execute(
                 """UPDATE room_attempts SET state='DESTROYED',active_sandbox_id=NULL,
-                version=? WHERE attempt_id=?""",
+                active_generation=NULL,version=? WHERE attempt_id=?""",
                 (version, ref.attempt_id),
             )
             return finish(

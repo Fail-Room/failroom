@@ -1,6 +1,7 @@
 import hashlib
 import tempfile
 import unittest
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -14,6 +15,7 @@ from failroom_api import (
 from failroom_state import (
     Action,
     BackendStore,
+    CleanupRun,
     ControlPlaneStore,
     Database,
     ResourceState,
@@ -23,7 +25,48 @@ from failroom_state import (
 )
 from fastapi.testclient import TestClient
 
+from failroom_control_plane.entry import RoomEntryService
 from failroom_control_plane.http import create_app
+from failroom_control_plane.lifecycle import RoomLifecycleService
+from failroom_control_plane.reset import RoomResetService
+
+
+class RecordingCleanupWorker:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def run_once(
+        self,
+        control_identity,
+        backend_identity,
+        *,
+        now,
+        limit,
+    ) -> CleanupRun:
+        self.calls += 1
+        now()
+        return CleanupRun(destroyed=0, deferred=0, finalized=0)
+
+
+class RecordingProvisioner:
+    def __init__(self) -> None:
+        self.keys: list[str] = []
+        self.failure: Exception | None = None
+
+    def provision(
+        self,
+        receipt,
+        *,
+        backend_identity,
+        control_identity,
+        key,
+        now,
+    ) -> None:
+        del receipt, backend_identity, control_identity
+        self.keys.append(key)
+        now()
+        if self.failure is not None:
+            raise self.failure
 
 
 class CapabilityHttpTests(unittest.TestCase):
@@ -38,6 +81,7 @@ class CapabilityHttpTests(unittest.TestCase):
         self.backend = BackendStore(self.database)
         self.control = ControlPlaneStore(self.database)
         self.user = UserIdentity("alice", frozenset({"room-1"}))
+        self.other_user = UserIdentity("bob", frozenset({"room-1"}))
         self.backend_identity = ServiceIdentity(
             "backend", Role.BACKEND, frozenset({Action.CREATE, Action.PUBLISH})
         )
@@ -46,25 +90,86 @@ class CapabilityHttpTests(unittest.TestCase):
         )
         self.codec = CapabilityCodec(b"k" * 32, max_lifetime=timedelta(seconds=60))
         self.authority = BackendCapabilityAuthority(self.backend, self.codec)
+        self.cleanup = RecordingCleanupWorker()
+        self.lifecycle = RoomLifecycleService(
+            self.backend,
+            self.cleanup,
+            control_identity=ServiceIdentity(
+                "cleanup-control",
+                Role.CONTROL_PLANE,
+                frozenset({Action.RECONCILE, Action.INSPECT, Action.TRANSITION}),
+            ),
+            backend_identity=ServiceIdentity(
+                "cleanup-backend",
+                Role.BACKEND,
+                frozenset({Action.RECONCILE, Action.PUBLISH}),
+            ),
+            cleanup_limit=10,
+            now=lambda: self.now,
+        )
+        self.provisioner = RecordingProvisioner()
+        self.entry = RoomEntryService(
+            self.backend,
+            self.provisioner,
+            backend_identity=self.backend_identity,
+            control_identity=ServiceIdentity(
+                "entry-control",
+                Role.CONTROL_PLANE,
+                frozenset({Action.INSPECT, Action.TRANSITION}),
+            ),
+            attempt_ttl=timedelta(minutes=15),
+            now=lambda: self.now,
+        )
+        self.reset = RoomResetService(self.backend, now=lambda: self.now)
         self.token = "local-token-with-at-least-32-bytes-0001"
-        verifier = BearerIdentityVerifier(
+        self.other_token = "other-token-with-at-least-32-bytes-0001"
+        self.verifier = BearerIdentityVerifier(
             {
                 hashlib.sha256(
                     self.token.encode("ascii")
                 ).hexdigest(): BearerCredential(
                     self.user,
                     self.now + timedelta(minutes=10),
-                )
+                ),
+                hashlib.sha256(
+                    self.other_token.encode("ascii")
+                ).hexdigest(): BearerCredential(
+                    self.other_user,
+                    self.now + timedelta(minutes=10),
+                ),
             },
             now=lambda: self.now,
         )
         self.client = TestClient(
             create_app(
                 authority=self.authority,
-                verifier=verifier,
+                verifier=self.verifier,
                 now=lambda: self.now,
+                lifecycle=self.lifecycle,
+                entry=self.entry,
+                reset=self.reset,
             )
         )
+
+    def test_create_app_runs_injected_lifespan(self) -> None:
+        events: list[str] = []
+
+        @asynccontextmanager
+        async def lifespan(_app):
+            events.append("started")
+            yield
+            events.append("stopped")
+
+        app = create_app(
+            authority=self.authority,
+            verifier=self.verifier,
+            now=lambda: self.now,
+            lifespan=lifespan,
+        )
+
+        with TestClient(app):
+            self.assertEqual(events, ["started"])
+        self.assertEqual(events, ["started", "stopped"])
 
     def _ready(self) -> str:
         receipt = self.backend.create(
@@ -137,6 +242,159 @@ class CapabilityHttpTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json(), {"code": "AUTHENTICATION_REQUIRED"})
+
+    def test_enter_room_creates_a_safe_owned_attempt(self) -> None:
+        response = self.client.post(
+            "/v1/rooms/room-1/attempts",
+            headers={
+                "Authorization": "Bearer " + self.token,
+                "Idempotency-Key": "enter-room",
+            },
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(
+            set(response.json()),
+            {"attempt_id", "room_id", "state", "expires_at"},
+        )
+        self.assertEqual(response.json()["room_id"], "room-1")
+        self.assertEqual(response.json()["state"], "PROVISIONING")
+        self.assertEqual(self.provisioner.keys, ["enter-room"])
+        self.assertNotIn("sandbox_id", response.json())
+        self.assertNotIn("generation", response.json())
+
+    def test_enter_room_requires_an_idempotency_key(self) -> None:
+        response = self.client.post(
+            "/v1/rooms/room-1/attempts",
+            headers={"Authorization": "Bearer " + self.token},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"code": "INVALID_REQUEST"})
+        self.assertEqual(self.provisioner.keys, [])
+
+    def test_enter_room_reduces_provisioning_failure(self) -> None:
+        self.provisioner.failure = RuntimeError("runtime detail must not escape")
+
+        response = self.client.post(
+            "/v1/rooms/room-1/attempts",
+            headers={
+                "Authorization": "Bearer " + self.token,
+                "Idempotency-Key": "failed-enter-room",
+            },
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json(), {"code": "ENTRY_FAILED"})
+
+    def test_status_endpoint_returns_only_safe_owned_attempt_fields(self) -> None:
+        attempt_id = self._ready()
+
+        response = self.client.get(
+            f"/v1/attempts/{attempt_id}/status",
+            headers={"Authorization": "Bearer " + self.token},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "attempt_id": attempt_id,
+                "room_id": "room-1",
+                "state": "READY",
+                "expires_at": self.deadline.isoformat(),
+                "destroy_intent": False,
+            },
+        )
+        self.assertNotIn("sandbox_id", response.json())
+        self.assertNotIn("generation", response.json())
+
+    def test_leave_endpoint_requires_key_then_runs_cleanup(self) -> None:
+        attempt_id = self._ready()
+
+        missing = self.client.post(
+            f"/v1/attempts/{attempt_id}/leave",
+            headers={"Authorization": "Bearer " + self.token},
+        )
+        accepted = self.client.post(
+            f"/v1/attempts/{attempt_id}/leave",
+            headers={
+                "Authorization": "Bearer " + self.token,
+                "Idempotency-Key": "leave-attempt",
+            },
+        )
+
+        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(missing.json(), {"code": "INVALID_REQUEST"})
+        self.assertEqual(accepted.status_code, 202)
+        self.assertEqual(accepted.json()["state"], "STOPPING")
+        self.assertTrue(accepted.json()["destroy_intent"])
+        self.assertEqual(self.cleanup.calls, 1)
+
+    def test_reset_endpoint_returns_safe_owned_resetting_attempt(self) -> None:
+        attempt_id = self._ready()
+
+        missing = self.client.post(
+            f"/v1/attempts/{attempt_id}/reset",
+            headers={"Authorization": "Bearer " + self.token},
+        )
+        accepted = self.client.post(
+            f"/v1/attempts/{attempt_id}/reset",
+            headers={
+                "Authorization": "Bearer " + self.token,
+                "Idempotency-Key": "reset-attempt",
+            },
+        )
+
+        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(missing.json(), {"code": "INVALID_REQUEST"})
+        self.assertEqual(accepted.status_code, 202)
+        self.assertEqual(
+            accepted.json(),
+            {
+                "attempt_id": attempt_id,
+                "room_id": "room-1",
+                "state": "RESETTING",
+                "expires_at": self.deadline.isoformat(),
+                "destroy_intent": False,
+            },
+        )
+        self.assertNotIn("sandbox_id", accepted.json())
+        self.assertNotIn("generation", accepted.json())
+
+    def test_reset_endpoint_reduces_foreign_owner_denial(self) -> None:
+        attempt_id = self._ready()
+
+        response = self.client.post(
+            f"/v1/attempts/{attempt_id}/reset",
+            headers={
+                "Authorization": "Bearer " + self.other_token,
+                "Idempotency-Key": "foreign-reset",
+            },
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json(), {"code": "AUTHORIZATION_FAILED"})
+        self.assertEqual(self.backend.inspect(self.user, attempt_id).state, "READY")
+
+    def test_status_endpoint_reduces_authentication_and_ownership_failures(
+        self,
+    ) -> None:
+        attempt_id = self._ready()
+
+        unauthenticated = self.client.get(
+            f"/v1/attempts/{attempt_id}/status",
+            headers={"Authorization": "Bearer unknown-token"},
+        )
+        foreign = self.client.get(
+            f"/v1/attempts/{attempt_id}/status",
+            headers={"Authorization": "Bearer " + self.other_token},
+        )
+
+        self.assertEqual(unauthenticated.status_code, 401)
+        self.assertEqual(unauthenticated.json(), {"code": "AUTHENTICATION_REQUIRED"})
+        self.assertEqual(foreign.status_code, 403)
+        self.assertEqual(foreign.json(), {"code": "AUTHORIZATION_FAILED"})
 
 
 if __name__ == "__main__":
