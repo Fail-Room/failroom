@@ -115,3 +115,7 @@ def main(
         return 2
     stdout.write("MIGRATION_COMPLETED\n")
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

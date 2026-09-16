@@ -1,4 +1,6 @@
 import io
+import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import UTC
@@ -216,6 +218,18 @@ class MigrationCliTests(unittest.TestCase):
         )
 
         self.assertEqual((result, stdout, stderr), (2, "", "RUNTIME_UNAVAILABLE\n"))
+
+    def test_module_entrypoint_routes_verify_local_to_main(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, "-m", "failroom_control_plane.cli", "verify-local"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(completed.stderr, "INVALID_CONFIGURATION\n")
 
     def test_default_local_runner_builds_loopback_uvicorn_server(self) -> None:
         config = SimpleNamespace(bind_host="127.0.0.1", bind_port=8765)
