@@ -21,12 +21,21 @@ class MigrationCliTests(unittest.TestCase):
         self.database = root / "state.sqlite3"
         self.backup = root / "state-before-v2.sqlite3"
 
-    def run_cli(self, argv: list[str], *, database_factory=None, local_runner=None):
+    def run_cli(
+        self,
+        argv: list[str],
+        *,
+        database_factory=None,
+        local_runner=None,
+        local_verifier=None,
+    ):
         stdout = io.StringIO()
         stderr = io.StringIO()
         kwargs = {}
         if local_runner is not None:
             kwargs["local_runner"] = local_runner
+        if local_verifier is not None:
+            kwargs["local_verifier"] = local_verifier
         result = main(
             argv,
             database_factory=database_factory,
@@ -169,7 +178,7 @@ class MigrationCliTests(unittest.TestCase):
         self.assertEqual(stderr, "STORE_FAILURE\n")
         self.assertNotIn("secret path", stderr)
 
-    def test_only_migrate_command_is_exposed(self) -> None:
+    def test_unknown_command_is_rejected(self) -> None:
         factory = Mock()
         result, stdout, stderr = self.run_cli(["serve"], database_factory=factory)
         self.assertEqual(result, 2)
@@ -191,6 +200,22 @@ class MigrationCliTests(unittest.TestCase):
         )
 
         self.assertEqual((result, stdout, stderr), (2, "", "INVALID_CONFIGURATION\n"))
+
+    def test_verify_local_dispatches_injected_preflight(self) -> None:
+        verifier = Mock()
+
+        result, stdout, stderr = self.run_cli(["verify-local"], local_verifier=verifier)
+
+        self.assertEqual((result, stdout, stderr), (0, "LOCAL_RUNTIME_VERIFIED\n", ""))
+        verifier.assert_called_once()
+
+    def test_verify_local_reduces_runtime_failure(self) -> None:
+        result, stdout, stderr = self.run_cli(
+            ["verify-local"],
+            local_verifier=Mock(side_effect=LocalRuntimeError("RUNTIME_UNAVAILABLE")),
+        )
+
+        self.assertEqual((result, stdout, stderr), (2, "", "RUNTIME_UNAVAILABLE\n"))
 
     def test_default_local_runner_builds_loopback_uvicorn_server(self) -> None:
         config = SimpleNamespace(bind_host="127.0.0.1", bind_port=8765)
@@ -219,6 +244,23 @@ class MigrationCliTests(unittest.TestCase):
             log_config=None,
             access_log=False,
         )
+
+    def test_default_local_verifier_parses_config_and_runs_preflight_only(self) -> None:
+        config = SimpleNamespace()
+
+        with (
+            patch(
+                "failroom_control_plane.cli.LocalRuntimeConfig.from_environment",
+                return_value=config,
+            ) as from_environment,
+            patch("failroom_control_plane.cli.preflight_runtime") as preflight_runtime,
+            patch("failroom_control_plane.cli.build_runtime") as build_runtime,
+        ):
+            cli._verify_local()
+
+        from_environment.assert_called_once_with()
+        preflight_runtime.assert_called_once_with(config)
+        build_runtime.assert_not_called()
 
 
 if __name__ == "__main__":

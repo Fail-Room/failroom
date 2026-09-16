@@ -1,4 +1,4 @@
-"""Operator-only database migration command surface."""
+"""Operator-only control-plane migration and local-runtime verification commands."""
 
 import argparse
 import sys
@@ -10,7 +10,12 @@ from typing import NoReturn, TextIO
 import uvicorn
 from failroom_state import Database, StoreError
 
-from .local_runtime import LocalRuntimeConfig, LocalRuntimeError, build_runtime
+from .local_runtime import (
+    LocalRuntimeConfig,
+    LocalRuntimeError,
+    build_runtime,
+    preflight_runtime,
+)
 
 __all__ = ("main",)
 
@@ -41,6 +46,7 @@ def _parser() -> argparse.ArgumentParser:
     migrate.add_argument("--busy-timeout-ms", required=True, type=int)
     migrate.add_argument("--target-version", choices=("2", "3", "4"), default="2")
     subparsers.add_parser("serve-local", add_help=False)
+    subparsers.add_parser("verify-local", add_help=False)
     return parser
 
 
@@ -56,15 +62,22 @@ def _serve_local() -> None:
     )
 
 
+def _verify_local() -> None:
+    """Validate local Docker and seccomp prerequisites without starting a runtime."""
+    config = LocalRuntimeConfig.from_environment()
+    preflight_runtime(config)
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
     database_factory: type[Database] | None = None,
     local_runner: Callable[[], None] | None = None,
+    local_verifier: Callable[[], None] | None = None,
     stdout: TextIO = sys.stdout,
     stderr: TextIO = sys.stderr,
 ) -> int:
-    """Run the sole explicit operator migration command."""
+    """Run an explicit operator migration or local-runtime verification command."""
     factory = Database if database_factory is None else database_factory
     try:
         args = _parser().parse_args(argv)
@@ -72,6 +85,11 @@ def main(
             runner = _serve_local if local_runner is None else local_runner
             runner()
             stdout.write("LOCAL_RUNTIME_STOPPED\n")
+            return 0
+        if args.command == "verify-local":
+            verifier = _verify_local if local_verifier is None else local_verifier
+            verifier()
+            stdout.write("LOCAL_RUNTIME_VERIFIED\n")
             return 0
         if args.command != "migrate":
             raise ValueError("INVALID_CONFIGURATION")

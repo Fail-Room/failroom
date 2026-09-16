@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 from failroom_api import BackendCapabilityAuthority, CapabilityCodec
@@ -47,6 +48,29 @@ _TERMINAL_REQUIRED = (
     "FAILROOM_TERMINAL_FRAME_BYTES",
     "FAILROOM_TERMINAL_POLL_INTERVAL_SECONDS",
 )
+
+
+class TerminalOutputEvidenceTests(unittest.TestCase):
+    def test_receive_until_requires_requested_output_fragment(self) -> None:
+        marker = "FAILROOM_ANSI_MARKER"
+        messages = iter(
+            (
+                {
+                    "type": "output",
+                    "data": f"printf '\\033[31m{marker}\\033[0m\\n'\r\n",
+                },
+                {"type": "output", "data": f"\x1b[31m{marker}\x1b[0m\r\n"},
+            )
+        )
+        socket = SimpleNamespace(receive_json=lambda: next(messages))
+
+        output = LinuxTerminalIntegrationTests._receive_until(
+            socket,
+            marker,
+            required_fragment="\x1b[31m",
+        )
+
+        self.assertEqual(output, f"\x1b[31m{marker}\x1b[0m\r\n")
 
 
 def _terminal_limits() -> tuple[PtyLimits, WebSocketLimits]:
@@ -201,11 +225,18 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
         return app
 
     @staticmethod
-    def _receive_until(socket, marker: str) -> str:
+    def _receive_until(
+        socket, marker: str, *, required_fragment: str | None = None
+    ) -> str:
         for _ in range(200):
             message = socket.receive_json()
-            if message.get("type") == "output" and marker in message.get("data", ""):
-                return message["data"]
+            output = message.get("data", "")
+            if (
+                message.get("type") == "output"
+                and marker in output
+                and (required_fragment is None or required_fragment in output)
+            ):
+                return output
         raise AssertionError("terminal marker not observed")
 
     def _cleanup(self, receipt) -> None:
@@ -257,7 +288,9 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
                         "data": f"printf '\\033[31m{marker}\\033[0m\\n'\n",
                     }
                 )
-                output = self._receive_until(socket, marker)
+                output = self._receive_until(
+                    socket, marker, required_fragment="\x1b[31m"
+                )
                 self.assertIn("\x1b[31m", output)
                 socket.send_json({"type": "close"})
         finally:
