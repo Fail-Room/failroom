@@ -340,6 +340,46 @@ class DockerCli:
             return False
         raise DockerError("RUNTIME_UNAVAILABLE")
 
+    def disk_full_target_initialization_failed(
+        self, container_id: str, *, uid: int, gid: int
+    ) -> bool:
+        return not self._disk_full_target_result(
+            container_id, uid=uid, gid=gid, action="initialize"
+        )
+
+    def start_disk_full_target(self, container_id: str, *, uid: int, gid: int) -> None:
+        _container_selector(container_id)
+        self._call(
+            (
+                "container", "exec", "--detach", "--user", _sandbox_user(uid, gid),
+                container_id, "/usr/local/bin/failroom-disk-target", "run",
+            )
+        )
+
+    def disk_full_target_healthy(
+        self, container_id: str, *, uid: int, gid: int
+    ) -> bool:
+        return self._disk_full_target_result(
+            container_id, uid=uid, gid=gid, action="status"
+        )
+
+    def _disk_full_target_result(
+        self, container_id: str, *, uid: int, gid: int, action: str
+    ) -> bool:
+        _container_selector(container_id)
+        result = self._call(
+            ("container", "exec", "--user", _sandbox_user(uid, gid), container_id,
+             "/usr/local/bin/failroom-disk-target", action),
+            allow_failure=True,
+        )
+        if result.stdout or result.stderr:
+            raise DockerError("INVALID_DOCKER_RESPONSE")
+        if result.returncode == 0:
+            return True
+        if result.returncode == 1:
+            return False
+        raise DockerError("RUNTIME_UNAVAILABLE")
+
     def remove_disk_full_filler(self, container_id: str, *, uid: int, gid: int) -> None:
         _container_selector(container_id)
         self._call(

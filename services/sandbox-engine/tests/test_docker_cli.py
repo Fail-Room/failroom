@@ -193,6 +193,19 @@ class DockerCliTests(unittest.TestCase):
         with self.assertRaisesRegex(DockerError, "^RUNTIME_UNAVAILABLE$"):
             unavailable.disk_full_filler_absent("a" * 64, uid=1000, gid=1000)
 
+    def test_uses_fixed_target_service_exec_argv(self):
+        calls = []
+        results = iter((ProcessResult(1, b"", b""), ProcessResult(0, b"", b""), ProcessResult(0, b"", b"")))
+        cli = DockerCli(context="desktop-linux", timeout=5, max_output_bytes=1024, runner=lambda argv, **kwargs: (calls.append(argv), next(results))[1])
+
+        self.assertTrue(cli.disk_full_target_initialization_failed("a" * 64, uid=1000, gid=1000))
+        cli.start_disk_full_target("a" * 64, uid=1000, gid=1000)
+        self.assertTrue(cli.disk_full_target_healthy("a" * 64, uid=1000, gid=1000))
+
+        self.assertEqual(calls[0][-2:], ("/usr/local/bin/failroom-disk-target", "initialize"))
+        self.assertEqual(calls[1][4:7], ("exec", "--detach", "--user"))
+        self.assertEqual(calls[2][-2:], ("/usr/local/bin/failroom-disk-target", "status"))
+
     def test_process_timeout_and_output_limit_are_enforced(self):
         for code, timeout, limit in (
             ("import time; time.sleep(10)", 0.1, 1024),
