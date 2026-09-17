@@ -20,6 +20,8 @@ from .docker_profile import (
 from .fingerprints import configuration_digest
 from .models import QualificationContext, QualificationReport
 from .qualification import require_qualified_profile
+from .scenario import DiskFullScenario
+from .scenario_runtime import DiskFullBootstrapRuntime, ScenarioObservation
 
 
 class PolicyStore(Protocol):
@@ -333,6 +335,21 @@ class PreparedDockerOperation:
             True,
             self._lifecycle._running_evidence(self, data),
         )
+
+    def bootstrap_disk_full(
+        self, created: CreatedContainer, scenario: DiskFullScenario
+    ) -> ScenarioObservation:
+        if type(created) is not CreatedContainer:
+            raise DockerError("INVALID_DOCKER_REQUEST")
+        return DiskFullBootstrapRuntime(
+            self._lifecycle._cli,
+            self._profile,
+            self._binding,
+            self._operation_id,
+            lambda container_id: self._lifecycle._inspect_exact_created(
+                self, container_id
+            ),
+        ).apply(created.container_id, scenario)
 
     def cleanup_after_failure(self) -> None:
         if self._cleanup_id is None:

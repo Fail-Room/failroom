@@ -8,6 +8,8 @@ import threading
 from dataclasses import dataclass
 from typing import BinaryIO, Protocol, cast
 
+from .scenario import DISK_FULL_FILLER_PATH
+
 
 class DockerError(RuntimeError):
     def __init__(self, code: str) -> None:
@@ -127,6 +129,38 @@ def _container_selector(value: str) -> None:
         raise DockerError("INVALID_DOCKER_REQUEST")
 
 
+def _sandbox_user(uid: int, gid: int) -> str:
+    if (
+        type(uid) is not int
+        or type(gid) is not int
+        or not 1 <= uid <= 2_147_483_647
+        or not 1 <= gid <= 2_147_483_647
+    ):
+        raise DockerError("INVALID_DOCKER_REQUEST")
+    return f"{uid}:{gid}"
+
+
+def _bounded_decimal(stdout: bytes, *, header: str | None, allow_zero: bool) -> int:
+    try:
+        lines = stdout.decode("ascii").splitlines()
+        if header is not None:
+            if len(lines) != 2 or lines[0].strip() != header:
+                raise ValueError
+            value = lines[1].strip()
+        else:
+            if len(lines) != 1:
+                raise ValueError
+            value = lines[0].strip()
+        if re.fullmatch(r"[0-9]{1,13}", value) is None:
+            raise ValueError
+        number = int(value)
+        if number > 1 << 40 or (not allow_zero and number == 0):
+            raise ValueError
+        return number
+    except (UnicodeError, ValueError):
+        raise DockerError("INVALID_DOCKER_RESPONSE") from None
+
+
 class DockerCli:
     """Explicit context, time and memory bounds; argv never goes through a shell."""
 
@@ -222,28 +256,74 @@ class DockerCli:
 
         _container_selector(container_id)
         if (
-            type(uid) is not int
-            or type(gid) is not int
-            or not 1 <= uid <= 2_147_483_647
-            or not 1 <= gid <= 2_147_483_647
-            or type(size_bytes) is not int
+            type(size_bytes) is not int
             or not 1 <= size_bytes <= 1 << 40
             or type(path) is not str
             or re.fullmatch(r"/workspace/[a-zA-Z0-9._-]{1,128}", path) is None
             or ".." in path
         ):
             raise DockerError("INVALID_DOCKER_REQUEST")
+        user = _sandbox_user(uid, gid)
         self._call(
             (
                 "container",
                 "exec",
                 "--user",
-                f"{uid}:{gid}",
+                user,
                 container_id,
                 "/usr/bin/fallocate",
                 "-l",
                 str(size_bytes),
                 path,
+            )
+        )
+
+    def workspace_available_bytes(self, container_id: str, *, uid: int, gid: int) -> int:
+        _container_selector(container_id)
+        result = self._call(
+            (
+                "container",
+                "exec",
+                "--user",
+                _sandbox_user(uid, gid),
+                container_id,
+                "/usr/bin/df",
+                "--output=avail",
+                "-B1",
+                "/workspace",
+            )
+        )
+        return _bounded_decimal(result.stdout, header="Avail", allow_zero=True)
+
+    def disk_full_filler_size(self, container_id: str, *, uid: int, gid: int) -> int:
+        _container_selector(container_id)
+        result = self._call(
+            (
+                "container",
+                "exec",
+                "--user",
+                _sandbox_user(uid, gid),
+                container_id,
+                "/usr/bin/stat",
+                "--format=%s",
+                "--",
+                DISK_FULL_FILLER_PATH,
+            )
+        )
+        return _bounded_decimal(result.stdout, header=None, allow_zero=False)
+
+    def remove_disk_full_filler(self, container_id: str, *, uid: int, gid: int) -> None:
+        _container_selector(container_id)
+        self._call(
+            (
+                "container",
+                "exec",
+                "--user",
+                _sandbox_user(uid, gid),
+                container_id,
+                "/usr/bin/rm",
+                "--",
+                DISK_FULL_FILLER_PATH,
             )
         )
 
