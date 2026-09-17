@@ -12,6 +12,7 @@ from failroom_api import (
     BearerIdentityVerifier,
     CapabilityCodec,
 )
+from failroom_sandbox.scenario_runtime import ScenarioObservation
 from failroom_state import (
     Action,
     BackendStore,
@@ -28,6 +29,7 @@ from fastapi.testclient import TestClient
 from failroom_control_plane.entry import RoomEntryService
 from failroom_control_plane.http import create_app
 from failroom_control_plane.lifecycle import RoomLifecycleService
+from failroom_control_plane.recovery import RecoveryVerificationService
 from failroom_control_plane.reset import RoomResetService
 
 
@@ -67,6 +69,16 @@ class RecordingProvisioner:
         now()
         if self.failure is not None:
             raise self.failure
+
+
+class RecordingRecoveryRuntime:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def verify(self, binding, runtime_operation_id, room_id, container_id):
+        del binding, runtime_operation_id, room_id, container_id
+        self.calls += 1
+        return ScenarioObservation("sha256:" + "b" * 64)
 
 
 class CapabilityHttpTests(unittest.TestCase):
@@ -121,6 +133,19 @@ class CapabilityHttpTests(unittest.TestCase):
             now=lambda: self.now,
         )
         self.reset = RoomResetService(self.backend, now=lambda: self.now)
+        self.recovery_runtime = RecordingRecoveryRuntime()
+        self.recovery = RecoveryVerificationService(
+            self.backend,
+            self.control,
+            self.recovery_runtime,
+            backend_identity=self.backend_identity,
+            control_identity=ServiceIdentity(
+                "recovery-control",
+                Role.CONTROL_PLANE,
+                frozenset({Action.INSPECT, Action.TRANSITION}),
+            ),
+            now=lambda: self.now,
+        )
         self.token = "local-token-with-at-least-32-bytes-0001"
         self.other_token = "other-token-with-at-least-32-bytes-0001"
         self.verifier = BearerIdentityVerifier(
@@ -148,6 +173,7 @@ class CapabilityHttpTests(unittest.TestCase):
                 lifecycle=self.lifecycle,
                 entry=self.entry,
                 reset=self.reset,
+                recovery=self.recovery,
             )
         )
 
@@ -231,6 +257,28 @@ class CapabilityHttpTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(set(response.json()), {"capability", "expires_at"})
         self.assertNotIn("sandbox_id", response.json())
+
+    def test_recovery_endpoint_requires_idempotency_and_returns_only_safe_status(self) -> None:
+        attempt_id = self._ready()
+
+        missing_key = self.client.post(
+            f"/v1/attempts/{attempt_id}/verify-recovery",
+            headers={"Authorization": "Bearer " + self.token},
+        )
+        response = self.client.post(
+            f"/v1/attempts/{attempt_id}/verify-recovery",
+            headers={
+                "Authorization": "Bearer " + self.token,
+                "Idempotency-Key": "verify-recovery",
+            },
+        )
+
+        self.assertEqual(missing_key.status_code, 400)
+        self.assertEqual(missing_key.json(), {"code": "INVALID_REQUEST"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["state"], "RESOLVED")
+        self.assertNotIn("sandbox_id", response.json())
+        self.assertEqual(self.recovery_runtime.calls, 1)
 
     def test_unknown_identity_returns_fixed_error(self) -> None:
         attempt_id = self._ready()

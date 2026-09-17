@@ -351,6 +351,17 @@ class PreparedDockerOperation:
             ),
         ).apply(created.container_id, scenario)
 
+    def verify_disk_full_recovery(
+        self, container_id: str, scenario: DiskFullScenario
+    ) -> ScenarioObservation:
+        return DiskFullBootstrapRuntime(
+            self._lifecycle._cli,
+            self._profile,
+            self._binding,
+            self._operation_id,
+            lambda cid: self._lifecycle._inspect_exact_created(self, cid),
+        ).verify_recovery(container_id, scenario)
+
     def cleanup_after_failure(self) -> None:
         if self._cleanup_id is None:
             return

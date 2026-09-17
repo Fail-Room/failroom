@@ -19,7 +19,7 @@ class ScenarioObservation:
 
 
 class DiskFullBootstrapRuntime:
-    """Allocate the fixed filler only between exact owned-container checks."""
+    """Observe fixed Disk Full transitions between exact owned-container checks."""
 
     def __init__(
         self,
@@ -69,6 +69,45 @@ class DiskFullBootstrapRuntime:
                     "container_id": container_id,
                     "filler_path": scenario.filler_path,
                     "filler_bytes": scenario.filler_bytes,
+                    "recovery_free_bytes": scenario.recovery_free_bytes,
+                }
+            )
+        )
+
+    def verify_recovery(
+        self, container_id: str, scenario: DiskFullScenario
+    ) -> ScenarioObservation:
+        """Prove recovery from trusted fixed observations, never learner input."""
+
+        self._validate_scenario(scenario)
+        self._require_running(container_id)
+        filler_absent = self._cli.disk_full_filler_absent(
+            container_id,
+            uid=self._profile.uid,
+            gid=self._profile.gid,
+        )
+        available_bytes = self._cli.workspace_available_bytes(
+            container_id,
+            uid=self._profile.uid,
+            gid=self._profile.gid,
+        )
+        self._require_running(container_id)
+        if not filler_absent or available_bytes < scenario.recovery_free_bytes:
+            raise DockerError("PROFILE_UNVERIFIED")
+        return ScenarioObservation(
+            configuration_digest(
+                {
+                    "schema": "failroom.disk-full-recovery.v1",
+                    "binding": {
+                        "attempt_id": self._binding.attempt_id,
+                        "sandbox_id": self._binding.sandbox_id,
+                        "generation": self._binding.generation,
+                    },
+                    "operation_id": self._operation_id,
+                    "container_id": container_id,
+                    "filler_path": scenario.filler_path,
+                    "filler_absent": True,
+                    "workspace_available_bytes": available_bytes,
                     "recovery_free_bytes": scenario.recovery_free_bytes,
                 }
             )

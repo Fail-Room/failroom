@@ -251,7 +251,11 @@ class ControlPlaneStore:
                 raise StoreError("INVALID_REQUEST")
         elif error_code is not None:
             raise StoreError("INVALID_REQUEST")
-        if state in (ResourceState.READY, ResourceState.DESTROYED):
+        if state in (
+            ResourceState.READY,
+            ResourceState.RESOLVED,
+            ResourceState.DESTROYED,
+        ):
             digest(evidence_digest)
         elif evidence_digest is not None:
             raise StoreError("INVALID_REQUEST")
@@ -315,7 +319,9 @@ class ControlPlaneStore:
                     container_id,
                     int(destroy),
                     int(expired),
-                    evidence_digest if state == ResourceState.READY else None,
+                    evidence_digest
+                    if state in (ResourceState.READY, ResourceState.RESOLVED)
+                    else None,
                     evidence_digest if state == ResourceState.DESTROYED else None,
                     ref.sandbox_id,
                 ),
