@@ -258,6 +258,23 @@ class DockerCliTests(unittest.TestCase):
             with self.subTest(payload=payload), self.assertRaises(DockerError):
                 cli.inspect_image("example@sha256:" + "a" * 64)
 
+    def test_inspects_a_local_immutable_image_id_without_shell_expansion(self):
+        calls = []
+        image_id = "sha256:" + "a" * 64
+        cli = DockerCli(
+            context="desktop-linux",
+            timeout=5,
+            max_output_bytes=1024,
+            runner=lambda argv, **kwargs: (
+                calls.append(argv),
+                ProcessResult(0, b'[{"Id":"sha256:' + b"a" * 64 + b'"}]', b""),
+            )[1],
+        )
+
+        cli.inspect_image(image_id)
+
+        self.assertEqual(calls, [("docker", "--context", "desktop-linux", "image", "inspect", image_id)])
+
     def test_runner_errors_do_not_expose_paths_or_output(self):
         def fail(*args, **kwargs):
             raise subprocess.TimeoutExpired("SECRET", 1, output=b"CREDENTIAL")

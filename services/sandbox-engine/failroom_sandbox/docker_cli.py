@@ -213,7 +213,9 @@ class DockerCli:
     def inspect_image(self, image: str) -> dict[str, object]:
         if (
             type(image) is not str
-            or re.fullmatch(r"[a-z0-9][a-z0-9./:_-]*@sha256:[a-f0-9]{64}", image)
+            or re.fullmatch(
+                r"(?:[a-z0-9][a-z0-9./:_-]*@)?sha256:[a-f0-9]{64}", image
+            )
             is None
         ):
             raise DockerError("INVALID_DOCKER_REQUEST")

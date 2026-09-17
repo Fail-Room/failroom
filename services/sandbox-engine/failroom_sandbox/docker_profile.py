@@ -96,7 +96,9 @@ def _is_absolute_path(value: object) -> bool:
 
 
 def _is_image(value: object) -> bool:
-    return type(value) is str and _IMAGE.fullmatch(value) is not None
+    return type(value) is str and (
+        _IMAGE.fullmatch(value) is not None or _SHA256.fullmatch(value) is not None
+    )
 
 
 def _is_cpu_limit(value: object) -> bool:

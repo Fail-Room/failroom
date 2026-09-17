@@ -122,6 +122,17 @@ class DockerProfileTests(unittest.TestCase):
                 ):
                     StrictDockerProfile(**values)
 
+    def test_accepts_a_local_immutable_image_id(self):
+        values = self._profile_values()
+        values["image"] = "sha256:" + "c" * 64
+
+        profile = StrictDockerProfile(**values)
+
+        self.assertEqual(
+            compile_create_argv(profile, self._binding(), "operation-789")[-2],
+            values["image"],
+        )
+
     def test_rejects_root_identity_and_unequal_memory_swap(self):
         profile = self._profile()
 
