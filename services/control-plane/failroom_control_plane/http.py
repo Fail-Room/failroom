@@ -16,6 +16,7 @@ from starlette.types import Lifespan
 
 from .entry import EntryError, RoomEntry, RoomEntryService
 from .lifecycle import LifecycleError, RoomLifecycleService, RoomStatus
+from .recovery import RecoveryError, RecoveryVerificationService
 from .reset import ResetError, RoomResetService
 from .terminal import ControlPlaneTerminalService
 from .websocket import (
@@ -35,6 +36,13 @@ _LIFECYCLE_STATUS = {
     "NOT_AUTHORIZED": 403,
     "INVALID_REQUEST": 400,
     "CLEANUP_PENDING": 202,
+}
+_RECOVERY_STATUS = {
+    "ATTEMPT_UNAVAILABLE": 409,
+    "NOT_AUTHORIZED": 403,
+    "INVALID_REQUEST": 400,
+    "RECOVERY_NOT_VERIFIED": 409,
+    "RECOVERY_UNAVAILABLE": 503,
 }
 
 
@@ -108,6 +116,12 @@ def _reset_error(error: ResetError) -> JSONResponse:
     return _error(code, status)
 
 
+def _recovery_error(error: RecoveryError) -> JSONResponse:
+    status = _RECOVERY_STATUS.get(error.code, 503)
+    code = error.code if status != 403 else "AUTHORIZATION_FAILED"
+    return _error(code, status)
+
+
 def create_app(
     *,
     authority: BackendCapabilityAuthority,
@@ -119,6 +133,7 @@ def create_app(
     lifecycle: RoomLifecycleService | None = None,
     entry: RoomEntryService | None = None,
     reset: RoomResetService | None = None,
+    recovery: RecoveryVerificationService | None = None,
     lifespan: Lifespan[FastAPI] | None = None,
 ) -> FastAPI:
     """Build an API app with all trust dependencies supplied by the caller."""
@@ -224,6 +239,24 @@ def create_app(
                 return _error(error.code, 401)
             except ResetError as error:
                 return _reset_error(error)
+
+    if recovery is not None:
+
+        @app.post("/v1/attempts/{attempt_id}/verify-recovery")
+        def verify_recovery(attempt_id: str, request: Request) -> JSONResponse:
+            key = request.headers.get("idempotency-key", "")
+            if not key:
+                return _error("INVALID_REQUEST", 400)
+            try:
+                return _status_response(
+                    recovery.verify(
+                        _authenticated_identity(verifier, request), attempt_id, key=key
+                    )
+                )
+            except _AuthenticationFailure as error:
+                return _error(error.code, 401)
+            except RecoveryError as error:
+                return _recovery_error(error)
 
     if any(value is not None for value in (gateway, terminal, terminal_limits)):
         if gateway is None or terminal is None or terminal_limits is None:

@@ -30,7 +30,11 @@ from test_linux_docker_integration import (
     build_runtime_from_required_environment,
 )
 
-from failroom_control_plane import LifecycleOrchestrator
+from failroom_control_plane import (
+    DockerRecoveryRuntime,
+    LifecycleOrchestrator,
+    RecoveryVerificationService,
+)
 from failroom_control_plane.room_scenarios import RoomScenarioRegistry
 
 
@@ -132,6 +136,20 @@ class LinuxDiskFullIntegrationTests(unittest.TestCase):
             )
             self.assertGreaterEqual(recovered, scenario.recovery_free_bytes)
             self.assertLessEqual(recovered, self.profile.workspace_tmpfs_bytes)
+
+            status = RecoveryVerificationService(
+                self.backend,
+                self.control,
+                DockerRecoveryRuntime(self.provisioning._lifecycle, self.profile),
+                backend_identity=self.backend_identity,
+                control_identity=self.control_identity,
+                now=lambda: self.now,
+            ).verify(self.user, receipt.attempt_id, key=uuid4().hex)
+            self.assertEqual(status.state, "RESOLVED")
+            self.assertEqual(
+                self.control.inspect(self.control_identity, receipt.ref).state,
+                ResourceState.RESOLVED,
+            )
 
             self.backend.leave(
                 self.user, receipt.ref, key=uuid4().hex, now=lambda: self.now

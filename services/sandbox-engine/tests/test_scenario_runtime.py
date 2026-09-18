@@ -120,6 +120,41 @@ class DiskFullBootstrapRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(DockerError, "^PROFILE_UNVERIFIED$"):
             runtime.apply(CID, SCENARIO)
 
+    def test_recovery_requires_absent_filler_and_threshold_between_exact_checks(self):
+        events: list[str] = []
+        results = iter((ProcessResult(0, b"", b""), ProcessResult(0, b"Avail\n8000000\n", b"")))
+
+        def runner(argv, **kwargs):
+            del kwargs
+            events.append(argv[-1])
+            return next(results)
+
+        def inspect(container_id: str) -> dict[str, object]:
+            self.assertEqual(container_id, CID)
+            events.append("inspect")
+            return {"State": {"Running": True}}
+
+        runtime = DiskFullBootstrapRuntime(
+            DockerCli(
+                context="desktop-linux",
+                timeout=5,
+                max_output_bytes=1024,
+                runner=runner,
+            ),
+            profile(),
+            BINDING,
+            "operation-789",
+            inspect,
+        )
+
+        observation = runtime.verify_recovery(CID, SCENARIO)
+
+        self.assertEqual(
+            events,
+            ["inspect", "/workspace/.failroom-disk-full", "/workspace", "inspect"],
+        )
+        self.assertRegex(observation.evidence_digest, r"^sha256:[a-f0-9]{64}$")
+
 
 if __name__ == "__main__":
     unittest.main()

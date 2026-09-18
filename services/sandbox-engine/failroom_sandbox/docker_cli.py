@@ -312,6 +312,34 @@ class DockerCli:
         )
         return _bounded_decimal(result.stdout, header=None, allow_zero=False)
 
+    def disk_full_filler_absent(
+        self, container_id: str, *, uid: int, gid: int
+    ) -> bool:
+        """Check the fixed filler path without accepting daemon errors as absence."""
+
+        _container_selector(container_id)
+        result = self._call(
+            (
+                "container",
+                "exec",
+                "--user",
+                _sandbox_user(uid, gid),
+                container_id,
+                "/usr/bin/test",
+                "!",
+                "-e",
+                DISK_FULL_FILLER_PATH,
+            ),
+            allow_failure=True,
+        )
+        if result.stdout or result.stderr:
+            raise DockerError("INVALID_DOCKER_RESPONSE")
+        if result.returncode == 0:
+            return True
+        if result.returncode == 1:
+            return False
+        raise DockerError("RUNTIME_UNAVAILABLE")
+
     def remove_disk_full_filler(self, container_id: str, *, uid: int, gid: int) -> None:
         _container_selector(container_id)
         self._call(

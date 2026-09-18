@@ -13,6 +13,7 @@ from failroom_state import CleanupTarget, ResourceRef, RuntimeCleanupError
 from failroom_control_plane.runtime_docker import (
     DockerCleanupRuntime,
     DockerProvisioningRuntime,
+    DockerRecoveryRuntime,
 )
 
 
@@ -83,6 +84,36 @@ class DockerRuntimeAdapterTests(unittest.TestCase):
         self.assertRegex(result.evidence_digest, r"^sha256:[0-9a-f]{64}$")
         self.assertNotEqual(result.evidence_digest, started.evidence_digest)
         operation.bootstrap_disk_full.assert_called_once_with(created, scenario)
+
+    def test_recovery_adapter_uses_the_exact_prepared_binding(self) -> None:
+        lifecycle = Mock()
+        profile = SimpleNamespace(workspace_tmpfs_bytes=67_108_864)
+        operation = Mock()
+        operation.verify_disk_full_recovery.return_value = ScenarioObservation(
+            "sha256:" + "c" * 64
+        )
+
+        @contextmanager
+        def prepare(*args: object):
+            yield operation
+
+        lifecycle.prepare.side_effect = prepare
+        adapter = DockerRecoveryRuntime(lifecycle, profile)
+
+        result = adapter.verify(
+            self.binding(), "runtime-operation", "disk-full", "c" * 64
+        )
+
+        self.assertRegex(result.evidence_digest, r"^sha256:[0-9a-f]{64}$")
+        lifecycle.prepare.assert_called_once_with(
+            profile, self.binding(), "runtime-operation"
+        )
+        scenario = DiskFullScenario(
+            filler_path="/workspace/.failroom-disk-full",
+            filler_bytes=60_000_000,
+            recovery_free_bytes=8_000_000,
+        )
+        operation.verify_disk_full_recovery.assert_called_once_with("c" * 64, scenario)
 
     def test_cleanup_adapter_uses_original_runtime_id_not_cleanup_operation_id(
         self,

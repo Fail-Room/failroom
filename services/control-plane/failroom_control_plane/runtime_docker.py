@@ -18,7 +18,11 @@ from failroom_state import CleanupTarget, RuntimeCleanupError
 
 from .room_scenarios import RoomScenarioRegistry
 
-__all__ = ("DockerCleanupRuntime", "DockerProvisioningRuntime")
+__all__ = (
+    "DockerCleanupRuntime",
+    "DockerProvisioningRuntime",
+    "DockerRecoveryRuntime",
+)
 
 
 class _DiskFullProvisioningSession:
@@ -88,6 +92,37 @@ class DockerProvisioningRuntime:
                 yield operation
             else:
                 yield _DiskFullProvisioningSession(operation, scenario)
+
+
+class DockerRecoveryRuntime:
+    """Prove one reviewed Room's recovery against its exact Docker binding."""
+
+    def __init__(
+        self, lifecycle: DockerDiagnosticLifecycle, profile: StrictDockerProfile
+    ) -> None:
+        self._lifecycle = lifecycle
+        self._profile = profile
+        self._room_scenarios = RoomScenarioRegistry()
+
+    def verify(
+        self,
+        binding: DockerBinding,
+        runtime_operation_id: str,
+        room_id: str,
+        container_id: str,
+    ) -> ScenarioObservation:
+        scenario = self._room_scenarios.resolve(
+            room_id, workspace_bytes=self._profile.workspace_tmpfs_bytes
+        )
+        if scenario is None:
+            raise DockerError("INVALID_DOCKER_REQUEST")
+        with self._lifecycle.prepare(
+            self._profile, binding, runtime_operation_id
+        ) as operation:
+            result = operation.verify_disk_full_recovery(container_id, scenario)
+        if type(result) is not ScenarioObservation:
+            raise DockerError("INVALID_DOCKER_RESPONSE")
+        return result
 
 
 class DockerCleanupRuntime:

@@ -142,6 +142,57 @@ class DockerCliTests(unittest.TestCase):
             ],
         )
 
+    def test_checks_only_the_fixed_disk_full_filler_for_absence(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append(argv)
+            return ProcessResult(0, b"", b"")
+
+        cli = DockerCli(
+            context="desktop-linux", timeout=5, max_output_bytes=1024, runner=runner
+        )
+
+        self.assertTrue(
+            cli.disk_full_filler_absent("a" * 64, uid=1000, gid=1000)
+        )
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "docker",
+                    "--context",
+                    "desktop-linux",
+                    "container",
+                    "exec",
+                    "--user",
+                    "1000:1000",
+                    "a" * 64,
+                    "/usr/bin/test",
+                    "!",
+                    "-e",
+                    "/workspace/.failroom-disk-full",
+                )
+            ],
+        )
+
+        present = DockerCli(
+            context="desktop-linux",
+            timeout=5,
+            max_output_bytes=1024,
+            runner=lambda *args, **kwargs: ProcessResult(1, b"", b""),
+        )
+        self.assertFalse(present.disk_full_filler_absent("a" * 64, uid=1000, gid=1000))
+
+        unavailable = DockerCli(
+            context="desktop-linux",
+            timeout=5,
+            max_output_bytes=1024,
+            runner=lambda *args, **kwargs: ProcessResult(2, b"", b""),
+        )
+        with self.assertRaisesRegex(DockerError, "^RUNTIME_UNAVAILABLE$"):
+            unavailable.disk_full_filler_absent("a" * 64, uid=1000, gid=1000)
+
     def test_process_timeout_and_output_limit_are_enforced(self):
         for code, timeout, limit in (
             ("import time; time.sleep(10)", 0.1, 1024),
