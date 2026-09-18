@@ -2,6 +2,8 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from time import monotonic, sleep
+from typing import Final
 
 from .docker_cli import DockerCli, DockerError
 from .docker_profile import DockerBinding, StrictDockerProfile
@@ -13,6 +15,8 @@ from .scenario import (
 )
 
 __all__ = ("DiskFullBootstrapRuntime", "ScenarioObservation")
+
+_TARGET_READY_POLL_SECONDS: Final = 0.1
 
 
 @dataclass(frozen=True)
@@ -32,6 +36,9 @@ class DiskFullBootstrapRuntime:
         binding: DockerBinding,
         operation_id: str,
         inspect_exact: Callable[[str], dict[str, object]],
+        *,
+        clock: Callable[[], float] = monotonic,
+        sleeper: Callable[[float], None] = sleep,
     ) -> None:
         if (
             type(cli) is not DockerCli
@@ -39,6 +46,8 @@ class DiskFullBootstrapRuntime:
             or type(binding) is not DockerBinding
             or type(operation_id) is not str
             or not callable(inspect_exact)
+            or not callable(clock)
+            or not callable(sleeper)
         ):
             raise DockerError("INVALID_DOCKER_REQUEST")
         self._cli = cli
@@ -46,6 +55,8 @@ class DiskFullBootstrapRuntime:
         self._binding = binding
         self._operation_id = operation_id
         self._inspect_exact = inspect_exact
+        self._clock = clock
+        self._sleeper = sleeper
 
     def apply(
         self, container_id: str, scenario: DiskFullScenario
@@ -106,10 +117,7 @@ class DiskFullBootstrapRuntime:
         self._cli.start_disk_full_target(
             container_id,
         )
-        if not self._cli.disk_full_target_healthy(
-            container_id,
-        ):
-            raise DockerError("PROFILE_UNVERIFIED")
+        self._wait_for_disk_full_target_healthy(container_id, scenario)
         self._require_running(container_id)
         return ScenarioObservation(
             configuration_digest(
@@ -127,6 +135,7 @@ class DiskFullBootstrapRuntime:
                     "workspace_available_bytes": available_bytes,
                     "recovery_free_bytes": scenario.recovery_free_bytes,
                     "target_healthy": True,
+                    "target_ready_timeout_seconds": scenario.target_ready_timeout_seconds,
                     "target_working_set_bytes": scenario.target_working_set_bytes,
                 }
             )
@@ -148,10 +157,21 @@ class DiskFullBootstrapRuntime:
             < self._profile.workspace_tmpfs_bytes
             or scenario.target_working_set_bytes != DISK_FULL_TARGET_WORKING_SET_BYTES
             or scenario.target_working_set_bytes > scenario.recovery_free_bytes
+            or not 0 < scenario.target_ready_timeout_seconds <= 60
             or scenario.filler_bytes + scenario.recovery_free_bytes
             < self._profile.workspace_tmpfs_bytes
         ):
             raise DockerError("INVALID_DOCKER_REQUEST")
+
+    def _wait_for_disk_full_target_healthy(
+        self, container_id: str, scenario: DiskFullScenario
+    ) -> None:
+        deadline = self._clock() + scenario.target_ready_timeout_seconds
+        while not self._cli.disk_full_target_healthy(container_id):
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                raise DockerError("PROFILE_UNVERIFIED")
+            self._sleeper(min(_TARGET_READY_POLL_SECONDS, remaining))
 
     def _require_running(self, container_id: str) -> None:
         data = self._inspect_exact(container_id)

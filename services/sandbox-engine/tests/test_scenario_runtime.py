@@ -13,6 +13,7 @@ SCENARIO = DiskFullScenario(
     filler_bytes=60_000_000,
     recovery_free_bytes=8_000_000,
     target_working_set_bytes=8_000_000,
+    target_ready_timeout_seconds=5,
 )
 
 
@@ -139,6 +140,7 @@ class DiskFullBootstrapRuntimeTests(unittest.TestCase):
                 ProcessResult(0, b"", b""),
                 ProcessResult(0, b"Avail\n8000000\n", b""),
                 ProcessResult(0, b"", b""),
+                ProcessResult(1, b"", b""),
                 ProcessResult(0, b"", b""),
             )
         )
@@ -168,6 +170,8 @@ class DiskFullBootstrapRuntimeTests(unittest.TestCase):
             BINDING,
             "operation-789",
             inspect,
+            clock=iter((0.0, 0.0)).__next__,
+            sleeper=lambda seconds: self.assertEqual(seconds, 0.1),
         )
 
         observation = runtime.verify_recovery(CID, SCENARIO)
@@ -179,6 +183,7 @@ class DiskFullBootstrapRuntimeTests(unittest.TestCase):
                 "/workspace/.failroom-disk-full",
                 "/workspace",
                 "target-run",
+                "target-status",
                 "target-status",
                 "inspect",
             ],
@@ -206,6 +211,8 @@ class DiskFullBootstrapRuntimeTests(unittest.TestCase):
             BINDING,
             "operation-789",
             lambda container_id: {"State": {"Running": container_id == CID}},
+            clock=iter((0.0, 5.0)).__next__,
+            sleeper=lambda seconds: self.fail("deadline prevents a retry"),
         )
 
         with self.assertRaisesRegex(DockerError, "^PROFILE_UNVERIFIED$"):

@@ -24,7 +24,10 @@ class DiskFullTargetArtifactTests(unittest.TestCase):
         self.assertIn("/proc/$pid", target)
         self.assertIn("STATE_DIR=/run/failroom-target", target)
         self.assertIn("READY=$STATE_DIR/ready", target)
-        self.assertIn("WORK=$STATE_DIR/working-set", target)
+        self.assertIn("WORK_DIR=/workspace/.failroom-target", target)
+        self.assertIn("WORK=$WORK_DIR/working-set", target)
+        self.assertIn('mkdir -p "$WORK_DIR"', target)
+        self.assertIn('chmod 0700 "$WORK_DIR"', target)
         self.assertIn('wc -c <"$WORK"', target)
 
 

@@ -16,8 +16,9 @@ class RoomScenarioRegistryTests(unittest.TestCase):
             DiskFullScenario(
                 filler_path="/workspace/.failroom-disk-full",
                 filler_bytes=60_000_000,
-                recovery_free_bytes=8_000_000,
-                target_working_set_bytes=8_000_000,
+            recovery_free_bytes=8_000_000,
+            target_working_set_bytes=8_000_000,
+            target_ready_timeout_seconds=5,
             ),
         )
         self.assertIsNone(registry.resolve("room-1", workspace_bytes=67_108_864))

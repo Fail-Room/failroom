@@ -18,6 +18,7 @@ class DiskFullScenarioTests(unittest.TestCase):
             "filler_bytes": 60_000_000,
             "recovery_free_bytes": 8_000_000,
             "target_working_set_bytes": 8_000_000,
+            "target_ready_timeout_seconds": 5,
         }
 
     def test_parses_the_fixed_minimal_declaration(self) -> None:
@@ -32,6 +33,7 @@ class DiskFullScenarioTests(unittest.TestCase):
                 filler_bytes=60_000_000,
                 recovery_free_bytes=8_000_000,
                 target_working_set_bytes=8_000_000,
+                target_ready_timeout_seconds=5,
             ),
         )
         with self.assertRaises(FrozenInstanceError):
@@ -52,6 +54,8 @@ class DiskFullScenarioTests(unittest.TestCase):
             {**self.declaration, "target_working_set_bytes": 0},
             {**self.declaration, "target_working_set_bytes": 7_000_000},
             {**self.declaration, "target_working_set_bytes": 8_000_001},
+            {**self.declaration, "target_ready_timeout_seconds": 0},
+            {**self.declaration, "target_ready_timeout_seconds": 61},
             {
                 "version": "disk-full-v1",
                 "filler_bytes": 60_000_000,

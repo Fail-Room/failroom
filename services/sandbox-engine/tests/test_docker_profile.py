@@ -440,7 +440,7 @@ class DockerProfileTests(unittest.TestCase):
                 "--cpus",
                 "0.5",
                 "--tmpfs",
-                "/workspace:rw,size=67108864,nosuid,nodev,noexec",
+                "/workspace:rw,size=67108864,mode=1777,nosuid,nodev,noexec",
                 "--tmpfs",
                 "/tmp:rw,size=16777216,nosuid,nodev,noexec",
                 "--tmpfs",
