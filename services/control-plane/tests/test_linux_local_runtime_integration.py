@@ -165,6 +165,104 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
                     )
                     self.assertEqual(left.status_code, 202)
 
+    def test_reset_invalidates_issued_capability_through_local_app(self) -> None:
+        environment = dict(os.environ)
+        environment["FAILROOM_DATABASE_PATH"] = str(
+            Path(self.database_temp.name) / "state.sqlite3"
+        )
+        config = LocalRuntimeConfig.from_environment(environment)
+        runtime = build_runtime(config, now=lambda: datetime.now(UTC))
+        headers = {"authorization": "Bearer " + self.token}
+
+        with TestClient(runtime.app) as client:
+            attempt_id: str | None = None
+            try:
+                entered = client.post(
+                    "/v1/rooms/disk-full/attempts",
+                    headers={**headers, "idempotency-key": "enter-" + uuid4().hex},
+                )
+                self.assertEqual(entered.status_code, 201)
+                attempt_id = entered.json()["attempt_id"]
+
+                capability = client.post(
+                    "/v1/attempts/" + attempt_id + "/terminal-capability",
+                    headers=headers,
+                )
+                self.assertEqual(capability.status_code, 200)
+
+                reset = client.post(
+                    "/v1/attempts/" + attempt_id + "/reset",
+                    headers={**headers, "idempotency-key": "reset-" + uuid4().hex},
+                )
+                self.assertEqual(reset.status_code, 202)
+                self.assertEqual(reset.json()["state"], "RESETTING")
+
+                with client.websocket_connect("/v1/terminal") as socket:
+                    socket.send_json(
+                        {
+                            "type": "authorize",
+                            "capability": capability.json()["capability"],
+                        }
+                    )
+                    with self.assertRaises(WebSocketDisconnect) as raised:
+                        socket.receive_json()
+                self.assertEqual(raised.exception.code, 4403)
+            finally:
+                if attempt_id is not None:
+                    left = client.post(
+                        "/v1/attempts/" + attempt_id + "/leave",
+                        headers={
+                            **headers,
+                            "idempotency-key": "leave-" + uuid4().hex,
+                        },
+                    )
+                    self.assertEqual(left.status_code, 202)
+
+    def test_reset_maintenance_destroys_prior_sandbox(self) -> None:
+        environment = dict(os.environ)
+        environment["FAILROOM_DATABASE_PATH"] = str(
+            Path(self.database_temp.name) / "state.sqlite3"
+        )
+        config = LocalRuntimeConfig.from_environment(environment)
+        runtime = build_runtime(config, now=lambda: datetime.now(UTC))
+        headers = {"authorization": "Bearer " + self.token}
+
+        with TestClient(runtime.app) as client:
+            attempt_id: str | None = None
+            try:
+                entered = client.post(
+                    "/v1/rooms/disk-full/attempts",
+                    headers={**headers, "idempotency-key": "enter-" + uuid4().hex},
+                )
+                self.assertEqual(entered.status_code, 201)
+                attempt_id = entered.json()["attempt_id"]
+
+                reset = client.post(
+                    "/v1/attempts/" + attempt_id + "/reset",
+                    headers={**headers, "idempotency-key": "reset-" + uuid4().hex},
+                )
+                self.assertEqual(reset.status_code, 202)
+
+                maintenance = runtime.maintenance.run_once()
+                self.assertEqual(maintenance.cleanup.destroyed, 1)
+                self.assertEqual(maintenance.cleanup.deferred, 0)
+
+                status = client.get(
+                    "/v1/attempts/" + attempt_id + "/status", headers=headers
+                )
+                self.assertEqual(status.status_code, 200)
+                self.assertEqual(status.json()["state"], "READY")
+            finally:
+                if attempt_id is not None:
+                    left = client.post(
+                        "/v1/attempts/" + attempt_id + "/leave",
+                        headers={
+                            **headers,
+                            "idempotency-key": "leave-" + uuid4().hex,
+                        },
+                    )
+                    self.assertEqual(left.status_code, 202)
+
 
 class LocalRuntimeTerminalOutputEvidenceTests(unittest.TestCase):
     def test_receive_until_requires_requested_output_fragment(self) -> None:

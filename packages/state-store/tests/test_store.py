@@ -606,6 +606,46 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(current.active_ref, attempt.ref)
         self.assertEqual(current.candidate_ref, candidate.ref)
 
+    def test_reset_leave_cannot_finalize_before_old_resource_is_destroyed(self):
+        attempt, _ = self.ready()
+        candidate = self.backend.begin_reset(
+            self.alice,
+            attempt.ref,
+            key="reset-before-leave",
+            now=lambda: self.now,
+        )
+        self.backend.leave(
+            self.alice, candidate.ref, key="leave-during-reset", now=lambda: self.now
+        )
+        tasks = self.control.reconcile(
+            self.service(Role.CONTROL_PLANE, Action.RECONCILE),
+            now=lambda: self.now,
+            limit=10,
+        )
+        candidate_task = next(task for task in tasks if task.ref == candidate.ref)
+        self.control.transition(
+            self.service(Role.CONTROL_PLANE, Action.TRANSITION),
+            candidate.ref,
+            expected_version=candidate_task.version,
+            state=ResourceState.DESTROYED,
+            key="destroy-missing-candidate",
+            evidence_digest=self.evidence,
+            now=lambda: self.now,
+        )
+
+        self.assert_error(
+            "CLEANUP_UNVERIFIED",
+            lambda: self.backend.complete_cleanup(
+                self.service(Role.BACKEND, Action.PUBLISH),
+                candidate.ref,
+                key="complete-missing-candidate",
+                now=lambda: self.now,
+            ),
+        )
+        self.assertEqual(
+            self.backend.inspect(self.alice, attempt.attempt_id).state, "STOPPING"
+        )
+
     def test_reset_candidate_failure_marks_attempt_failed_for_cleanup(self):
         attempt, resource = self.ready()
         candidate = self.backend.begin_reset(
