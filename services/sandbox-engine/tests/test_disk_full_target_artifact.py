@@ -22,7 +22,7 @@ class DiskFullTargetArtifactTests(unittest.TestCase):
         target = (IMAGE_DIR / "failroom-disk-target").read_text(encoding="ascii")
 
         self.assertIn("/proc/$pid", target)
-        self.assertIn("STATE_DIR=/workspace/.failroom-target", target)
+        self.assertIn("STATE_DIR=/run/failroom-target", target)
         self.assertIn("READY=$STATE_DIR/ready", target)
         self.assertIn("WORK=$STATE_DIR/working-set", target)
         self.assertIn('wc -c <"$WORK"', target)

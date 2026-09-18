@@ -68,6 +68,7 @@ def observation(profile, seccomp_path):
             "Tmpfs": {
                 "/workspace": "rw,size=67108864,nosuid,nodev,noexec",
                 "/tmp": "rw,size=16777216,nosuid,nodev,noexec",
+                "/run/failroom-target": "rw,size=1048576,mode=0700,nosuid,nodev,noexec",
             },
             "Ulimits": [
                 {"Name": "nofile", "Soft": 256, "Hard": 256},
@@ -88,6 +89,7 @@ def observation(profile, seccomp_path):
         "Mounts": [
             {"Type": "tmpfs", "Destination": "/workspace", "Source": ""},
             {"Type": "tmpfs", "Destination": "/tmp", "Source": ""},
+            {"Type": "tmpfs", "Destination": "/run/failroom-target", "Source": ""},
         ],
         "State": {"Running": False, "Status": "created"},
     }
@@ -372,6 +374,17 @@ class DockerLifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(DockerError, "^CLEANUP_INCOMPLETE$"):
             self.create()
         self.assertFalse(self.engine.created)
+        self.assertFalse(
+            any(c[3:5] == ("container", "start") for c in self.engine.calls)
+        )
+
+    def test_missing_target_supervisor_mount_is_cleaned_without_start(self):
+        self.engine.resource["HostConfig"]["Tmpfs"].pop("/run/failroom-target")
+        self.engine.resource["Mounts"] = self.engine.resource["Mounts"][:2]
+
+        with self.assertRaisesRegex(DockerError, "^CLEANUP_INCOMPLETE$"):
+            self.create()
+
         self.assertFalse(
             any(c[3:5] == ("container", "start") for c in self.engine.calls)
         )

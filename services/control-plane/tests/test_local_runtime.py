@@ -54,6 +54,7 @@ class LocalRuntimeConfigTests(unittest.TestCase):
             "FAILROOM_PIDS_LIMIT": "128",
             "FAILROOM_WORKSPACE_TMPFS_BYTES": "67108864",
             "FAILROOM_TEMP_TMPFS_BYTES": "67108864",
+            "FAILROOM_TARGET_SUPERVISOR_TMPFS_BYTES": "1048576",
             "FAILROOM_SHM_BYTES": "67108864",
             "FAILROOM_FD_LIMIT": "1024",
             "FAILROOM_IO_DEVICE": "/dev/sdf",

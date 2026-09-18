@@ -10,6 +10,8 @@ from typing import BinaryIO, Protocol, cast
 
 from .scenario import DISK_FULL_FILLER_PATH
 
+_TARGET_SUPERVISOR_USER = "0:0"
+
 
 class DockerError(RuntimeError):
     def __init__(self, code: str) -> None:
@@ -342,35 +344,31 @@ class DockerCli:
             return False
         raise DockerError("RUNTIME_UNAVAILABLE")
 
-    def disk_full_target_initialization_failed(
-        self, container_id: str, *, uid: int, gid: int
-    ) -> bool:
+    def disk_full_target_initialization_failed(self, container_id: str) -> bool:
         return not self._disk_full_target_result(
-            container_id, uid=uid, gid=gid, action="initialize"
+            container_id, action="initialize"
         )
 
-    def start_disk_full_target(self, container_id: str, *, uid: int, gid: int) -> None:
+    def start_disk_full_target(self, container_id: str) -> None:
         _container_selector(container_id)
         self._call(
             (
-                "container", "exec", "--detach", "--user", _sandbox_user(uid, gid),
+                "container", "exec", "--detach", "--user", _TARGET_SUPERVISOR_USER,
                 container_id, "/usr/local/bin/failroom-disk-target", "run",
             )
         )
 
-    def disk_full_target_healthy(
-        self, container_id: str, *, uid: int, gid: int
-    ) -> bool:
+    def disk_full_target_healthy(self, container_id: str) -> bool:
         return self._disk_full_target_result(
-            container_id, uid=uid, gid=gid, action="status"
+            container_id, action="status"
         )
 
     def _disk_full_target_result(
-        self, container_id: str, *, uid: int, gid: int, action: str
+        self, container_id: str, *, action: str
     ) -> bool:
         _container_selector(container_id)
         result = self._call(
-            ("container", "exec", "--user", _sandbox_user(uid, gid), container_id,
+            ("container", "exec", "--user", _TARGET_SUPERVISOR_USER, container_id,
              "/usr/local/bin/failroom-disk-target", action),
             allow_failure=True,
         )

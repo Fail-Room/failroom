@@ -29,6 +29,7 @@ def profile() -> StrictDockerProfile:
         pids_limit=64,
         workspace_tmpfs_bytes=67_108_864,
         temp_tmpfs_bytes=16_777_216,
+        target_supervisor_tmpfs_bytes=1_048_576,
         shm_size_bytes=16_777_216,
         fd_limit=256,
         io_device_path="/dev/loop0",

@@ -61,8 +61,6 @@ class DiskFullBootstrapRuntime:
         )
         if not self._cli.disk_full_target_initialization_failed(
             container_id,
-            uid=self._profile.uid,
-            gid=self._profile.gid,
         ):
             raise DockerError("PROFILE_UNVERIFIED")
         self._require_running(container_id)
@@ -107,13 +105,9 @@ class DiskFullBootstrapRuntime:
             raise DockerError("PROFILE_UNVERIFIED")
         self._cli.start_disk_full_target(
             container_id,
-            uid=self._profile.uid,
-            gid=self._profile.gid,
         )
         if not self._cli.disk_full_target_healthy(
             container_id,
-            uid=self._profile.uid,
-            gid=self._profile.gid,
         ):
             raise DockerError("PROFILE_UNVERIFIED")
         self._require_running(container_id)

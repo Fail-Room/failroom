@@ -34,6 +34,7 @@ _REQUIRED = (
     "FAILROOM_PIDS_LIMIT",
     "FAILROOM_WORKSPACE_TMPFS_BYTES",
     "FAILROOM_TEMP_TMPFS_BYTES",
+    "FAILROOM_TARGET_SUPERVISOR_TMPFS_BYTES",
     "FAILROOM_SHM_BYTES",
     "FAILROOM_FD_LIMIT",
     "FAILROOM_IO_DEVICE",
@@ -66,6 +67,9 @@ def _profile_from_environment() -> StrictDockerProfile:
         pids_limit=int(_required("FAILROOM_PIDS_LIMIT")),
         workspace_tmpfs_bytes=int(_required("FAILROOM_WORKSPACE_TMPFS_BYTES")),
         temp_tmpfs_bytes=int(_required("FAILROOM_TEMP_TMPFS_BYTES")),
+        target_supervisor_tmpfs_bytes=int(
+            _required("FAILROOM_TARGET_SUPERVISOR_TMPFS_BYTES")
+        ),
         shm_size_bytes=int(_required("FAILROOM_SHM_BYTES")),
         fd_limit=int(_required("FAILROOM_FD_LIMIT")),
         io_device_path=_required("FAILROOM_IO_DEVICE"),
@@ -96,6 +100,11 @@ def _assert_hardening(
         {
             "/workspace": f"rw,size={profile.workspace_tmpfs_bytes},nosuid,nodev,noexec",
             "/tmp": f"rw,size={profile.temp_tmpfs_bytes},nosuid,nodev,noexec",
+            "/run/failroom-target": (
+                "rw,size="
+                + str(profile.target_supervisor_tmpfs_bytes)
+                + ",mode=0700,nosuid,nodev,noexec"
+            ),
         },
     )
     test_case.assertEqual(
@@ -103,6 +112,7 @@ def _assert_hardening(
         [
             {"Type": "tmpfs", "Destination": "/workspace", "Source": ""},
             {"Type": "tmpfs", "Destination": "/tmp", "Source": ""},
+            {"Type": "tmpfs", "Destination": "/run/failroom-target", "Source": ""},
         ],
     )
     test_case.assertNotIn("docker.sock", repr(data))

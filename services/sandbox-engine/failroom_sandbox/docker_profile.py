@@ -61,6 +61,7 @@ class StrictDockerProfile:
     pids_limit: int
     workspace_tmpfs_bytes: int
     temp_tmpfs_bytes: int
+    target_supervisor_tmpfs_bytes: int
     shm_size_bytes: int
     fd_limit: int
     io_device_path: str
@@ -166,6 +167,7 @@ def _validate_profile(profile: object) -> None:
         and _is_positive_int(profile.pids_limit)
         and _is_positive_int(profile.workspace_tmpfs_bytes)
         and _is_positive_int(profile.temp_tmpfs_bytes)
+        and _is_positive_int(profile.target_supervisor_tmpfs_bytes)
         and _is_positive_int(profile.shm_size_bytes)
         and _is_positive_int(profile.fd_limit)
         and _is_absolute_path(profile.io_device_path)
@@ -222,6 +224,11 @@ def _profile_configuration(profile: StrictDockerProfile) -> dict[str, object]:
                     "path": "/tmp",
                     "size_bytes": profile.temp_tmpfs_bytes,
                     "options": ["rw", "nosuid", "nodev", "noexec"],
+                },
+                "target_supervisor": {
+                    "path": "/run/failroom-target",
+                    "size_bytes": profile.target_supervisor_tmpfs_bytes,
+                    "options": ["rw", "mode=0700", "nosuid", "nodev", "noexec"],
                 },
             },
             "shm_size_bytes": profile.shm_size_bytes,
@@ -335,6 +342,10 @@ def compile_create_argv(
         + ",nosuid,nodev,noexec",
         "--tmpfs",
         "/tmp:rw,size=" + str(profile.temp_tmpfs_bytes) + ",nosuid,nodev,noexec",
+        "--tmpfs",
+        "/run/failroom-target:rw,size="
+        + str(profile.target_supervisor_tmpfs_bytes)
+        + ",mode=0700,nosuid,nodev,noexec",
         "--shm-size",
         str(profile.shm_size_bytes),
         "--ulimit",
