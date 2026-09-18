@@ -3,6 +3,7 @@
 import os
 import sys
 import tempfile
+import time
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
@@ -57,6 +58,19 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
             ):
                 return output
         raise AssertionError("terminal marker not observed")
+
+    @staticmethod
+    def _wait_for_attempt_state(
+        client, attempt_id: str, headers: dict[str, str], expected: str
+    ) -> dict[str, object]:
+        deadline = time.monotonic() + 5
+        while True:
+            response = client.get("/v1/attempts/" + attempt_id + "/status", headers=headers)
+            if response.status_code == 200 and response.json().get("state") == expected:
+                return response.json()
+            if time.monotonic() >= deadline:
+                raise AssertionError("attempt did not reach " + expected)
+            time.sleep(0.05)
 
     def test_enter_capability_terminal_and_leave_through_local_app(self) -> None:
         environment = dict(os.environ)
@@ -117,6 +131,97 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
                         },
                     )
                     self.assertEqual(left.status_code, 202)
+
+    def test_terminal_recovery_verification_and_leave_through_local_app(self) -> None:
+        environment = dict(os.environ)
+        environment["FAILROOM_DATABASE_PATH"] = str(
+            Path(self.database_temp.name) / "state.sqlite3"
+        )
+        config = LocalRuntimeConfig.from_environment(environment)
+        runtime = build_runtime(config, now=lambda: datetime.now(UTC))
+        headers = {"authorization": "Bearer " + self.token}
+
+        with TestClient(runtime.app) as client:
+            attempt_id: str | None = None
+            try:
+                entered = client.post(
+                    "/v1/rooms/disk-full/attempts",
+                    headers={**headers, "idempotency-key": "enter-" + uuid4().hex},
+                )
+                self.assertEqual(entered.status_code, 201)
+                attempt_id = entered.json()["attempt_id"]
+
+                unrecovered = client.post(
+                    "/v1/attempts/" + attempt_id + "/verify-recovery",
+                    headers={
+                        **headers,
+                        "idempotency-key": "unrecovered-" + uuid4().hex,
+                    },
+                )
+                self.assertEqual(unrecovered.status_code, 409)
+                self.assertEqual(
+                    unrecovered.json(), {"code": "RECOVERY_NOT_VERIFIED"}
+                )
+                status = client.get(
+                    "/v1/attempts/" + attempt_id + "/status", headers=headers
+                )
+                self.assertEqual(status.status_code, 200)
+                self.assertEqual(status.json()["state"], "RUNNING")
+
+                capability = client.post(
+                    "/v1/attempts/" + attempt_id + "/terminal-capability",
+                    headers=headers,
+                )
+                self.assertEqual(capability.status_code, 200)
+
+                with client.websocket_connect("/v1/terminal") as socket:
+                    socket.send_json(
+                        {
+                            "type": "authorize",
+                            "capability": capability.json()["capability"],
+                        }
+                    )
+                    self.assertEqual(socket.receive_json(), {"type": "authorized"})
+                    marker = "FAILROOM_LOCAL_RECOVERY_" + uuid4().hex
+                    socket.send_json(
+                        {
+                            "type": "input",
+                            "data": (
+                                "rm -- /workspace/.failroom-disk-full && "
+                                + "printf '"
+                                + marker
+                                + "\\n'\n"
+                            ),
+                        }
+                    )
+                    self.assertIn(marker, self._receive_until(socket, marker))
+                    socket.send_json({"type": "close"})
+
+                recovered = client.post(
+                    "/v1/attempts/" + attempt_id + "/verify-recovery",
+                    headers={
+                        **headers,
+                        "idempotency-key": "recover-" + uuid4().hex,
+                    },
+                )
+                self.assertEqual(recovered.status_code, 200)
+                self.assertEqual(recovered.json()["state"], "RESOLVED")
+            finally:
+                if attempt_id is not None:
+                    left = client.post(
+                        "/v1/attempts/" + attempt_id + "/leave",
+                        headers={
+                            **headers,
+                            "idempotency-key": "leave-" + uuid4().hex,
+                        },
+                    )
+                    self.assertEqual(left.status_code, 202)
+                    self.assertEqual(left.json()["state"], "STOPPING")
+                    self.assertTrue(left.json()["destroy_intent"])
+                    destroyed = self._wait_for_attempt_state(
+                        client, attempt_id, headers, "DESTROYED"
+                    )
+                    self.assertEqual(destroyed["state"], "DESTROYED")
 
     def test_reused_capability_is_denied_through_local_app(self) -> None:
         environment = dict(os.environ)
