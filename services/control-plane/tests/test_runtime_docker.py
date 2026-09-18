@@ -1,9 +1,13 @@
 import unittest
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 from failroom_sandbox.docker_cli import DockerError
+from failroom_sandbox.docker_lifecycle import ContainerObservation, CreatedContainer
 from failroom_sandbox.docker_profile import DockerBinding
+from failroom_sandbox.scenario import DiskFullScenario
+from failroom_sandbox.scenario_runtime import ScenarioObservation
 from failroom_state import CleanupTarget, ResourceRef, RuntimeCleanupError
 
 from failroom_control_plane.runtime_docker import (
@@ -31,7 +35,7 @@ class DockerRuntimeAdapterTests(unittest.TestCase):
 
     def test_provisioning_adapter_holds_prepared_operation(self) -> None:
         lifecycle = Mock()
-        profile = object()
+        profile = SimpleNamespace(workspace_tmpfs_bytes=67_108_864)
         operation = object()
 
         @contextmanager
@@ -42,12 +46,43 @@ class DockerRuntimeAdapterTests(unittest.TestCase):
         lifecycle.prepare.side_effect = prepare
         adapter = DockerProvisioningRuntime(lifecycle, profile)
 
-        with adapter.open(self.binding(), "runtime-operation") as actual:
+        with adapter.open(self.binding(), "runtime-operation", "room-1") as actual:
             self.assertIs(actual, operation)
 
         lifecycle.prepare.assert_called_once_with(
             profile, self.binding(), "runtime-operation"
         )
+
+    def test_disk_full_adapter_combines_running_and_bootstrap_evidence(self) -> None:
+        lifecycle = Mock()
+        profile = SimpleNamespace(workspace_tmpfs_bytes=67_108_864)
+        operation = Mock()
+        created = CreatedContainer("c" * 64, True)
+        started = ContainerObservation(created.container_id, True, "sha256:" + "a" * 64)
+        operation.bootstrap_disk_full.return_value = ScenarioObservation(
+            "sha256:" + "b" * 64
+        )
+        scenario = DiskFullScenario(
+            filler_path="/workspace/.failroom-disk-full",
+            filler_bytes=60_000_000,
+            recovery_free_bytes=8_000_000,
+        )
+
+        @contextmanager
+        def prepare(*args: object):
+            yield operation
+
+        lifecycle.prepare.side_effect = prepare
+        adapter = DockerProvisioningRuntime(lifecycle, profile)
+
+        with adapter.open(self.binding(), "runtime-operation", "disk-full") as actual:
+            result = actual.bootstrap_disk_full(created, started)
+
+        self.assertEqual(result.container_id, created.container_id)
+        self.assertTrue(result.running)
+        self.assertRegex(result.evidence_digest, r"^sha256:[0-9a-f]{64}$")
+        self.assertNotEqual(result.evidence_digest, started.evidence_digest)
+        operation.bootstrap_disk_full.assert_called_once_with(created, scenario)
 
     def test_cleanup_adapter_uses_original_runtime_id_not_cleanup_operation_id(
         self,

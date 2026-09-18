@@ -11,6 +11,137 @@ from failroom_sandbox.docker_cli import (
 
 
 class DockerCliTests(unittest.TestCase):
+    def test_allocates_a_bounded_workspace_file_with_fixed_argv(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return ProcessResult(0, b"", b"")
+
+        cli = DockerCli(
+            context="desktop-linux", timeout=5, max_output_bytes=1024, runner=runner
+        )
+        cli.allocate_workspace_file(
+            "a" * 64,
+            uid=1000,
+            gid=1000,
+            size_bytes=60_000_000,
+            path="/workspace/.failroom-disk-full",
+        )
+
+        self.assertEqual(
+            calls[0][0],
+            (
+                "docker",
+                "--context",
+                "desktop-linux",
+                "container",
+                "exec",
+                "--user",
+                "1000:1000",
+                "a" * 64,
+                "/usr/bin/fallocate",
+                "-l",
+                "60000000",
+                "/workspace/.failroom-disk-full",
+            ),
+        )
+
+    def test_rejects_unbounded_workspace_allocation_arguments(self):
+        cli = DockerCli(
+            context="desktop-linux",
+            timeout=5,
+            max_output_bytes=1024,
+            runner=lambda *args, **kwargs: ProcessResult(0, b"", b""),
+        )
+        for kwargs in (
+            {"uid": 0, "gid": 1000, "size_bytes": 1, "path": "/workspace/a"},
+            {"uid": 1000, "gid": 1000, "size_bytes": 0, "path": "/workspace/a"},
+            {"uid": 1000, "gid": 1000, "size_bytes": 1, "path": "/tmp/a"},
+            {
+                "uid": 1000,
+                "gid": 1000,
+                "size_bytes": 1,
+                "path": "/workspace/../tmp/a",
+            },
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(
+                DockerError, "^INVALID_DOCKER_REQUEST$"
+            ):
+                cli.allocate_workspace_file("a" * 64, **kwargs)
+
+    def test_observes_and_removes_only_the_fixed_disk_full_filler(self):
+        calls = []
+        results = iter(
+            (
+                ProcessResult(0, b"Avail\n7108864\n", b""),
+                ProcessResult(0, b"60000000\n", b""),
+                ProcessResult(0, b"", b""),
+            )
+        )
+
+        def runner(argv, **kwargs):
+            calls.append(argv)
+            return next(results)
+
+        cli = DockerCli(
+            context="desktop-linux", timeout=5, max_output_bytes=1024, runner=runner
+        )
+        self.assertEqual(
+            cli.workspace_available_bytes("a" * 64, uid=1000, gid=1000), 7_108_864
+        )
+        self.assertEqual(
+            cli.disk_full_filler_size("a" * 64, uid=1000, gid=1000), 60_000_000
+        )
+        cli.remove_disk_full_filler("a" * 64, uid=1000, gid=1000)
+
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "docker",
+                    "--context",
+                    "desktop-linux",
+                    "container",
+                    "exec",
+                    "--user",
+                    "1000:1000",
+                    "a" * 64,
+                    "/usr/bin/df",
+                    "--output=avail",
+                    "-B1",
+                    "/workspace",
+                ),
+                (
+                    "docker",
+                    "--context",
+                    "desktop-linux",
+                    "container",
+                    "exec",
+                    "--user",
+                    "1000:1000",
+                    "a" * 64,
+                    "/usr/bin/stat",
+                    "--format=%s",
+                    "--",
+                    "/workspace/.failroom-disk-full",
+                ),
+                (
+                    "docker",
+                    "--context",
+                    "desktop-linux",
+                    "container",
+                    "exec",
+                    "--user",
+                    "1000:1000",
+                    "a" * 64,
+                    "/usr/bin/rm",
+                    "--",
+                    "/workspace/.failroom-disk-full",
+                ),
+            ],
+        )
+
     def test_process_timeout_and_output_limit_are_enforced(self):
         for code, timeout, limit in (
             ("import time; time.sleep(10)", 0.1, 1024),

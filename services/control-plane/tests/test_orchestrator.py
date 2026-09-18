@@ -46,19 +46,35 @@ class FakeSession:
         return ContainerObservation(created.container_id, True, "sha256:" + "a" * 64)
 
 
+class FakeDiskFullSession(FakeSession):
+    def bootstrap_disk_full(
+        self, created: CreatedContainer, started: ContainerObservation
+    ) -> ContainerObservation:
+        self.runtime.calls.append("bootstrap:STARTING")
+        if self.runtime.bootstrap_error is not None:
+            error = self.runtime.bootstrap_error
+            self.runtime.bootstrap_error = None
+            raise error
+        return ContainerObservation(created.container_id, True, "sha256:" + "b" * 64)
+
+
 class FakeRuntime:
     def __init__(self) -> None:
         self.calls: list[str] = []
         self.create_error: DockerError | None = None
         self.start_error: DockerError | None = None
+        self.bootstrap_error: DockerError | None = None
+        self.bootstrap_enabled = False
         self.bindings: list[DockerBinding] = []
+        self.room_ids: list[str] = []
 
     @contextmanager
-    def open(self, binding: DockerBinding, runtime_operation_id: str):
+    def open(self, binding: DockerBinding, runtime_operation_id: str, room_id: str):
         self.bindings.append(binding)
+        self.room_ids.append(room_id)
         self.calls.append("open")
         try:
-            yield FakeSession(self)
+            yield FakeDiskFullSession(self) if self.bootstrap_enabled else FakeSession(self)
         finally:
             self.calls.append("close")
 
@@ -123,6 +139,49 @@ class OrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(self.resource(receipt).state, ResourceState.READY)
         self.assertEqual(self.attempt(receipt).state, "READY")
+
+    def test_optional_disk_full_bootstrap_runs_before_ready_publication(self):
+        self.runtime.bootstrap_enabled = True
+        receipt = self.create_attempt()
+
+        self.provision(receipt)
+
+        self.assertEqual(
+            self.runtime.calls,
+            [
+                "open",
+                "create:CREATING",
+                "start:STARTING",
+                "bootstrap:STARTING",
+                "close",
+            ],
+        )
+        self.assertEqual(self.resource(receipt).state, ResourceState.READY)
+        self.assertEqual(self.attempt(receipt).state, "READY")
+        self.assertEqual(self.runtime.room_ids, ["disk-full"])
+
+    def test_bootstrap_failure_marks_failed_and_prevents_ready_publication(self):
+        self.runtime.bootstrap_enabled = True
+        self.runtime.bootstrap_error = DockerError("PROFILE_UNVERIFIED")
+        receipt = self.create_attempt()
+
+        with self.assertRaises(LifecycleError) as caught:
+            self.provision(receipt)
+
+        self.assertEqual(caught.exception.code, "START_FAILED")
+        self.assertEqual(self.resource(receipt).state, ResourceState.FAILED)
+        self.assertTrue(self.resource(receipt).destroy_intent)
+        self.assertNotEqual(self.attempt(receipt).state, "READY")
+        self.assertEqual(
+            self.runtime.calls,
+            [
+                "open",
+                "create:CREATING",
+                "start:STARTING",
+                "bootstrap:STARTING",
+                "close",
+            ],
+        )
 
     def test_create_timeout_keeps_cleanup_intent_and_never_publishes_ready(self):
         self.runtime.create_error = DockerError("RUNTIME_UNAVAILABLE")

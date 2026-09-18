@@ -158,6 +158,29 @@ class StoreTests(unittest.TestCase):
             ),
         )
 
+    def test_trusted_room_lookup_requires_service_identity_and_current_binding(self):
+        receipt = self.create()
+
+        self.assertEqual(
+            self.backend.room_id_for_binding(
+                self.service(Role.BACKEND, Action.CREATE), receipt.ref
+            ),
+            "disk-full",
+        )
+        self.assert_error(
+            "NOT_AUTHORIZED",
+            lambda: self.backend.room_id_for_binding(
+                self.service(Role.BACKEND, Action.PUBLISH), receipt.ref
+            ),
+        )
+        self.assert_error(
+            "STALE_BINDING",
+            lambda: self.backend.room_id_for_binding(
+                self.service(Role.BACKEND, Action.CREATE),
+                ResourceRef(receipt.attempt_id, "different-sandbox", 1),
+            ),
+        )
+
     def test_accepted_resource_exposes_preallocated_runtime_operation_id(self):
         receipt = self.create()
         self.accept(receipt)
