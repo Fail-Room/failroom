@@ -1,0 +1,50 @@
+#!/bin/sh
+set -eu
+
+STATE_DIR=/run/failroom-target
+READY=$STATE_DIR/ready
+PID=$STATE_DIR/pid
+WORK=$STATE_DIR/working-set
+WORKING_SET_BYTES=8000000
+
+initialize() {
+  umask 077
+  mkdir -p "$STATE_DIR"
+  rm -f "$READY" "$PID" "$WORK" "$WORK.partial"
+  if ! dd if=/dev/zero of="$WORK.partial" bs=1000000 count=8 conv=fsync status=none 2>/dev/null; then
+    rm -f "$READY" "$PID" "$WORK.partial"
+    return 1
+  fi
+  mv "$WORK.partial" "$WORK"
+}
+
+status() {
+  test -r "$PID" || return 1
+  pid=$(cat "$PID")
+  case "$pid" in
+    ""|*[!0-9]*) return 1 ;;
+  esac
+  test -d "/proc/$pid" || return 1
+  test -f "$READY" || return 1
+  test -f "$WORK" || return 1
+  test "$(wc -c <"$WORK")" = "$WORKING_SET_BYTES"
+}
+
+case "${1:-}" in
+  initialize)
+    initialize
+    ;;
+  run)
+    initialize
+    printf '%s\n' "$$" >"$PID"
+    : >"$READY"
+    trap 'rm -f "$READY" "$PID"; exit 0' INT TERM
+    while :; do sleep 1; done
+    ;;
+  status)
+    status
+    ;;
+  *)
+    exit 64
+    ;;
+esac

@@ -9,6 +9,7 @@ _DISK_FULL_DECLARATION = {
     "version": "disk-full-v1",
     "filler_bytes": 60_000_000,
     "recovery_free_bytes": 8_000_000,
+    "target_working_set_bytes": 8_000_000,
 }
 
 

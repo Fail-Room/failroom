@@ -68,6 +68,7 @@ def observation(profile, seccomp_path):
             "Tmpfs": {
                 "/workspace": "rw,size=67108864,nosuid,nodev,noexec",
                 "/tmp": "rw,size=16777216,nosuid,nodev,noexec",
+                "/run/failroom-target": "rw,size=1048576,mode=0700,nosuid,nodev,noexec",
             },
             "Ulimits": [
                 {"Name": "nofile", "Soft": 256, "Hard": 256},
@@ -88,6 +89,7 @@ def observation(profile, seccomp_path):
         "Mounts": [
             {"Type": "tmpfs", "Destination": "/workspace", "Source": ""},
             {"Type": "tmpfs", "Destination": "/tmp", "Source": ""},
+            {"Type": "tmpfs", "Destination": "/run/failroom-target", "Source": ""},
         ],
         "State": {"Running": False, "Status": "created"},
     }
@@ -149,7 +151,8 @@ class Engine:
             if self.after_start:
                 self.after_start(self.resource)
         elif args[:2] == ("container", "exec"):
-            pass
+            if args[-2:] == ("/usr/local/bin/failroom-disk-target", "initialize"):
+                return ProcessResult(1, b"", b"")
         elif args[:2] == ("container", "stop"):
             self.resource["State"] = {"Running": False, "Status": "exited"}
         elif args[:2] == ("container", "rm"):
@@ -199,6 +202,7 @@ class DockerLifecycleTests(unittest.TestCase):
             filler_path="/workspace/.failroom-disk-full",
             filler_bytes=60_000_000,
             recovery_free_bytes=8_000_000,
+            target_working_set_bytes=8_000_000,
         )
 
         with self.lifecycle.prepare(self.profile, BINDING, OP) as operation:
@@ -229,7 +233,11 @@ class DockerLifecycleTests(unittest.TestCase):
             ("container", "inspect"),
         )
         self.assertEqual(
-            self.engine.calls[allocation_index + 1][3:5],
+            self.engine.calls[allocation_index + 1][-2:],
+            ("/usr/local/bin/failroom-disk-target", "initialize"),
+        )
+        self.assertEqual(
+            self.engine.calls[allocation_index + 2][3:5],
             ("container", "inspect"),
         )
 
@@ -246,6 +254,24 @@ class DockerLifecycleTests(unittest.TestCase):
         result = self.create()
         self.assertEqual(result.container_id, CID)
         self.assertTrue(result.running)
+
+    def test_local_immutable_image_id_must_match_the_inspected_image(self):
+        self.profile = replace(self.profile, image=IMAGE_ID)
+        self.engine = Engine(self.profile, self.policy.path)
+        self.engine.image["RepoDigests"] = None
+        self.cli = DockerCli(
+            context="desktop-linux",
+            timeout=5,
+            max_output_bytes=65536,
+            runner=self.engine,
+        )
+        self.lifecycle = DockerDiagnosticLifecycle(self.cli, self.policy)
+
+        self.assertEqual(self.create().container_id, CID)
+
+        self.engine.image["Id"] = "sha256:" + "e" * 64
+        with self.assertRaisesRegex(DockerError, "^IMAGE_UNVERIFIED$"):
+            self.create()
 
     def test_explicit_null_image_volume_metadata_is_treated_as_no_declared_volume(self):
         self.engine.image["Config"]["Volumes"] = None
@@ -348,6 +374,17 @@ class DockerLifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(DockerError, "^CLEANUP_INCOMPLETE$"):
             self.create()
         self.assertFalse(self.engine.created)
+        self.assertFalse(
+            any(c[3:5] == ("container", "start") for c in self.engine.calls)
+        )
+
+    def test_missing_target_supervisor_mount_is_cleaned_without_start(self):
+        self.engine.resource["HostConfig"]["Tmpfs"].pop("/run/failroom-target")
+        self.engine.resource["Mounts"] = self.engine.resource["Mounts"][:2]
+
+        with self.assertRaisesRegex(DockerError, "^CLEANUP_INCOMPLETE$"):
+            self.create()
+
         self.assertFalse(
             any(c[3:5] == ("container", "start") for c in self.engine.calls)
         )

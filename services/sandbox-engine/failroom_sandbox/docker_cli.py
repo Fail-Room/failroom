@@ -10,6 +10,8 @@ from typing import BinaryIO, Protocol, cast
 
 from .scenario import DISK_FULL_FILLER_PATH
 
+_TARGET_SUPERVISOR_USER = "0:0"
+
 
 class DockerError(RuntimeError):
     def __init__(self, code: str) -> None:
@@ -213,7 +215,9 @@ class DockerCli:
     def inspect_image(self, image: str) -> dict[str, object]:
         if (
             type(image) is not str
-            or re.fullmatch(r"[a-z0-9][a-z0-9./:_-]*@sha256:[a-f0-9]{64}", image)
+            or re.fullmatch(
+                r"(?:[a-z0-9][a-z0-9./:_-]*@)?sha256:[a-f0-9]{64}", image
+            )
             is None
         ):
             raise DockerError("INVALID_DOCKER_REQUEST")
@@ -330,6 +334,42 @@ class DockerCli:
                 "-e",
                 DISK_FULL_FILLER_PATH,
             ),
+            allow_failure=True,
+        )
+        if result.stdout or result.stderr:
+            raise DockerError("INVALID_DOCKER_RESPONSE")
+        if result.returncode == 0:
+            return True
+        if result.returncode == 1:
+            return False
+        raise DockerError("RUNTIME_UNAVAILABLE")
+
+    def disk_full_target_initialization_failed(self, container_id: str) -> bool:
+        return not self._disk_full_target_result(
+            container_id, action="initialize"
+        )
+
+    def start_disk_full_target(self, container_id: str) -> None:
+        _container_selector(container_id)
+        self._call(
+            (
+                "container", "exec", "--detach", "--user", _TARGET_SUPERVISOR_USER,
+                container_id, "/usr/local/bin/failroom-disk-target", "run",
+            )
+        )
+
+    def disk_full_target_healthy(self, container_id: str) -> bool:
+        return self._disk_full_target_result(
+            container_id, action="status"
+        )
+
+    def _disk_full_target_result(
+        self, container_id: str, *, action: str
+    ) -> bool:
+        _container_selector(container_id)
+        result = self._call(
+            ("container", "exec", "--user", _TARGET_SUPERVISOR_USER, container_id,
+             "/usr/local/bin/failroom-disk-target", action),
             allow_failure=True,
         )
         if result.stdout or result.stderr:

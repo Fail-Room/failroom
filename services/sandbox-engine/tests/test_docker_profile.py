@@ -33,6 +33,7 @@ class DockerProfileTests(unittest.TestCase):
             "pids_limit": 64,
             "workspace_tmpfs_bytes": 67_108_864,
             "temp_tmpfs_bytes": 16_777_216,
+            "target_supervisor_tmpfs_bytes": 1_048_576,
             "shm_size_bytes": 16_777_216,
             "fd_limit": 256,
             "io_device_path": "/dev/loop0",
@@ -65,6 +66,15 @@ class DockerProfileTests(unittest.TestCase):
         del incomplete["absolute_ttl_seconds"]
         with self.assertRaises(TypeError):
             StrictDockerProfile(**incomplete)
+
+    def test_requires_an_explicit_protected_target_supervisor_mount(self):
+        values = self._profile_values()
+        profile = StrictDockerProfile(**values)
+
+        self.assertIn(
+            "/run/failroom-target:rw,size=1048576,mode=0700,nosuid,nodev,noexec",
+            compile_create_argv(profile, self._binding(), "operation-789"),
+        )
 
     def test_declares_only_the_contract_api_and_has_no_field_defaults(self):
         self.assertEqual(
@@ -121,6 +131,17 @@ class DockerProfileTests(unittest.TestCase):
                     "^INVALID_DOCKER_PROFILE$",
                 ):
                     StrictDockerProfile(**values)
+
+    def test_accepts_a_local_immutable_image_id(self):
+        values = self._profile_values()
+        values["image"] = "sha256:" + "c" * 64
+
+        profile = StrictDockerProfile(**values)
+
+        self.assertEqual(
+            compile_create_argv(profile, self._binding(), "operation-789")[-2],
+            values["image"],
+        )
 
     def test_rejects_root_identity_and_unequal_memory_swap(self):
         profile = self._profile()
@@ -422,6 +443,8 @@ class DockerProfileTests(unittest.TestCase):
                 "/workspace:rw,size=67108864,nosuid,nodev,noexec",
                 "--tmpfs",
                 "/tmp:rw,size=16777216,nosuid,nodev,noexec",
+                "--tmpfs",
+                "/run/failroom-target:rw,size=1048576,mode=0700,nosuid,nodev,noexec",
                 "--shm-size",
                 "16777216",
                 "--ulimit",
