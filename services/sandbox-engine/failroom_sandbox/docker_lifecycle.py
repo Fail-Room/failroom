@@ -2,8 +2,9 @@
 
 import hashlib
 import json
+import math
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -11,9 +12,15 @@ from typing import Protocol
 
 from .docker_cli import DockerCli, DockerError
 from .docker_profile import (
+    _LIFETIME_START_MARGIN_SECONDS,
     DockerBinding,
     StrictDockerProfile,
+    _container_name,
     _cpu_nanocpus,
+    _max_lifetime_seconds,
+    _validate_binding,
+    _validate_operation_id,
+    _validate_profile,
     compile_create_argv,
     profile_fingerprint,
 )
@@ -41,6 +48,63 @@ class ContainerObservation:
 class CreatedContainer:
     container_id: str
     running: bool
+
+
+@dataclass(frozen=True)
+class ContainerLifetime:
+    """The attempt's immutable deadline and the trusted clock that bound PID 1."""
+
+    deadline: datetime
+    now: Callable[[], datetime]
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.deadline) is not datetime
+            or self.deadline.utcoffset() is None
+            or not callable(self.now)
+        ):
+            raise DockerError("INVALID_DOCKER_REQUEST")
+
+
+def _trusted_now(lifetime: ContainerLifetime) -> datetime:
+    try:
+        current = lifetime.now()
+    except Exception:
+        raise DockerError("INVALID_DOCKER_REQUEST") from None
+    if type(current) is not datetime or current.utcoffset() is None:
+        raise DockerError("INVALID_DOCKER_REQUEST")
+    return current
+
+
+def _planned_lifetime_seconds(
+    lifetime: ContainerLifetime, profile: StrictDockerProfile
+) -> int:
+    """Sleep until the start margin before the deadline, never past the TTL."""
+    remaining = math.floor((lifetime.deadline - _trusted_now(lifetime)).total_seconds())
+    seconds = min(
+        remaining - _LIFETIME_START_MARGIN_SECONDS, _max_lifetime_seconds(profile)
+    )
+    if seconds < 1:
+        raise DockerError("INVALID_DOCKER_REQUEST")
+    return seconds
+
+
+def _require_within_deadline(lifetime: ContainerLifetime, seconds: int) -> None:
+    if _trusted_now(lifetime) + timedelta(seconds=seconds) > lifetime.deadline:
+        raise DockerError("PROFILE_UNVERIFIED")
+
+
+def _verified_lifetime(config: dict[str, object], profile: StrictDockerProfile) -> int:
+    command = config.get("Cmd")
+    if (
+        type(command) is not list
+        or len(command) != 1
+        or type(command[0]) is not str
+        or re.fullmatch(r"[1-9][0-9]{0,9}", command[0]) is None
+        or int(command[0]) > _max_lifetime_seconds(profile)
+    ):
+        raise DockerError("PROFILE_UNVERIFIED")
+    return int(command[0])
 
 
 def _object(value: object) -> dict[str, object]:
@@ -229,13 +293,13 @@ def _verify_profile(
         or config.get("Image") != profile.image
         or config.get("User") != f"{profile.uid}:{profile.gid}"
         or config.get("Entrypoint") != ["/bin/sleep"]
-        or config.get("Cmd") != ["60"]
         or _object(config.get("Healthcheck")).get("Test") != ["NONE"]
         or config.get("Env") != _object(image.get("Config")).get("Env")
         or _object(host.get("RestartPolicy")).get("Name") != "no"
         or _object(host.get("LogConfig")).get("Type") != "none"
     ):
         raise DockerError("PROFILE_UNVERIFIED")
+    _verified_lifetime(config, profile)
     ulimits = host.get("Ulimits")
     if type(ulimits) is not list or sorted(
         ulimits, key=lambda x: str(_object(x).get("Name"))
@@ -291,24 +355,46 @@ class PreparedDockerOperation:
         operation_id: str,
         image: dict[str, object],
         pinned: str,
+        lifetime: ContainerLifetime | None = None,
     ) -> None:
+        _validate_profile(profile)
+        _validate_binding(binding)
+        _validate_operation_id(operation_id)
         self._lifecycle = lifecycle
         self._profile = profile
         self._binding = binding
         self._operation_id = operation_id
         self._image = image
         self._pinned = pinned
-        self._argv = tuple(
-            "seccomp=" + pinned if arg == "seccomp=" + profile.seccomp_path else arg
-            for arg in compile_create_argv(profile, binding, operation_id)
-        )
+        self._lifetime = lifetime
+        self._name = _container_name(binding, operation_id)
         self._cleanup_id: str | None = None
 
+    def _require_lifetime(self) -> ContainerLifetime:
+        if type(self._lifetime) is not ContainerLifetime:
+            raise DockerError("INVALID_DOCKER_REQUEST")
+        return self._lifetime
+
+    def _create_argv(self, lifetime_seconds: int) -> tuple[str, ...]:
+        return tuple(
+            "seccomp=" + self._pinned
+            if arg == "seccomp=" + self._profile.seccomp_path
+            else arg
+            for arg in compile_create_argv(
+                self._profile,
+                self._binding,
+                self._operation_id,
+                lifetime_seconds=lifetime_seconds,
+            )
+        )
+
     def create_verified(self) -> CreatedContainer:
-        name = self._argv[4]
-        data = self._lifecycle._cli.inspect_container(name)
+        lifetime_seconds = _planned_lifetime_seconds(
+            self._require_lifetime(), self._profile
+        )
+        data = self._lifecycle._cli.inspect_container(self._name)
         if data is None:
-            cid = self._lifecycle._cli.create(self._argv)
+            cid = self._lifecycle._cli.create(self._create_argv(lifetime_seconds))
             self._cleanup_id = cid
             data = self._lifecycle._cli.inspect_container(cid)
             if data is None:
@@ -326,8 +412,14 @@ class PreparedDockerOperation:
         return CreatedContainer(cid, state.get("Running") is True)
 
     def start_verified(self, created: CreatedContainer) -> ContainerObservation:
+        lifetime = self._require_lifetime()
         data = self._lifecycle._inspect_exact_created(self, created.container_id)
+        lifetime_seconds = _verified_lifetime(
+            _object(data.get("Config")), self._profile
+        )
         if not created.running:
+            # Never start a container whose PID 1 would outlive the deadline.
+            _require_within_deadline(lifetime, lifetime_seconds)
             try:
                 self._lifecycle._cli.start(created.container_id)
             except DockerError:
@@ -342,10 +434,12 @@ class PreparedDockerOperation:
                 )
         if _object(data.get("State")).get("Running") is not True:
             raise DockerError("PROFILE_UNVERIFIED")
+        # A slow or reconciled start is judged from the latest trusted time.
+        _require_within_deadline(lifetime, lifetime_seconds)
         return ContainerObservation(
             created.container_id,
             True,
-            self._lifecycle._running_evidence(self, data),
+            self._lifecycle._running_evidence(self, data, lifetime_seconds),
         )
 
     def bootstrap_disk_full(
@@ -408,11 +502,14 @@ class DockerDiagnosticLifecycle:
         return data
 
     def _running_evidence(
-        self, operation: PreparedDockerOperation, data: dict[str, object]
+        self,
+        operation: PreparedDockerOperation,
+        data: dict[str, object],
+        lifetime_seconds: int,
     ) -> str:
         return configuration_digest(
             {
-                "schema": "failroom.diagnostic-running.v1",
+                "schema": "failroom.diagnostic-running.v2",
                 "context": self._cli.context,
                 "labels": {
                     **_labels(operation._binding),
@@ -421,6 +518,7 @@ class DockerDiagnosticLifecycle:
                 "image_id": operation._image["Id"],
                 "profile": profile_fingerprint(operation._profile),
                 "container_id": data["Id"],
+                "lifetime_seconds": lifetime_seconds,
                 "running": True,
             }
         )
@@ -431,11 +529,16 @@ class DockerDiagnosticLifecycle:
         profile: StrictDockerProfile,
         binding: DockerBinding,
         operation_id: str,
+        *,
+        lifetime: ContainerLifetime | None = None,
     ) -> Iterator[PreparedDockerOperation]:
+        """Pin one operation; create and start additionally require ``lifetime``."""
+        if lifetime is not None and type(lifetime) is not ContainerLifetime:
+            raise DockerError("INVALID_DOCKER_REQUEST")
         image = _verified_image(self._cli, profile)
         with self._policies.pin(profile.seccomp_path, profile.seccomp_digest) as pinned:
             operation = PreparedDockerOperation(
-                self, profile, binding, operation_id, image, pinned
+                self, profile, binding, operation_id, image, pinned, lifetime
             )
             try:
                 yield operation
@@ -444,9 +547,16 @@ class DockerDiagnosticLifecycle:
                 raise
 
     def create_diagnostic(
-        self, profile: StrictDockerProfile, binding: DockerBinding, operation_id: str
+        self,
+        profile: StrictDockerProfile,
+        binding: DockerBinding,
+        operation_id: str,
+        *,
+        lifetime: ContainerLifetime,
     ) -> ContainerObservation:
-        with self.prepare(profile, binding, operation_id) as operation:
+        with self.prepare(
+            profile, binding, operation_id, lifetime=lifetime
+        ) as operation:
             return operation.start_verified(operation.create_verified())
 
     def destroy(

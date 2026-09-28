@@ -8,12 +8,16 @@ the production SeccompPolicyStore rejects that platform before Docker create.
 import os
 import sys
 import unittest
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
 from failroom_sandbox.docker_cli import DockerCli
-from failroom_sandbox.docker_lifecycle import DockerDiagnosticLifecycle
+from failroom_sandbox.docker_lifecycle import (
+    ContainerLifetime,
+    DockerDiagnosticLifecycle,
+)
 from failroom_sandbox.docker_profile import DockerBinding, StrictDockerProfile
 from failroom_sandbox.seccomp import SeccompPolicyStore
 
@@ -148,12 +152,22 @@ class DockerDiagnosticIntegrationTests(unittest.TestCase):
         operation_id = uuid4().hex
         container_id = None
         try:
-            observation = lifecycle.create_diagnostic(profile, binding, operation_id)
+            lifetime = ContainerLifetime(
+                datetime.now(UTC) + timedelta(seconds=profile.absolute_ttl_seconds),
+                lambda: datetime.now(UTC),
+            )
+            observation = lifecycle.create_diagnostic(
+                profile, binding, operation_id, lifetime=lifetime
+            )
             container_id = observation.container_id
             self.assertTrue(observation.running)
             data = cli.inspect_container(container_id)
             self.assertIsNotNone(data)
             _assert_hardening(self, data, profile)
+            self.assertEqual(data["Config"]["Entrypoint"], ["/bin/sleep"])
+            self.assertLessEqual(
+                int(data["Config"]["Cmd"][0]), profile.absolute_ttl_seconds - 10
+            )
             evidence = lifecycle.destroy(
                 binding,
                 container_id,

@@ -1,10 +1,15 @@
 import unittest
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 from failroom_sandbox.docker_cli import DockerError
-from failroom_sandbox.docker_lifecycle import ContainerObservation, CreatedContainer
+from failroom_sandbox.docker_lifecycle import (
+    ContainerLifetime,
+    ContainerObservation,
+    CreatedContainer,
+)
 from failroom_sandbox.docker_profile import DockerBinding
 from failroom_sandbox.scenario import DiskFullScenario
 from failroom_sandbox.scenario_runtime import ScenarioObservation
@@ -20,6 +25,10 @@ from failroom_control_plane.runtime_docker import (
 class DockerRuntimeAdapterTests(unittest.TestCase):
     def binding(self) -> DockerBinding:
         return DockerBinding("attempt-123", "sandbox-456", 1)
+
+    def lifetime(self) -> ContainerLifetime:
+        now = datetime(2026, 9, 28, 12, 0, tzinfo=UTC)
+        return ContainerLifetime(now + timedelta(minutes=5), lambda: now)
 
     def target(
         self,
@@ -38,20 +47,23 @@ class DockerRuntimeAdapterTests(unittest.TestCase):
         lifecycle = Mock()
         profile = SimpleNamespace(workspace_tmpfs_bytes=67_108_864)
         operation = object()
+        lifetime = self.lifetime()
 
         @contextmanager
-        def prepare(*args: object):
+        def prepare(*args: object, **kwargs: object):
             lifecycle.prepare_calls = args
             yield operation
 
         lifecycle.prepare.side_effect = prepare
         adapter = DockerProvisioningRuntime(lifecycle, profile)
 
-        with adapter.open(self.binding(), "runtime-operation", "room-1") as actual:
+        with adapter.open(
+            self.binding(), "runtime-operation", "room-1", lifetime=lifetime
+        ) as actual:
             self.assertIs(actual, operation)
 
         lifecycle.prepare.assert_called_once_with(
-            profile, self.binding(), "runtime-operation"
+            profile, self.binding(), "runtime-operation", lifetime=lifetime
         )
 
     def test_disk_full_adapter_combines_running_and_bootstrap_evidence(self) -> None:
@@ -72,13 +84,15 @@ class DockerRuntimeAdapterTests(unittest.TestCase):
         )
 
         @contextmanager
-        def prepare(*args: object):
+        def prepare(*args: object, **kwargs: object):
             yield operation
 
         lifecycle.prepare.side_effect = prepare
         adapter = DockerProvisioningRuntime(lifecycle, profile)
 
-        with adapter.open(self.binding(), "runtime-operation", "disk-full") as actual:
+        with adapter.open(
+            self.binding(), "runtime-operation", "disk-full", lifetime=self.lifetime()
+        ) as actual:
             result = actual.bootstrap_disk_full(created, started)
 
         self.assertEqual(result.container_id, created.container_id)

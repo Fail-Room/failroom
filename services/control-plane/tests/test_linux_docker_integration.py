@@ -3,6 +3,7 @@
 import os
 import sys
 import tempfile
+import time
 import unittest
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -377,6 +378,62 @@ class LinuxControlPlaneIntegrationTests(unittest.TestCase):
                     "linux-reset-leave-finally",
                 )
                 self.cleanup.destroy_and_verify_absent(target)
+
+    def test_pid1_outlives_sixty_seconds_and_stops_by_the_attempt_deadline(
+        self,
+    ) -> None:
+        """Hold one real sandbox past 60 seconds and until its deadline (~85 s)."""
+
+        def clock() -> datetime:
+            return datetime.now(UTC)
+
+        started = clock()
+        deadline = started + timedelta(seconds=80)
+        receipt = None
+        try:
+            receipt = self.backend.create(
+                self.user,
+                "disk-full",
+                key=uuid4().hex,
+                expires_at=deadline,
+                now=clock,
+            )
+            self.orchestrator.provision(
+                receipt,
+                backend_identity=self.backend_identity,
+                control_identity=self.control_identity,
+                key=uuid4().hex,
+                now=clock,
+            )
+            resource = self.control.inspect(self.control_identity, receipt.ref)
+            self.assertEqual(resource.state, ResourceState.READY)
+            self.assertIsNotNone(resource.container_id)
+            data = self.inspect_cli.inspect_container(resource.container_id)
+            self.assertIsNotNone(data)
+            self.assertEqual(data["Config"]["Entrypoint"], ["/bin/sleep"])
+            lifetime_seconds = int(data["Config"]["Cmd"][0])
+            self.assertGreater(lifetime_seconds, 60)
+            self.assertLessEqual(lifetime_seconds, 70)
+
+            time.sleep(max(0.0, 65 - (clock() - started).total_seconds()))
+            running = self.inspect_cli.inspect_container(resource.container_id)
+            self.assertIs(running["State"]["Running"], True)
+
+            time.sleep(max(0.0, (deadline - clock()).total_seconds()) + 1)
+            stopped = self.inspect_cli.inspect_container(resource.container_id)
+            self.assertIs(stopped["State"]["Running"], False)
+            self.assertEqual(stopped["State"]["ExitCode"], 0)
+        finally:
+            if receipt is not None:
+                resource = self.control.inspect(self.control_identity, receipt.ref)
+                self.cleanup.destroy_and_verify_absent(
+                    CleanupTarget(
+                        receipt.ref,
+                        resource.container_id,
+                        resource.runtime_operation_id,
+                        "linux-lifetime-finally",
+                    )
+                )
 
 
 if __name__ == "__main__":

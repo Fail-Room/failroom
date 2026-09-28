@@ -5,6 +5,7 @@ from contextlib import contextmanager
 
 from failroom_sandbox.docker_cli import DockerError
 from failroom_sandbox.docker_lifecycle import (
+    ContainerLifetime,
     ContainerObservation,
     CreatedContainer,
     DockerDiagnosticLifecycle,
@@ -80,13 +81,18 @@ class DockerProvisioningRuntime:
 
     @contextmanager
     def open(
-        self, binding: DockerBinding, runtime_operation_id: str, room_id: str
+        self,
+        binding: DockerBinding,
+        runtime_operation_id: str,
+        room_id: str,
+        *,
+        lifetime: ContainerLifetime,
     ) -> Iterator[PreparedDockerOperation | _DiskFullProvisioningSession]:
         scenario = self._room_scenarios.resolve(
             room_id, workspace_bytes=self._profile.workspace_tmpfs_bytes
         )
         with self._lifecycle.prepare(
-            self._profile, binding, runtime_operation_id
+            self._profile, binding, runtime_operation_id, lifetime=lifetime
         ) as operation:
             if scenario is None:
                 yield operation
