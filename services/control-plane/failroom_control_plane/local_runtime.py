@@ -46,6 +46,7 @@ from .maintenance import LifecycleMaintenanceService, MaintenanceError
 from .orchestrator import LifecycleOrchestrator
 from .recovery import RecoveryVerificationService
 from .reset import RoomResetService
+from .room_scenarios import RoomScenarioRegistry
 from .runtime_docker import (
     DockerCleanupRuntime,
     DockerProvisioningRuntime,
@@ -381,6 +382,7 @@ def build_runtime(config: LocalRuntimeConfig, *, now: Clock) -> LocalRuntime:
                 seconds=config.controller.profile.absolute_ttl_seconds
             ),
             now=now,
+            rooms=RoomScenarioRegistry(),
         )
         lifecycle = RoomLifecycleService(
             backend,

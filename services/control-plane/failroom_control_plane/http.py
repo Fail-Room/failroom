@@ -37,6 +37,10 @@ _LIFECYCLE_STATUS = {
     "INVALID_REQUEST": 400,
     "CLEANUP_PENDING": 202,
 }
+_ENTRY_STATUS = {
+    "NOT_AUTHORIZED": 403,
+    "ROOM_UNAVAILABLE": 404,
+}
 _RECOVERY_STATUS = {
     "ATTEMPT_UNAVAILABLE": 409,
     "NOT_AUTHORIZED": 403,
@@ -99,7 +103,9 @@ def _entry_response(entry: RoomEntry) -> JSONResponse:
 
 
 def _entry_error(error: EntryError) -> JSONResponse:
-    return _error(error.code, 503)
+    status = _ENTRY_STATUS.get(error.code, 503)
+    code = error.code if status != 403 else "AUTHORIZATION_FAILED"
+    return _error(code, status)
 
 
 def _lifecycle_error(error: LifecycleError) -> JSONResponse:

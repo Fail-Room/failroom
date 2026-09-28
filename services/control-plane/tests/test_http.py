@@ -1,7 +1,8 @@
 import hashlib
+import sqlite3
 import tempfile
 import unittest
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -31,6 +32,7 @@ from failroom_control_plane.http import create_app
 from failroom_control_plane.lifecycle import RoomLifecycleService
 from failroom_control_plane.recovery import RecoveryVerificationService
 from failroom_control_plane.reset import RoomResetService
+from failroom_control_plane.room_scenarios import RoomScenarioRegistry
 
 
 class RecordingCleanupWorker:
@@ -92,7 +94,7 @@ class CapabilityHttpTests(unittest.TestCase):
         self.database.initialize()
         self.backend = BackendStore(self.database)
         self.control = ControlPlaneStore(self.database)
-        self.user = UserIdentity("alice", frozenset({"room-1"}))
+        self.user = UserIdentity("alice", frozenset({"room-1", "disk-full"}))
         self.other_user = UserIdentity("bob", frozenset({"room-1"}))
         self.backend_identity = ServiceIdentity(
             "backend", Role.BACKEND, frozenset({Action.CREATE, Action.PUBLISH})
@@ -131,6 +133,7 @@ class CapabilityHttpTests(unittest.TestCase):
             ),
             attempt_ttl=timedelta(minutes=15),
             now=lambda: self.now,
+            rooms=RoomScenarioRegistry(),
         )
         self.reset = RoomResetService(self.backend, now=lambda: self.now)
         self.recovery_runtime = RecordingRecoveryRuntime()
@@ -293,9 +296,14 @@ class CapabilityHttpTests(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json(), {"code": "AUTHENTICATION_REQUIRED"})
 
+    def _attempt_count(self) -> int:
+        with closing(sqlite3.connect(self.path)) as connection:
+            row = connection.execute("SELECT COUNT(*) FROM room_attempts").fetchone()
+        return int(row[0])
+
     def test_enter_room_creates_a_safe_owned_attempt(self) -> None:
         response = self.client.post(
-            "/v1/rooms/room-1/attempts",
+            "/v1/rooms/disk-full/attempts",
             headers={
                 "Authorization": "Bearer " + self.token,
                 "Idempotency-Key": "enter-room",
@@ -307,7 +315,7 @@ class CapabilityHttpTests(unittest.TestCase):
             set(response.json()),
             {"attempt_id", "room_id", "state", "expires_at"},
         )
-        self.assertEqual(response.json()["room_id"], "room-1")
+        self.assertEqual(response.json()["room_id"], "disk-full")
         self.assertEqual(response.json()["state"], "PROVISIONING")
         self.assertEqual(self.provisioner.keys, ["enter-room"])
         self.assertNotIn("sandbox_id", response.json())
@@ -315,7 +323,7 @@ class CapabilityHttpTests(unittest.TestCase):
 
     def test_enter_room_requires_an_idempotency_key(self) -> None:
         response = self.client.post(
-            "/v1/rooms/room-1/attempts",
+            "/v1/rooms/disk-full/attempts",
             headers={"Authorization": "Bearer " + self.token},
         )
 
@@ -327,7 +335,7 @@ class CapabilityHttpTests(unittest.TestCase):
         self.provisioner.failure = RuntimeError("runtime detail must not escape")
 
         response = self.client.post(
-            "/v1/rooms/room-1/attempts",
+            "/v1/rooms/disk-full/attempts",
             headers={
                 "Authorization": "Bearer " + self.token,
                 "Idempotency-Key": "failed-enter-room",
@@ -336,6 +344,34 @@ class CapabilityHttpTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json(), {"code": "ENTRY_FAILED"})
+
+    def test_enter_room_rejects_an_unreviewed_room_before_any_state(self) -> None:
+        response = self.client.post(
+            "/v1/rooms/room-1/attempts",
+            headers={
+                "Authorization": "Bearer " + self.token,
+                "Idempotency-Key": "enter-unreviewed-room",
+            },
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json(), {"code": "ROOM_UNAVAILABLE"})
+        self.assertEqual(self.provisioner.keys, [])
+        self.assertEqual(self._attempt_count(), 0)
+
+    def test_enter_room_denies_a_reviewed_room_outside_the_users_scope(self) -> None:
+        response = self.client.post(
+            "/v1/rooms/disk-full/attempts",
+            headers={
+                "Authorization": "Bearer " + self.other_token,
+                "Idempotency-Key": "enter-foreign-room",
+            },
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json(), {"code": "AUTHORIZATION_FAILED"})
+        self.assertEqual(self.provisioner.keys, [])
+        self.assertEqual(self._attempt_count(), 0)
 
     def test_status_endpoint_returns_only_safe_owned_attempt_fields(self) -> None:
         attempt_id = self._ready()

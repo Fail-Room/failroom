@@ -87,17 +87,17 @@ class DockerProvisioningRuntime:
         room_id: str,
         *,
         lifetime: ContainerLifetime,
-    ) -> Iterator[PreparedDockerOperation | _DiskFullProvisioningSession]:
+    ) -> Iterator[_DiskFullProvisioningSession]:
         scenario = self._room_scenarios.resolve(
             room_id, workspace_bytes=self._profile.workspace_tmpfs_bytes
         )
+        if scenario is None:
+            # Only reviewed Rooms provision; refuse before any Docker call.
+            raise DockerError("INVALID_DOCKER_REQUEST")
         with self._lifecycle.prepare(
             self._profile, binding, runtime_operation_id, lifetime=lifetime
         ) as operation:
-            if scenario is None:
-                yield operation
-            else:
-                yield _DiskFullProvisioningSession(operation, scenario)
+            yield _DiskFullProvisioningSession(operation, scenario)
 
 
 class DockerRecoveryRuntime:

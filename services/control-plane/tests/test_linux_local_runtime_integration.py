@@ -1,10 +1,12 @@
 """Opt-in HTTP-to-real-PTY proof for the local trusted runtime."""
 
 import os
+import sqlite3
 import sys
 import tempfile
 import time
 import unittest
+from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -133,6 +135,40 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
                         },
                     )
                     self.assertEqual(left.status_code, 202)
+
+    def test_enter_rejects_unreviewed_and_unauthorized_rooms_without_state(
+        self,
+    ) -> None:
+        environment = dict(os.environ)
+        database_path = Path(self.database_temp.name) / "state.sqlite3"
+        environment["FAILROOM_DATABASE_PATH"] = str(database_path)
+        # The local operator identity may enter only a Room with no scenario.
+        environment["FAILROOM_LOCAL_ROOM_SCOPES"] = "scenario-less-room"
+        config = LocalRuntimeConfig.from_environment(environment)
+        runtime = build_runtime(config, now=lambda: datetime.now(UTC))
+        headers = {"authorization": "Bearer " + self.token}
+
+        with TestClient(runtime.app) as client:
+            unreviewed = client.post(
+                "/v1/rooms/scenario-less-room/attempts",
+                headers={**headers, "idempotency-key": "enter-" + uuid4().hex},
+            )
+            unauthorized = client.post(
+                "/v1/rooms/disk-full/attempts",
+                headers={**headers, "idempotency-key": "enter-" + uuid4().hex},
+            )
+
+        self.assertEqual(
+            (unreviewed.status_code, unreviewed.json()),
+            (404, {"code": "ROOM_UNAVAILABLE"}),
+        )
+        self.assertEqual(
+            (unauthorized.status_code, unauthorized.json()),
+            (403, {"code": "AUTHORIZATION_FAILED"}),
+        )
+        with closing(sqlite3.connect(database_path)) as connection:
+            attempts = connection.execute("SELECT COUNT(*) FROM room_attempts")
+            self.assertEqual(attempts.fetchone(), (0,))
 
     def test_terminal_session_outlives_sixty_seconds_through_local_app(self) -> None:
         """Keep one learner terminal responsive for 70 seconds (slow, opt-in)."""
