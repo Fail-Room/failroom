@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from .docker_cli import DockerCli, DockerError
 from .docker_profile import DockerBinding, StrictDockerProfile
 from .fingerprints import configuration_digest
-from .scenario import DISK_FULL_FILLER_PATH, DiskFullScenario
+from .scenario import (
+    DISK_FULL_FILLER_PATH,
+    DISK_FULL_TARGET_WORKING_SET_BYTES,
+    DiskFullScenario,
+)
 
 __all__ = ("DiskFullBootstrapRuntime", "ScenarioObservation")
 
@@ -19,7 +23,7 @@ class ScenarioObservation:
 
 
 class DiskFullBootstrapRuntime:
-    """Allocate the fixed filler only between exact owned-container checks."""
+    """Observe fixed Disk Full transitions between exact owned-container checks."""
 
     def __init__(
         self,
@@ -55,6 +59,10 @@ class DiskFullBootstrapRuntime:
             size_bytes=scenario.filler_bytes,
             path=scenario.filler_path,
         )
+        if not self._cli.disk_full_target_initialization_failed(
+            container_id,
+        ):
+            raise DockerError("PROFILE_UNVERIFIED")
         self._require_running(container_id)
         return ScenarioObservation(
             configuration_digest(
@@ -70,6 +78,56 @@ class DiskFullBootstrapRuntime:
                     "filler_path": scenario.filler_path,
                     "filler_bytes": scenario.filler_bytes,
                     "recovery_free_bytes": scenario.recovery_free_bytes,
+                    "target_initialization_failed": True,
+                    "target_working_set_bytes": scenario.target_working_set_bytes,
+                }
+            )
+        )
+
+    def verify_recovery(
+        self, container_id: str, scenario: DiskFullScenario
+    ) -> ScenarioObservation:
+        """Prove recovery from trusted fixed observations, never learner input."""
+
+        self._validate_scenario(scenario)
+        self._require_running(container_id)
+        filler_absent = self._cli.disk_full_filler_absent(
+            container_id,
+            uid=self._profile.uid,
+            gid=self._profile.gid,
+        )
+        available_bytes = self._cli.workspace_available_bytes(
+            container_id,
+            uid=self._profile.uid,
+            gid=self._profile.gid,
+        )
+        if not filler_absent or available_bytes < scenario.recovery_free_bytes:
+            raise DockerError("PROFILE_UNVERIFIED")
+        self._cli.start_disk_full_target(
+            container_id,
+        )
+        if not self._cli.disk_full_target_healthy(
+            container_id,
+        ):
+            raise DockerError("PROFILE_UNVERIFIED")
+        self._require_running(container_id)
+        return ScenarioObservation(
+            configuration_digest(
+                {
+                    "schema": "failroom.disk-full-recovery.v1",
+                    "binding": {
+                        "attempt_id": self._binding.attempt_id,
+                        "sandbox_id": self._binding.sandbox_id,
+                        "generation": self._binding.generation,
+                    },
+                    "operation_id": self._operation_id,
+                    "container_id": container_id,
+                    "filler_path": scenario.filler_path,
+                    "filler_absent": True,
+                    "workspace_available_bytes": available_bytes,
+                    "recovery_free_bytes": scenario.recovery_free_bytes,
+                    "target_healthy": True,
+                    "target_working_set_bytes": scenario.target_working_set_bytes,
                 }
             )
         )
@@ -80,10 +138,16 @@ class DiskFullBootstrapRuntime:
             or scenario.filler_path != DISK_FULL_FILLER_PATH
             or type(scenario.filler_bytes) is not int
             or type(scenario.recovery_free_bytes) is not int
+            or type(scenario.target_working_set_bytes) is not int
             or not 0 < scenario.filler_bytes < self._profile.workspace_tmpfs_bytes
             or not 0
             < scenario.recovery_free_bytes
             < self._profile.workspace_tmpfs_bytes
+            or not 0
+            < scenario.target_working_set_bytes
+            < self._profile.workspace_tmpfs_bytes
+            or scenario.target_working_set_bytes != DISK_FULL_TARGET_WORKING_SET_BYTES
+            or scenario.target_working_set_bytes > scenario.recovery_free_bytes
             or scenario.filler_bytes + scenario.recovery_free_bytes
             < self._profile.workspace_tmpfs_bytes
         ):

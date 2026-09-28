@@ -796,6 +796,49 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(state.destroy_intent)
         self.assertEqual(state.expires_at, self.deadline)
 
+    def test_trusted_recovery_evidence_is_required_before_resolved_publication(self):
+        attempt, resource = self.ready()
+        running = self.advance(
+            resource,
+            ResourceState.RUNNING,
+            key="recovery-running",
+        )
+        running_attempt = self.backend.publish_running(
+            self.service(Role.BACKEND, Action.PUBLISH),
+            attempt.ref,
+            expected_version=attempt.version,
+            key="publish-running",
+            now=lambda: self.now,
+        )
+
+        self.assert_error(
+            "INVALID_REQUEST",
+            lambda: self.advance(
+                running,
+                ResourceState.RESOLVED,
+                key="recovery-missing-evidence",
+            ),
+        )
+        resolved = self.advance(
+            running,
+            ResourceState.RESOLVED,
+            key="recovery-resolved",
+            evidence_digest="sha256:" + "b" * 64,
+        )
+        resolved_attempt = self.backend.publish_resolved(
+            self.service(Role.BACKEND, Action.PUBLISH),
+            attempt.ref,
+            expected_version=running_attempt.version,
+            key="publish-resolved",
+            now=lambda: self.now,
+        )
+
+        self.assertEqual(resolved.state, "RESOLVED")
+        self.assertEqual(resolved_attempt.state, "RESOLVED")
+        self.assertEqual(
+            self.backend.inspect(self.alice, attempt.attempt_id).state, "RESOLVED"
+        )
+
     def test_ttl_is_immutable_at_sql_boundary(self):
         attempt = self.create()
         self.accept(attempt)
@@ -1312,7 +1355,7 @@ print(task.attempt_id, task.state)
         }
 
         def options(state):
-            if state in ("READY", "DESTROYED"):
+            if state in ("READY", "RESOLVED", "DESTROYED"):
                 return {"evidence_digest": self.evidence}
             if state == "STARTING":
                 return {"container_id": str(uuid4())}

@@ -1,15 +1,20 @@
 """Opt-in proof that the Disk Full Room consumes and restores tmpfs space."""
 
 import os
+import re
+import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
 from failroom_sandbox.docker_cli import DockerCli
+from failroom_sandbox.docker_lifecycle import DockerDiagnosticLifecycle
 from failroom_sandbox.docker_profile import DockerBinding
+from failroom_sandbox.seccomp import SeccompPolicyStore
 from failroom_state import (
     Action,
     BackendStore,
@@ -27,11 +32,18 @@ from test_linux_docker_integration import (
     _exact_label_filters,
     _profile_from_environment,
     _required,
-    build_runtime_from_required_environment,
 )
 
-from failroom_control_plane import LifecycleOrchestrator
+from failroom_control_plane import (
+    DockerRecoveryRuntime,
+    LifecycleOrchestrator,
+    RecoveryVerificationService,
+)
 from failroom_control_plane.room_scenarios import RoomScenarioRegistry
+from failroom_control_plane.runtime_docker import (
+    DockerCleanupRuntime,
+    DockerProvisioningRuntime,
+)
 
 
 @unittest.skipUnless(
@@ -43,7 +55,21 @@ from failroom_control_plane.room_scenarios import RoomScenarioRegistry
 )
 class LinuxDiskFullIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.profile = _profile_from_environment()
+        base_profile = _profile_from_environment()
+        self.cli = DockerCli(
+            context=_required("FAILROOM_DOCKER_CONTEXT"),
+            timeout=float(_required("FAILROOM_DOCKER_TIMEOUT_SECONDS")),
+            max_output_bytes=int(_required("FAILROOM_DOCKER_MAX_OUTPUT_BYTES")),
+        )
+        self.target_tag = "failroom-disk-full-test-" + uuid4().hex
+        self.profile = replace(base_profile, image=self._build_target_image())
+        self.lifecycle = DockerDiagnosticLifecycle(
+            self.cli,
+            SeccompPolicyStore(
+                Path(_required("FAILROOM_SECCOMP_STORE")),
+                max_bytes=int(_required("FAILROOM_SECCOMP_MAX_BYTES")),
+            ),
+        )
         self.database_temp = tempfile.TemporaryDirectory(dir=_database_directory())
         self.addCleanup(self.database_temp.cleanup)
         self.database = Database(
@@ -72,7 +98,8 @@ class LinuxDiskFullIntegrationTests(unittest.TestCase):
             Role.BACKEND,
             frozenset({Action.RECONCILE, Action.PUBLISH}),
         )
-        self.provisioning, self.cleanup = build_runtime_from_required_environment()
+        self.provisioning = DockerProvisioningRuntime(self.lifecycle, self.profile)
+        self.cleanup = DockerCleanupRuntime(self.lifecycle)
         self.orchestrator = LifecycleOrchestrator(
             self.backend, self.control, self.provisioning
         )
@@ -82,11 +109,49 @@ class LinuxDiskFullIntegrationTests(unittest.TestCase):
             self.cleanup,
             retry_delay=timedelta(seconds=10),
         )
-        self.cli = DockerCli(
-            context=_required("FAILROOM_DOCKER_CONTEXT"),
-            timeout=float(_required("FAILROOM_DOCKER_TIMEOUT_SECONDS")),
-            max_output_bytes=int(_required("FAILROOM_DOCKER_MAX_OUTPUT_BYTES")),
+
+    def _build_target_image(self) -> str:
+        image_directory = (
+            Path(__file__).resolve().parents[3] / "scenarios" / "disk-full" / "image"
         )
+        self.addCleanup(self._remove_target_tag)
+        result = subprocess.run(
+            (
+                "docker",
+                "--context",
+                _required("FAILROOM_DOCKER_CONTEXT"),
+                "build",
+                "--pull=false",
+                "--quiet",
+                "--tag",
+                self.target_tag,
+                str(image_directory),
+            ),
+            check=False,
+            capture_output=True,
+            timeout=float(_required("FAILROOM_DOCKER_TIMEOUT_SECONDS")),
+        )
+        image_id = result.stdout.decode("ascii", errors="ignore").strip()
+        if result.returncode != 0 or re.fullmatch(r"sha256:[a-f0-9]{64}", image_id) is None:
+            self.fail("TARGET_IMAGE_BUILD_FAILED")
+        return image_id
+
+    def _remove_target_tag(self) -> None:
+        result = subprocess.run(
+            (
+                "docker",
+                "--context",
+                _required("FAILROOM_DOCKER_CONTEXT"),
+                "image",
+                "rm",
+                self.target_tag,
+            ),
+            check=False,
+            capture_output=True,
+            timeout=float(_required("FAILROOM_DOCKER_TIMEOUT_SECONDS")),
+        )
+        if result.returncode != 0:
+            self.fail("TARGET_IMAGE_CLEANUP_FAILED")
 
     def test_disk_full_filler_reduces_and_restores_workspace_capacity(self) -> None:
         receipt = None
@@ -132,6 +197,20 @@ class LinuxDiskFullIntegrationTests(unittest.TestCase):
             )
             self.assertGreaterEqual(recovered, scenario.recovery_free_bytes)
             self.assertLessEqual(recovered, self.profile.workspace_tmpfs_bytes)
+
+            status = RecoveryVerificationService(
+                self.backend,
+                self.control,
+                DockerRecoveryRuntime(self.lifecycle, self.profile),
+                backend_identity=self.backend_identity,
+                control_identity=self.control_identity,
+                now=lambda: self.now,
+            ).verify(self.user, receipt.attempt_id, key=uuid4().hex)
+            self.assertEqual(status.state, "RESOLVED")
+            self.assertEqual(
+                self.control.inspect(self.control_identity, receipt.ref).state,
+                ResourceState.RESOLVED,
+            )
 
             self.backend.leave(
                 self.user, receipt.ref, key=uuid4().hex, now=lambda: self.now

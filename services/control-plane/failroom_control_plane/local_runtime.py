@@ -44,8 +44,13 @@ from .http import create_app
 from .lifecycle import RoomLifecycleService
 from .maintenance import LifecycleMaintenanceService, MaintenanceError
 from .orchestrator import LifecycleOrchestrator
+from .recovery import RecoveryVerificationService
 from .reset import RoomResetService
-from .runtime_docker import DockerCleanupRuntime, DockerProvisioningRuntime
+from .runtime_docker import (
+    DockerCleanupRuntime,
+    DockerProvisioningRuntime,
+    DockerRecoveryRuntime,
+)
 from .terminal import ControlPlaneTerminalService
 from .websocket import WebSocketLimits
 
@@ -171,6 +176,9 @@ class LocalRuntimeConfig:
                     values, "FAILROOM_WORKSPACE_TMPFS_BYTES"
                 ),
                 temp_tmpfs_bytes=_integer(values, "FAILROOM_TEMP_TMPFS_BYTES"),
+                target_supervisor_tmpfs_bytes=_integer(
+                    values, "FAILROOM_TARGET_SUPERVISOR_TMPFS_BYTES"
+                ),
                 shm_size_bytes=_integer(values, "FAILROOM_SHM_BYTES"),
                 fd_limit=_integer(values, "FAILROOM_FD_LIMIT"),
                 io_device_path=_required(values, "FAILROOM_IO_DEVICE"),
@@ -358,6 +366,7 @@ def build_runtime(config: LocalRuntimeConfig, *, now: Clock) -> LocalRuntime:
         provisioning = DockerProvisioningRuntime(
             docker_lifecycle, config.controller.profile
         )
+        recovery = DockerRecoveryRuntime(docker_lifecycle, config.controller.profile)
         cleanup = DockerCleanupRuntime(docker_lifecycle)
         orchestrator = LifecycleOrchestrator(backend, control, provisioning)
         cleanup_worker = DockerCleanupWorker(
@@ -425,6 +434,14 @@ def build_runtime(config: LocalRuntimeConfig, *, now: Clock) -> LocalRuntime:
             lifecycle=lifecycle,
             entry=entry,
             reset=RoomResetService(backend, now=now),
+            recovery=RecoveryVerificationService(
+                backend,
+                control,
+                recovery,
+                backend_identity=backend_identity,
+                control_identity=control_identity,
+                now=now,
+            ),
             lifespan=_application_lifespan(
                 maintenance, interval=config.maintenance_interval
             ),

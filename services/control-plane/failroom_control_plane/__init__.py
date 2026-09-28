@@ -21,8 +21,13 @@ from .orchestrator import (
     ProvisioningSession,
     phase_key,
 )
+from .recovery import RecoveryError, RecoveryRuntime, RecoveryVerificationService
 from .reset import ResetError, RoomResetService
-from .runtime_docker import DockerCleanupRuntime, DockerProvisioningRuntime
+from .runtime_docker import (
+    DockerCleanupRuntime,
+    DockerProvisioningRuntime,
+    DockerRecoveryRuntime,
+)
 from .terminal import (
     ControlPlaneTerminalService,
     TerminalError,
@@ -36,6 +41,7 @@ __all__ = (
     "ControllerConfig",
     "DockerCleanupRuntime",
     "DockerProvisioningRuntime",
+    "DockerRecoveryRuntime",
     "CleanupWorker",
     "LifecycleError",
     "LifecycleMaintenanceService",
@@ -52,6 +58,9 @@ __all__ = (
     "ControlPlaneTerminalService",
     "RoomLifecycleService",
     "RoomResetService",
+    "RecoveryError",
+    "RecoveryRuntime",
+    "RecoveryVerificationService",
     "RoomStatus",
     "ResetError",
     "TerminalError",
