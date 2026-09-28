@@ -1,3 +1,7 @@
+[build-system]
+requires = ["uv_build>=0.11.6,<0.13"]
+build-backend = "uv_build"
+
 [project]
 name = "failroom-control-plane"
 version = "0.1.0"
@@ -21,11 +25,12 @@ dev = [
 ]
 
 [tool.uv.sources]
-failroom-state-store = { path = "../../packages/state-store" }
-failroom-sandbox-engine = { path = "../sandbox-engine" }
+failroom-state-store = { path = "../../packages/state-store", editable = true }
+failroom-sandbox-engine = { path = "../sandbox-engine", editable = true }
 
-[tool.uv]
-package = false
+[tool.uv.build-backend]
+module-name = "failroom_control_plane"
+module-root = ""
 
 [tool.ruff]
 target-version = "py312"

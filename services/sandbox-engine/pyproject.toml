@@ -1,3 +1,7 @@
+[build-system]
+requires = ["uv_build>=0.11.6,<0.13"]
+build-backend = "uv_build"
+
 [project]
 name = "failroom-sandbox-engine"
 version = "0.1.0"
@@ -12,11 +16,12 @@ dev = [
 ]
 
 [tool.uv.sources]
-failroom-api = { path = "../api" }
-failroom-state-store = { path = "../../packages/state-store" }
+failroom-api = { path = "../api", editable = true }
+failroom-state-store = { path = "../../packages/state-store", editable = true }
 
-[tool.uv]
-package = false
+[tool.uv.build-backend]
+module-name = "failroom_sandbox"
+module-root = ""
 
 [tool.ruff]
 target-version = "py312"

@@ -8,8 +8,8 @@ has no HTTP service, learner sandbox creation endpoint, or WebSocket transport.
 The package uses Python 3.12.13 and repository-local runtime packages only. Ruff and mypy are pinned
 development tools; `uv.lock` locks their transitive dependencies. Commands below
 run from this directory with uv installed:
-Gateway tests compose sibling source packages. In a source checkout, set
-`PYTHONPATH=../api:../../packages/state-store` before the unittest command (PowerShell uses `;`).
+Gateway tests compose sibling source packages. `uv sync --locked` installs them
+from this checkout in editable mode, so the commands need no `PYTHONPATH`.
 
 ```sh
 uv sync --locked
