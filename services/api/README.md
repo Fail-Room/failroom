@@ -1,9 +1,11 @@
 # Failroom API Contract Package
 
-Internal Phase 1 capability primitives for trusted services. This package provides
-a bounded HMAC codec for the short-lived terminal capability contract; it does not
-run an HTTP listener, authenticate users, distribute keys, consume `jti` values,
-open a WebSocket, or attach a PTY.
+Internal Phase 1 capability and identity primitives for trusted services. This
+package provides a bounded HMAC codec for the short-lived terminal capability
+contract, the backend capability authority facade, and a bearer identity
+verifier. It does not run an HTTP listener, distribute keys, open a WebSocket,
+or attach a PTY; the trusted control plane composes these primitives into its
+HTTP and WebSocket routes.
 
 ## Capability contract
 
@@ -25,10 +27,26 @@ for the HMAC comparison, and returns `CapabilityClaims` for the authenticated
 backend contract. The state store must still re-check ownership, generation,
 session epoch, expiry and resource state before consuming the capability.
 
-The codec does not prove that a user is authenticated or that a Room is attachable.
-Those checks, key custody, HTTP issuance and gateway transport remain planned.
-Never put the key, raw capability or decoded claims in a learner sandbox, URL, log,
-metric label or terminal output.
+The codec does not prove that a user is authenticated or that a Room is
+attachable; the bearer verifier and the backend authority facade below perform
+those checks. HTTP issuance and gateway transport live in the control-plane
+package. Key custody and distribution remain planned: the local runtime takes
+its key from explicit operator configuration. Never put the key, raw capability
+or decoded claims in a learner sandbox, URL, log, metric label or terminal
+output.
+
+## Bearer identity verifier
+
+`BearerIdentityVerifier` holds explicitly configured credentials as a mapping
+from the SHA-256 hex digest of each bearer token to a `BearerCredential` with a
+`UserIdentity` and an aware expiry time; it never stores raw tokens. `verify()`
+accepts only an `Authorization` value of the form `Bearer <token>` with 32–4096
+ASCII characters, compares the token digest with each configured digest in
+constant time, and returns the matching identity. It raises the fixed
+`AUTHENTICATION_REQUIRED` code for a missing, malformed or unknown token and
+`AUTHENTICATION_EXPIRED` once the credential has expired. The local runtime
+configures exactly one credential; this verifier is not a login, account or
+token-issuing service.
 
 ## Backend authority facade
 

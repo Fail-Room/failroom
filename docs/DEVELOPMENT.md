@@ -2,15 +2,20 @@
 
 ## Current Repository State
 
-Phase 0 established the product and engineering contracts. Phase 1 now includes profile qualification and a verified diagnostic Docker lifecycle in services/sandbox-engine/, SQLite repositories and an injected cleanup pass in packages/state-store/, the trusted in-process control-plane composition in services/control-plane/, and the bounded capability plus attachment-lease contract in services/api/ and state-store/, each with tests and a Python development manifest/lockfile. There is no runnable web/API application, learner terminal, authentication flow, deployment, or production service. No persistent service database is created by installing or testing these modules.
-The backend capability authority facade is implemented as an in-process contract:
-it issues only for attachable owned attempts and introspects through atomic state-store consumption. The terminal gateway authority coordinator now connects that consumption to a generation-bound attachment lease. HTTP authentication, WebSocket transport and PTY attachment remain future integration work.
+Phase 0 established the product and engineering contracts. The repository now contains local proof-of-concept code, each package with tests and a pinned Python development manifest and lockfile:
 
-Next.js, xterm.js, and FastAPI are the planned architecture choices. Phase 1 will select and lock their concrete versions, manifests, dependency tooling, and integration layout. Application setup commands will be documented only after those artifacts exist and are verified.
+- `services/sandbox-engine/`: profile qualification, the verified diagnostic Docker lifecycle, the bounded Docker PTY primitive, the terminal gateway authority coordinator, and the Disk Full scenario runtime.
+- `packages/state-store/`: SQLite repositories for attempt authority, resource lifecycle, capability consumption, attachment leases and reset generations, plus the injected cleanup pass.
+- `services/api/`: the bounded capability codec, the backend capability authority facade, and the bearer identity verifier.
+- `services/control-plane/`: the trusted composition; HTTP and WebSocket routes for Enter Room, Room Status, the terminal, Reset Room, recovery verification and Leave Room; and the operator-only local runtime (`serve-local`).
+
+The local runtime binds only to a loopback address and serves one local operator. It provisions Disk Full Room sandboxes without a qualification report, so it does not meet the qualification requirement in [SECURITY.md](SECURITY.md) and must not be offered to learners or other users. A trusted qualification collector and allocation gate are the next required step. There is no web application, browser terminal UI, production authentication, deployment, or production service. Installing or testing these packages creates no persistent service database.
+
+FastAPI and uvicorn are pinned in the control-plane package for the local runtime. Next.js and xterm.js remain planned; their versions, manifests and integration layout will be selected with the browser terminal, and its setup commands will be documented only after those artifacts exist and are verified.
 
 ## Available Checks
 
-The sandbox engine uses Python 3.12.13 with no runtime dependencies. Its `uv.lock` pins the development tools and their transitive dependencies. From `services/sandbox-engine/`, run:
+The sandbox engine uses Python 3.12.13 and depends only on the repository's API contract and state-store packages, which `uv sync --locked` installs from this checkout in editable mode. Its `uv.lock` pins the development tools and their transitive dependencies. From `services/sandbox-engine/`, run:
 
 ```sh
 uv sync --locked
@@ -20,7 +25,7 @@ uv run --locked ruff format --check .
 uv run --locked mypy failroom_sandbox
 ```
 
-These checks cover evidence completeness, typing, duplication, context binding, age boundaries, deterministic safe errors, profile compilation, bounded Docker CLI transport, diagnostic ownership/mount checks, and seccomp snapshot handling. Default Docker lifecycle fixtures are synthetic. The opt-in Docker integration tests are skipped unless a trusted Linux controller supplies every explicit FAILROOM_* input. Actual learner resource probes, allocation-path integration and browser-to-PTY end-to-end checks remain required. See the sandbox-engine and control-plane component contracts for the implemented boundaries.
+These checks cover evidence completeness, typing, duplication, context binding, age boundaries, deterministic safe errors, profile compilation, bounded Docker CLI transport, diagnostic ownership/mount checks, and seccomp snapshot handling. Default Docker lifecycle fixtures are synthetic. The opt-in Docker integration tests are skipped unless a trusted Linux controller supplies every explicit FAILROOM_* input. Qualification evidence collection from actual learner resource probes, qualification in the allocation path, and browser-to-PTY end-to-end checks remain required. See the sandbox-engine and control-plane component contracts for the implemented boundaries.
 
 The state store also uses Python 3.12.13 with no runtime dependencies. From `packages/state-store/`, run:
 
@@ -32,11 +37,11 @@ uv run --locked ruff format --check .
 uv run --locked mypy failroom_state
 ```
 
-Its tests use real SQLite files in OS temporary directories, independent connections, concurrent callers and child processes. They cover the four-table schema, ownership and scoped service contexts, immutable tuples/TTL/intents, 81 resource-state transition combinations, compare-and-set conflicts, duplicate requests, concurrent `jti` consumption, post-lock expiry, rollback, abrupt process exit and durable cleanup/finalization recovery. These are storage integration tests, not browser-to-PTY end-to-end or runtime-isolation tests.
+Its tests use real SQLite files in OS temporary directories, independent connections, concurrent callers and child processes. They cover the five-table schema, explicit migrations through v4, ownership and scoped service contexts, immutable tuples/TTL/intents, reset generations, 81 resource-state transition combinations, compare-and-set conflicts, duplicate requests, concurrent `jti` consumption, post-lock expiry, rollback, abrupt process exit and durable cleanup/finalization recovery. These are storage integration tests, not browser-to-PTY end-to-end or runtime-isolation tests.
 
 The [state-store contract](../packages/state-store/README.md) describes explicit private local database placement, recovery ordering, known limitations and rollback precautions. Runtime integration must run backend expiry, control-plane cleanup and backend pending-finalization recovery before accepting terminal traffic, then maintain independent TTL enforcement. Do not place service databases in synchronized source checkouts or treat a stored evidence digest as physical cleanup proof.
 
-The control-plane package uses the same Python 3.12.13 toolchain. From services/control-plane/, run:
+The control-plane package uses Python 3.12 with pinned FastAPI and uvicorn runtime dependencies. It also provides the operator-only local runtime; its [README](../services/control-plane/README.md) documents `serve-local`, `verify-local`, `migrate` and the opt-in Linux integration tests. From services/control-plane/, run:
 
 Commands:
 - uv sync --locked
@@ -45,7 +50,7 @@ Commands:
 - uv run --locked ruff format --check .
 - uv run --locked mypy failroom_control_plane
 
-The API contract package uses Python 3.12.13 and has no HTTP listener. From services/api/, run:
+The API contract package uses Python 3.12 and has no HTTP listener. From services/api/, run:
 
 Commands:
 - uv sync --locked
@@ -54,7 +59,7 @@ Commands:
 - uv run --locked ruff format --check .
 - uv run --locked mypy failroom_api
 
-This package only issues and verifies bounded HMAC capability claims. The state-store v2-to-v3 migration must be run explicitly with a new absolute backup path before attachment leases are available.
+This package issues and verifies bounded HMAC capability claims, delegates atomic `jti` consumption to the state store, and verifies explicitly configured bearer credentials. Existing databases must be migrated explicitly to schema v4, one version at a time, each with a new absolute backup path; the control-plane README documents the `migrate` command.
 
 ## Delivery Principles
 
@@ -138,7 +143,7 @@ Sandbox-related changes must explicitly cover backend-preallocated identity, aut
 
 ## Local Validation
 
-Use the module checks above for the implemented qualification gate, diagnostic adapter, state worker, control-plane composition and capability/lease contract. The opt-in Docker integration tests must be run only from a trusted Linux control-plane host after explicit operator inputs are configured; Windows skips remain UNVERIFIED. Application integration and browser-to-PTY checks become available with their respective runtime components. Documentation-only changes should at minimum:
+Use the module checks above for the implemented qualification gate, diagnostic adapter, state worker, control-plane composition, local runtime and capability/lease contract. The opt-in Docker, terminal and local runtime integration tests must be run only from a trusted Linux control-plane host after explicit operator inputs are configured; the control-plane README lists their inputs, and Windows skips remain UNVERIFIED. Browser-to-PTY checks become available with the browser terminal. Documentation-only changes should at minimum:
 
 1. Confirm every referenced local Markdown link resolves.
 2. Check headings, terminology, planned-status wording, and final newlines.
