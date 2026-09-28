@@ -339,7 +339,7 @@ def compile_create_argv(
         "--tmpfs",
         "/workspace:rw,size="
         + str(profile.workspace_tmpfs_bytes)
-        + ",nosuid,nodev,noexec",
+        + ",mode=1777,nosuid,nodev,noexec",
         "--tmpfs",
         "/tmp:rw,size=" + str(profile.temp_tmpfs_bytes) + ",nosuid,nodev,noexec",
         "--tmpfs",

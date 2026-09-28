@@ -194,7 +194,9 @@ def _verify_profile(
         "PidsLimit": profile.pids_limit,
         "ShmSize": profile.shm_size_bytes,
         "Tmpfs": {
-            "/workspace": f"rw,size={profile.workspace_tmpfs_bytes},nosuid,nodev,noexec",
+            "/workspace": (
+                f"rw,size={profile.workspace_tmpfs_bytes},mode=1777,nosuid,nodev,noexec"
+            ),
             "/tmp": f"rw,size={profile.temp_tmpfs_bytes},nosuid,nodev,noexec",
             "/run/failroom-target": (
                 "rw,size="

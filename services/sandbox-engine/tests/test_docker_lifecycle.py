@@ -66,7 +66,7 @@ def observation(profile, seccomp_path):
             "PidsLimit": 64,
             "ShmSize": 16777216,
             "Tmpfs": {
-                "/workspace": "rw,size=67108864,nosuid,nodev,noexec",
+                "/workspace": "rw,size=67108864,mode=1777,nosuid,nodev,noexec",
                 "/tmp": "rw,size=16777216,nosuid,nodev,noexec",
                 "/run/failroom-target": "rw,size=1048576,mode=0700,nosuid,nodev,noexec",
             },
@@ -203,6 +203,7 @@ class DockerLifecycleTests(unittest.TestCase):
             filler_bytes=60_000_000,
             recovery_free_bytes=8_000_000,
             target_working_set_bytes=8_000_000,
+            target_ready_timeout_seconds=5,
         )
 
         with self.lifecycle.prepare(self.profile, BINDING, OP) as operation:

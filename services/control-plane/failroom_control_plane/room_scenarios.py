@@ -1,6 +1,10 @@
 """Trusted, data-only Room-to-scenario selection."""
 
-from failroom_sandbox.scenario import DiskFullScenario, parse_disk_full_scenario
+from failroom_sandbox.scenario import (
+    DISK_FULL_TARGET_READY_TIMEOUT_SECONDS,
+    DiskFullScenario,
+    parse_disk_full_scenario,
+)
 
 __all__ = ("RoomScenarioRegistry",)
 
@@ -10,6 +14,7 @@ _DISK_FULL_DECLARATION = {
     "filler_bytes": 60_000_000,
     "recovery_free_bytes": 8_000_000,
     "target_working_set_bytes": 8_000_000,
+    "target_ready_timeout_seconds": DISK_FULL_TARGET_READY_TIMEOUT_SECONDS,
 }
 
 

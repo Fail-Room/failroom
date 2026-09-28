@@ -4,12 +4,15 @@ set -eu
 STATE_DIR=/run/failroom-target
 READY=$STATE_DIR/ready
 PID=$STATE_DIR/pid
-WORK=$STATE_DIR/working-set
+WORK_DIR=/workspace/.failroom-target
+WORK=$WORK_DIR/working-set
 WORKING_SET_BYTES=8000000
 
 initialize() {
   umask 077
   mkdir -p "$STATE_DIR"
+  mkdir -p "$WORK_DIR"
+  chmod 0700 "$WORK_DIR"
   rm -f "$READY" "$PID" "$WORK" "$WORK.partial"
   if ! dd if=/dev/zero of="$WORK.partial" bs=1000000 count=8 conv=fsync status=none 2>/dev/null; then
     rm -f "$READY" "$PID" "$WORK.partial"
@@ -26,6 +29,7 @@ status() {
   esac
   test -d "/proc/$pid" || return 1
   test -f "$READY" || return 1
+  test -d "$WORK_DIR" || return 1
   test -f "$WORK" || return 1
   test "$(wc -c <"$WORK")" = "$WORKING_SET_BYTES"
 }
