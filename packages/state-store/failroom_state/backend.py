@@ -480,6 +480,13 @@ class BackendStore:
                     "DESTROYED",
                     int(resource["version"]),
                 )
+            unfinished = connection.execute(
+                """SELECT 1 FROM sandbox_resources WHERE attempt_id=?
+                AND state!='DESTROYED' LIMIT 1""",
+                (ref.attempt_id,),
+            ).fetchone()
+            if unfinished is not None:
+                raise StoreError("CLEANUP_UNVERIFIED")
             _stop(connection, row, clock)
             row = binding(connection, ref)
             version = int(row["version"]) + int(row["state"] != "DESTROYED")
