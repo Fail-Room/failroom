@@ -1,5 +1,7 @@
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -14,6 +16,7 @@ from failroom_state import (
 )
 
 from failroom_control_plane.entry import EntryError, RoomEntryService
+from failroom_control_plane.room_scenarios import RoomScenarioRegistry
 
 
 class RecordingProvisioner:
@@ -41,13 +44,13 @@ class RoomEntryServiceTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.now = datetime(2026, 9, 14, 12, tzinfo=UTC)
-        database = Database(
-            Path(self.temp.name) / "state.sqlite3", busy_timeout_ms=5000
-        )
+        self.path = Path(self.temp.name) / "state.sqlite3"
+        database = Database(self.path, busy_timeout_ms=5000)
         database.initialize()
         self.backend = BackendStore(database)
         self.provisioner = RecordingProvisioner()
-        self.user = UserIdentity("alice", frozenset({"room-1"}))
+        self.user = UserIdentity("alice", frozenset({"disk-full", "room-1"}))
+        self.outsider = UserIdentity("mallory", frozenset({"room-1"}))
         self.backend_identity = ServiceIdentity(
             "backend",
             Role.BACKEND,
@@ -59,21 +62,28 @@ class RoomEntryServiceTests(unittest.TestCase):
             frozenset({Action.INSPECT, Action.TRANSITION}),
         )
 
+    def service(self, **overrides: object) -> RoomEntryService:
+        arguments: dict[str, object] = {
+            "backend_identity": self.backend_identity,
+            "control_identity": self.control_identity,
+            "attempt_ttl": timedelta(minutes=15),
+            "now": lambda: self.now,
+            "rooms": RoomScenarioRegistry(),
+        }
+        arguments.update(overrides)
+        return RoomEntryService(self.backend, self.provisioner, **arguments)
+
+    def attempt_count(self) -> int:
+        with closing(sqlite3.connect(self.path)) as connection:
+            row = connection.execute("SELECT COUNT(*) FROM room_attempts").fetchone()
+        return int(row[0])
+
     def test_enter_preallocates_owned_attempt_then_provisions_exact_receipt(
         self,
     ) -> None:
-        service = RoomEntryService(
-            self.backend,
-            self.provisioner,
-            backend_identity=self.backend_identity,
-            control_identity=self.control_identity,
-            attempt_ttl=timedelta(minutes=15),
-            now=lambda: self.now,
-        )
+        entry = self.service().enter(self.user, "disk-full", key="enter-room")
 
-        entry = service.enter(self.user, "room-1", key="enter-room")
-
-        self.assertEqual(entry.room_id, "room-1")
+        self.assertEqual(entry.room_id, "disk-full")
         self.assertEqual(entry.state, "PROVISIONING")
         self.assertEqual(entry.expires_at, self.now + timedelta(minutes=15))
         self.assertEqual(len(self.provisioner.calls), 1)
@@ -88,17 +98,9 @@ class RoomEntryServiceTests(unittest.TestCase):
 
     def test_enter_preserves_stop_intent_when_provisioning_fails(self) -> None:
         self.provisioner.failure = RuntimeError("runtime detail must not escape")
-        service = RoomEntryService(
-            self.backend,
-            self.provisioner,
-            backend_identity=self.backend_identity,
-            control_identity=self.control_identity,
-            attempt_ttl=timedelta(minutes=15),
-            now=lambda: self.now,
-        )
 
         with self.assertRaises(EntryError) as raised:
-            service.enter(self.user, "room-1", key="failed-enter")
+            self.service().enter(self.user, "disk-full", key="failed-enter")
 
         self.assertEqual(raised.exception.code, "ENTRY_FAILED")
         receipt = self.provisioner.calls[0][0]
@@ -106,32 +108,54 @@ class RoomEntryServiceTests(unittest.TestCase):
         self.assertEqual(attempt.state, "STOPPING")
         self.assertTrue(attempt.destroy_intent)
 
-    def test_constructor_rejects_missing_trusted_scope_or_ttl(self) -> None:
-        with self.assertRaises(EntryError) as missing_scope:
-            RoomEntryService(
-                self.backend,
-                self.provisioner,
-                backend_identity=ServiceIdentity(
-                    "backend",
-                    Role.BACKEND,
-                    frozenset({Action.CREATE}),
-                ),
-                control_identity=self.control_identity,
-                attempt_ttl=timedelta(minutes=15),
-                now=lambda: self.now,
-            )
-        with self.assertRaises(EntryError) as invalid_ttl:
-            RoomEntryService(
-                self.backend,
-                self.provisioner,
-                backend_identity=self.backend_identity,
-                control_identity=self.control_identity,
-                attempt_ttl=timedelta(0),
-                now=lambda: self.now,
-            )
+    def test_enter_rejects_an_unreviewed_room_before_state_or_runtime(self) -> None:
+        for room_id in ("room-1", "scenario-less-room", "DISK-FULL"):
+            with self.subTest(room_id=room_id):
+                with self.assertRaises(EntryError) as raised:
+                    self.service().enter(self.user, room_id, key="enter-" + room_id)
 
-        self.assertEqual(missing_scope.exception.code, "INVALID_CONFIGURATION")
-        self.assertEqual(invalid_ttl.exception.code, "INVALID_CONFIGURATION")
+                self.assertEqual(raised.exception.code, "ROOM_UNAVAILABLE")
+        self.assertEqual(self.provisioner.calls, [])
+        self.assertEqual(self.attempt_count(), 0)
+
+    def test_enter_denies_a_reviewed_room_outside_the_users_scope(self) -> None:
+        with self.assertRaises(EntryError) as raised:
+            self.service().enter(self.outsider, "disk-full", key="foreign-enter")
+
+        self.assertEqual(raised.exception.code, "NOT_AUTHORIZED")
+        self.assertEqual(self.provisioner.calls, [])
+        self.assertEqual(self.attempt_count(), 0)
+
+    def test_enter_reduces_other_store_failures_without_provisioning(self) -> None:
+        service = self.service()
+        service.enter(self.user, "disk-full", key="reused-key")
+        self.now += timedelta(minutes=1)
+
+        with self.assertRaises(EntryError) as raised:
+            service.enter(self.user, "disk-full", key="reused-key")
+
+        self.assertEqual(raised.exception.code, "ENTRY_FAILED")
+        self.assertEqual(len(self.provisioner.calls), 1)
+        self.assertEqual(self.attempt_count(), 1)
+
+    def test_constructor_rejects_missing_trusted_scope_ttl_or_room_catalog(
+        self,
+    ) -> None:
+        invalid = (
+            {
+                "backend_identity": ServiceIdentity(
+                    "backend", Role.BACKEND, frozenset({Action.CREATE})
+                )
+            },
+            {"attempt_ttl": timedelta(0)},
+            {"rooms": object()},
+            {"rooms": None},
+        )
+        for overrides in invalid:
+            with self.subTest(overrides=sorted(overrides)):
+                with self.assertRaises(EntryError) as raised:
+                    self.service(**overrides)
+                self.assertEqual(raised.exception.code, "INVALID_CONFIGURATION")
 
 
 if __name__ == "__main__":

@@ -16,18 +16,20 @@ from failroom_state import (
     UserIdentity,
 )
 
+from .room_scenarios import RoomScenarioRegistry
+
 Clock = Callable[[], datetime]
+
+_ENTRY_CODES = frozenset(
+    {"INVALID_CONFIGURATION", "ENTRY_FAILED", "NOT_AUTHORIZED", "ROOM_UNAVAILABLE"}
+)
 
 
 class EntryError(RuntimeError):
     """A fixed Enter Room failure without runtime or resource details."""
 
     def __init__(self, code: str) -> None:
-        self.code = (
-            code
-            if code in {"INVALID_CONFIGURATION", "ENTRY_FAILED"}
-            else "ENTRY_FAILED"
-        )
+        self.code = code if code in _ENTRY_CODES else "ENTRY_FAILED"
         super().__init__(self.code)
 
 
@@ -65,6 +67,7 @@ class RoomEntryService:
         control_identity: ServiceIdentity,
         attempt_ttl: timedelta,
         now: Clock,
+        rooms: RoomScenarioRegistry,
     ) -> None:
         if (
             type(backend) is not BackendStore
@@ -78,6 +81,7 @@ class RoomEntryService:
             or type(attempt_ttl) is not timedelta
             or attempt_ttl <= timedelta(0)
             or not callable(now)
+            or type(rooms) is not RoomScenarioRegistry
         ):
             raise EntryError("INVALID_CONFIGURATION")
         self._backend = backend
@@ -86,16 +90,26 @@ class RoomEntryService:
         self._control_identity = control_identity
         self._attempt_ttl = attempt_ttl
         self._now = now
+        self._rooms = rooms
 
     def enter(self, identity: UserIdentity, room_id: str, *, key: str) -> RoomEntry:
+        # Only a reviewed Room may allocate attempt state or runtime resources.
+        if not self._rooms.is_reviewed(room_id):
+            raise EntryError("ROOM_UNAVAILABLE")
         expires_at = self._now() + self._attempt_ttl
-        receipt = self._backend.create(
-            identity,
-            room_id,
-            key=key,
-            expires_at=expires_at,
-            now=self._now,
-        )
+        try:
+            receipt = self._backend.create(
+                identity,
+                room_id,
+                key=key,
+                expires_at=expires_at,
+                now=self._now,
+            )
+        except StoreError as error:
+            code = (
+                "NOT_AUTHORIZED" if error.code == "NOT_AUTHORIZED" else "ENTRY_FAILED"
+            )
+            raise EntryError(code) from None
         try:
             self._provisioner.provision(
                 receipt,

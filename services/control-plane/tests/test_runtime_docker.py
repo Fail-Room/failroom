@@ -15,6 +15,7 @@ from failroom_sandbox.scenario import DiskFullScenario
 from failroom_sandbox.scenario_runtime import ScenarioObservation
 from failroom_state import CleanupTarget, ResourceRef, RuntimeCleanupError
 
+from failroom_control_plane.orchestrator import DiskFullBootstrapSession
 from failroom_control_plane.runtime_docker import (
     DockerCleanupRuntime,
     DockerProvisioningRuntime,
@@ -43,28 +44,25 @@ class DockerRuntimeAdapterTests(unittest.TestCase):
             "cleanup-operation",
         )
 
-    def test_provisioning_adapter_holds_prepared_operation(self) -> None:
+    def test_provisioning_adapter_rejects_an_unreviewed_room_before_prepare(
+        self,
+    ) -> None:
         lifecycle = Mock()
         profile = SimpleNamespace(workspace_tmpfs_bytes=67_108_864)
-        operation = object()
-        lifetime = self.lifetime()
-
-        @contextmanager
-        def prepare(*args: object, **kwargs: object):
-            lifecycle.prepare_calls = args
-            yield operation
-
-        lifecycle.prepare.side_effect = prepare
         adapter = DockerProvisioningRuntime(lifecycle, profile)
 
-        with adapter.open(
-            self.binding(), "runtime-operation", "room-1", lifetime=lifetime
-        ) as actual:
-            self.assertIs(actual, operation)
+        for room_id in ("room-1", "scenario-less-room"):
+            with self.subTest(room_id=room_id):
+                with self.assertRaisesRegex(DockerError, "^INVALID_DOCKER_REQUEST$"):
+                    with adapter.open(
+                        self.binding(),
+                        "runtime-operation",
+                        room_id,
+                        lifetime=self.lifetime(),
+                    ):
+                        self.fail("an unreviewed Room must not open a session")
 
-        lifecycle.prepare.assert_called_once_with(
-            profile, self.binding(), "runtime-operation", lifetime=lifetime
-        )
+        lifecycle.prepare.assert_not_called()
 
     def test_disk_full_adapter_combines_running_and_bootstrap_evidence(self) -> None:
         lifecycle = Mock()
@@ -89,12 +87,19 @@ class DockerRuntimeAdapterTests(unittest.TestCase):
 
         lifecycle.prepare.side_effect = prepare
         adapter = DockerProvisioningRuntime(lifecycle, profile)
+        lifetime = self.lifetime()
 
         with adapter.open(
-            self.binding(), "runtime-operation", "disk-full", lifetime=self.lifetime()
+            self.binding(), "runtime-operation", "disk-full", lifetime=lifetime
         ) as actual:
+            # The raw prepared operation must never reach the orchestrator.
+            self.assertIsNot(actual, operation)
+            self.assertIsInstance(actual, DiskFullBootstrapSession)
             result = actual.bootstrap_disk_full(created, started)
 
+        lifecycle.prepare.assert_called_once_with(
+            profile, self.binding(), "runtime-operation", lifetime=lifetime
+        )
         self.assertEqual(result.container_id, created.container_id)
         self.assertTrue(result.running)
         self.assertRegex(result.evidence_digest, r"^sha256:[0-9a-f]{64}$")
