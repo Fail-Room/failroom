@@ -5,7 +5,7 @@ requires-python = "==3.12.*"
 [[package]]
 name = "failroom-api"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "failroom-state-store" },
 ]
@@ -17,7 +17,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "failroom-state-store", virtual = "../../packages/state-store" }]
+requires-dist = [{ name = "failroom-state-store", editable = "../../packages/state-store" }]
 
 [package.metadata.requires-dev]
 dev = [
@@ -28,7 +28,7 @@ dev = [
 [[package]]
 name = "failroom-state-store"
 version = "0.1.0"
-source = { virtual = "../../packages/state-store" }
+source = { editable = "../../packages/state-store" }
 
 [package.metadata]
 

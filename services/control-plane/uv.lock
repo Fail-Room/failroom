@@ -45,13 +45,13 @@ wheels = [
 [[package]]
 name = "failroom-api"
 version = "0.1.0"
-source = { virtual = "../api" }
+source = { editable = "../api" }
 dependencies = [
     { name = "failroom-state-store" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "failroom-state-store", virtual = "../../packages/state-store" }]
+requires-dist = [{ name = "failroom-state-store", editable = "../../packages/state-store" }]
 
 [package.metadata.requires-dev]
 dev = [
@@ -62,7 +62,7 @@ dev = [
 [[package]]
 name = "failroom-control-plane"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "failroom-sandbox-engine" },
     { name = "failroom-state-store" },
@@ -79,8 +79,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "failroom-sandbox-engine", virtual = "../sandbox-engine" },
-    { name = "failroom-state-store", virtual = "../../packages/state-store" },
+    { name = "failroom-sandbox-engine", editable = "../sandbox-engine" },
+    { name = "failroom-state-store", editable = "../../packages/state-store" },
     { name = "fastapi", specifier = "==0.116.1" },
     { name = "uvicorn", specifier = "==0.35.0" },
 ]
@@ -95,7 +95,7 @@ dev = [
 [[package]]
 name = "failroom-sandbox-engine"
 version = "0.1.0"
-source = { virtual = "../sandbox-engine" }
+source = { editable = "../sandbox-engine" }
 dependencies = [
     { name = "failroom-api" },
     { name = "failroom-state-store" },
@@ -103,8 +103,8 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "failroom-api", virtual = "../api" },
-    { name = "failroom-state-store", virtual = "../../packages/state-store" },
+    { name = "failroom-api", editable = "../api" },
+    { name = "failroom-state-store", editable = "../../packages/state-store" },
 ]
 
 [package.metadata.requires-dev]
@@ -116,7 +116,7 @@ dev = [
 [[package]]
 name = "failroom-state-store"
 version = "0.1.0"
-source = { virtual = "../../packages/state-store" }
+source = { editable = "../../packages/state-store" }
 
 [package.metadata]
 
