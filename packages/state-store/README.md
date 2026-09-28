@@ -2,7 +2,7 @@
 
 Internal Phase 1 SQLite persistence for trusted services. This package stores
 authority, lifecycle observations and recovery work. It owns immutable runtime
-operation bindings and explicit v1-to-v2 and v2-to-v3 migrations. The trusted
+operation bindings and explicit v1-to-v2, v2-to-v3 and v3-to-v4 migrations. The trusted
 attachment-lease state contract is implemented here; it does not implement an HTTP
 API, authentication, signed-capability transport, Docker operations, a PTY, or a
 background scheduler. The trusted control-plane package
@@ -30,7 +30,9 @@ against other code running with the same trusted service account.
 Room authorization. `ServiceIdentity` must come from authenticated service
 identity and server-granted role/action scopes. Never deserialize these contexts
 from browser, sandbox, or unauthenticated service payloads. Identifiers alone are
-not credentials. Transport authentication remains unimplemented.
+not credentials. This package does not authenticate callers; the control plane's
+local routes authenticate one local bearer credential with the verifier in
+`services/api/`.
 
 `CapabilityClaims` must originate from an already signature-verified, short-lived
 capability. `consume()` rechecks owner, active tuple, generation, session epoch,
@@ -38,8 +40,9 @@ both records' attachable states, scope and expiry, then inserts the `jti` hash i
 one write transaction. Only one concurrent consumption succeeds. This does not
 open a WebSocket or authorize a PTY: the lease contract is a trusted state boundary,
 but transport authentication, PTY runtime checks and lease invalidation are still
-mandatory. The bounded signing/verification codec lives in `services/api/`; HTTP
-issuance, key distribution and replay-record retention policy are not implemented here.
+mandatory. The bounded signing/verification codec lives in `services/api/` and
+HTTP issuance in the control plane; key distribution and replay-record retention
+policy are not implemented.
 
 Every time-dependent method requires `now`, a trusted zero-argument clock callable
 returning an aware `datetime`, such as `lambda: datetime.now(UTC)`. It is invoked
@@ -58,26 +61,46 @@ references. `FAILED` requires one of `CREATE_FAILED`, `START_FAILED`,
 
 ## Schema and migration contract
 
-Fresh databases use schema v3. Existing v2 databases remain usable for state operations but require the operator-only `Database.migrate_v2_to_v3()` command with a new absolute backup path before attachment-lease operations are available. Migration adds the lease table without changing existing rows or issuing runtime identities.
+Fresh databases use schema v4. Operator-only migrations upgrade an existing
+database one version at a time, each with a new absolute backup path:
+`Database.migrate_v1_to_v2()`, `Database.migrate_v2_to_v3()`, which adds the
+attachment-lease table, and `Database.migrate_v3_to_v4()`, which adds reset
+generations (active and candidate sandbox pointers and reset intent). A v1
+database reports `MIGRATION_REQUIRED`. v2 and v3 databases still open, but
+current state operations, including `create()`, use v4 columns, so upgrade them
+to v4 before use. Migrations preserve existing rows and never issue runtime
+identities.
 
 ## Transaction and replay contract
 
 - `create()` atomically persists the backend-generated attempt/sandbox tuple,
   generation 1, future absolute deadline and operation receipt before any resource
-  record is accepted. Phase 1 has one immutable generation per attempt; reset and
-  generation-changing retries require a later explicit schema/API change.
-- Initialization creates version 3 only in an empty database. Unknown application
+  record is accepted.
+- Reset Room is the only transition that gives an attempt a new generation.
+  `begin_reset()` accepts only a `READY`, `RUNNING` or `RESOLVED` attempt without
+  destroy intent whose active tuple matches. It revokes the active generation by
+  moving the attempt to `RESETTING` and incrementing the session epoch, so
+  earlier capabilities stop working, and records a backend-generated sandbox ID
+  and the next generation as the candidate. Only the old active resource may
+  then be cleaned up, and the candidate is accepted for provisioning only after
+  that resource is `DESTROYED`. `publish_reset_ready()` makes the candidate the
+  active binding only after it is `READY`, and `fail_reset()` records `FAILED`
+  after the candidate failed with destroy intent.
+- Initialization creates version 4 only in an empty database. Unknown application
   IDs, existing unrelated objects, or unsupported schema versions are refused.
 - An exact version 1 database is left untouched at startup and reports
   `MIGRATION_REQUIRED`. An operator must call `Database.migrate_v1_to_v2()` with a
   new absolute backup path; the method validates the legacy shape and integrity,
   creates a committed pre-migration backup, then applies the atomic schema change.
-- Tampered, corrupt, or already-version-2 databases are rejected by the migration
-  entry point. There are no automatic migrations or schema resets.
+- Each migration entry point accepts only the exact previous version and shape.
+  Tampered, corrupt, or already-migrated databases are rejected. There are no
+  automatic migrations or schema resets.
 - Each call uses a fresh connection, foreign keys, `BEGIN IMMEDIATE`, full
   synchronization and bounded lock waiting. Initialization enables WAL. SQL
-  triggers prevent extending deadlines, changing owners or tuples, lowering
-  session epochs, clearing cleanup intents, or leaving `DESTROYED`.
+  triggers prevent extending deadlines, changing owners or Rooms, changing an
+  attempt's tuple outside the reset transition above, changing a resource
+  record's tuple, lowering session epochs, clearing cleanup intents, or leaving
+  `DESTROYED`.
 - Resource transitions use expected tuple and version under the writer lock.
   The backend independently publishes the exact resource as active after `READY`.
   A failed generation can only progress toward cleanup.
@@ -156,9 +179,14 @@ loop, sleep or automatic retry runs after the pass returns. The injected-runtime
 tests establish SQLite orchestration behavior, not actual Docker removal or
 isolation evidence.
 
-Independent TTL enforcement, runtime inventory/orphan detection, runtime attachment
-lease races, reset, final-image qualification and actual cleanup remain required
-before learner sandbox creation can be enabled.
+The control plane's operator-only local runtime wires these contracts to Docker
+creation, reset and verified cleanup for the Disk Full Room. It creates those
+sandboxes without final-image qualification, which is a documented limitation
+of that proof of concept, not a qualified learner allocator. Docker
+inventory-wide orphan detection, runtime attachment lease race coverage and TTL
+enforcement while every service is down also remain open: a container's PID 1
+exits no later than the attempt deadline, but removing the container waits for
+the next maintenance pass.
 
 ## Local checks and database placement
 
