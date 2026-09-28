@@ -7,6 +7,7 @@ from typing import Protocol, runtime_checkable
 
 from failroom_sandbox.docker_cli import DockerError
 from failroom_sandbox.docker_lifecycle import (
+    ContainerLifetime,
     ContainerObservation,
     CreatedContainer,
 )
@@ -57,7 +58,12 @@ class DiskFullBootstrapSession(Protocol):
 
 class ProvisioningRuntime(Protocol):
     def open(
-        self, binding: DockerBinding, runtime_operation_id: str, room_id: str
+        self,
+        binding: DockerBinding,
+        runtime_operation_id: str,
+        room_id: str,
+        *,
+        lifetime: ContainerLifetime,
     ) -> AbstractContextManager[ProvisioningSession]: ...
 
 
@@ -160,8 +166,13 @@ class LifecycleOrchestrator:
             current.ref.generation,
         )
         try:
+            # The resource carries the attempt's immutable deadline; the runtime
+            # must never let PID 1 outlive it, even while services are down.
             with self._runtime.open(
-                binding, current.runtime_operation_id or "", room_id
+                binding,
+                current.runtime_operation_id or "",
+                room_id,
+                lifetime=ContainerLifetime(current.expires_at, now),
             ) as session:
                 try:
                     created = session.create_verified()

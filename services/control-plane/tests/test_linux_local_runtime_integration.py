@@ -132,6 +132,74 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
                     )
                     self.assertEqual(left.status_code, 202)
 
+    def test_terminal_session_outlives_sixty_seconds_through_local_app(self) -> None:
+        """Keep one learner terminal responsive for 70 seconds (slow, opt-in)."""
+        environment = dict(os.environ)
+        environment["FAILROOM_DATABASE_PATH"] = str(
+            Path(self.database_temp.name) / "state.sqlite3"
+        )
+        config = LocalRuntimeConfig.from_environment(environment)
+        if (
+            config.controller.profile.absolute_ttl_seconds < 120
+            or config.pty_limits.session_seconds < 90
+        ):
+            raise unittest.SkipTest(
+                "UNVERIFIED: requires FAILROOM_ABSOLUTE_TTL_SECONDS >= 120 and "
+                "FAILROOM_TERMINAL_SESSION_SECONDS >= 90"
+            )
+        runtime = build_runtime(config, now=lambda: datetime.now(UTC))
+        headers = {"authorization": "Bearer " + self.token}
+
+        with TestClient(runtime.app) as client:
+            attempt_id: str | None = None
+            try:
+                entered = client.post(
+                    "/v1/rooms/disk-full/attempts",
+                    headers={**headers, "idempotency-key": "enter-" + uuid4().hex},
+                )
+                self.assertEqual(entered.status_code, 201)
+                attempt_id = entered.json()["attempt_id"]
+                capability = client.post(
+                    "/v1/attempts/" + attempt_id + "/terminal-capability",
+                    headers=headers,
+                )
+                self.assertEqual(capability.status_code, 200)
+
+                with client.websocket_connect("/v1/terminal") as socket:
+                    socket.send_json(
+                        {
+                            "type": "authorize",
+                            "capability": capability.json()["capability"],
+                        }
+                    )
+                    self.assertEqual(socket.receive_json(), {"type": "authorized"})
+                    started = time.monotonic()
+                    tick = 0
+                    while time.monotonic() - started < 70:
+                        tick += 1
+                        socket.send_json(
+                            {"type": "input", "data": f"echo T$((1000+{tick}))\n"}
+                        )
+                        self._receive_until(socket, f"T{1000 + tick}")
+                        time.sleep(5)
+                    socket.send_json({"type": "close"})
+
+                status = client.get(
+                    "/v1/attempts/" + attempt_id + "/status", headers=headers
+                )
+                self.assertEqual(status.status_code, 200)
+                self.assertEqual(status.json()["state"], "READY")
+            finally:
+                if attempt_id is not None:
+                    left = client.post(
+                        "/v1/attempts/" + attempt_id + "/leave",
+                        headers={
+                            **headers,
+                            "idempotency-key": "leave-" + uuid4().hex,
+                        },
+                    )
+                    self.assertEqual(left.status_code, 202)
+
     def test_terminal_recovery_verification_and_leave_through_local_app(self) -> None:
         environment = dict(os.environ)
         environment["FAILROOM_DATABASE_PATH"] = str(

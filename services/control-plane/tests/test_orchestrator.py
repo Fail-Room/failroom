@@ -6,6 +6,7 @@ from pathlib import Path
 
 from failroom_sandbox.docker_cli import DockerError
 from failroom_sandbox.docker_lifecycle import (
+    ContainerLifetime,
     ContainerObservation,
     CreatedContainer,
 )
@@ -67,11 +68,20 @@ class FakeRuntime:
         self.bootstrap_enabled = False
         self.bindings: list[DockerBinding] = []
         self.room_ids: list[str] = []
+        self.lifetimes: list[ContainerLifetime] = []
 
     @contextmanager
-    def open(self, binding: DockerBinding, runtime_operation_id: str, room_id: str):
+    def open(
+        self,
+        binding: DockerBinding,
+        runtime_operation_id: str,
+        room_id: str,
+        *,
+        lifetime: ContainerLifetime,
+    ):
         self.bindings.append(binding)
         self.room_ids.append(room_id)
+        self.lifetimes.append(lifetime)
         self.calls.append("open")
         try:
             yield FakeDiskFullSession(self) if self.bootstrap_enabled else FakeSession(self)
@@ -193,6 +203,26 @@ class OrchestratorTests(unittest.TestCase):
         self.assertNotEqual(self.attempt(receipt).state, "READY")
         self.assertEqual(self.runtime.calls, ["open", "create:CREATING", "close"])
 
+    def test_runtime_receives_the_resource_deadline_and_trusted_clock(self) -> None:
+        receipt = self.create_attempt()
+
+        def clock() -> datetime:
+            return self.now
+
+        self.orchestrator.provision(
+            receipt,
+            backend_identity=self.backend_identity,
+            control_identity=self.control_identity,
+            key="root-create",
+            now=clock,
+        )
+
+        (lifetime,) = self.runtime.lifetimes
+        self.assertIsInstance(lifetime, ContainerLifetime)
+        self.assertEqual(lifetime.deadline, self.deadline)
+        self.assertEqual(lifetime.deadline, self.resource(receipt).expires_at)
+        self.assertIs(lifetime.now, clock)
+
     def test_duplicate_root_key_reuses_existing_ready_resource(self) -> None:
         receipt = self.create_attempt()
         self.provision(receipt)
@@ -261,6 +291,11 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIsNone(current.candidate_ref)
         self.assertEqual(self.resource(candidate).state, ResourceState.READY)
         self.assertEqual(self.runtime.bindings[-1].sandbox_id, candidate.ref.sandbox_id)
+        # Reset never extends the container lifetime past the original deadline.
+        self.assertEqual(
+            [lifetime.deadline for lifetime in self.runtime.lifetimes],
+            [self.deadline, self.deadline],
+        )
 
     def test_reset_provisioning_failure_marks_attempt_failed(self) -> None:
         receipt = self.create_attempt()

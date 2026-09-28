@@ -17,6 +17,8 @@ from failroom_sandbox.fingerprints import configuration_digest
 
 _IMAGE_DIGEST = "sha256:" + "a" * 64
 _SECCOMP_DIGEST = "sha256:" + "b" * 64
+# The profile TTL (300) minus the fixed 10-second start margin.
+_LIFETIME = 290
 
 
 class DockerProfileTests(unittest.TestCase):
@@ -73,7 +75,9 @@ class DockerProfileTests(unittest.TestCase):
 
         self.assertIn(
             "/run/failroom-target:rw,size=1048576,mode=0700,nosuid,nodev,noexec",
-            compile_create_argv(profile, self._binding(), "operation-789"),
+            compile_create_argv(
+                profile, self._binding(), "operation-789", lifetime_seconds=_LIFETIME
+            ),
         )
 
     def test_declares_only_the_contract_api_and_has_no_field_defaults(self):
@@ -109,7 +113,12 @@ class DockerProfileTests(unittest.TestCase):
         self.assertTrue({"docker", "subprocess"}.isdisjoint(imported_roots))
 
         with patch("subprocess.run") as subprocess_run:
-            compile_create_argv(self._profile(), self._binding(), "operation-789")
+            compile_create_argv(
+                self._profile(),
+                self._binding(),
+                "operation-789",
+                lifetime_seconds=_LIFETIME,
+            )
         subprocess_run.assert_not_called()
 
     def test_rejects_missing_or_mutable_image_references(self):
@@ -139,7 +148,9 @@ class DockerProfileTests(unittest.TestCase):
         profile = StrictDockerProfile(**values)
 
         self.assertEqual(
-            compile_create_argv(profile, self._binding(), "operation-789")[-2],
+            compile_create_argv(
+                profile, self._binding(), "operation-789", lifetime_seconds=_LIFETIME
+            )[-2],
             values["image"],
         )
 
@@ -261,7 +272,12 @@ class DockerProfileTests(unittest.TestCase):
                     ProfileConfigurationError,
                     "^INVALID_DOCKER_OPERATION$",
                 ):
-                    compile_create_argv(profile, self._binding(), operation_id)
+                    compile_create_argv(
+                        profile,
+                        self._binding(),
+                        operation_id,
+                        lifetime_seconds=_LIFETIME,
+                    )
 
     def test_cpu_requires_docker_minimum_exact_nanocpus_and_signed_int64(self):
         for value in (
@@ -293,6 +309,7 @@ class DockerProfileTests(unittest.TestCase):
                         replace(self._profile(), cpu_limit=Decimal(raw)),
                         self._binding(),
                         "operation-789",
+                        lifetime_seconds=_LIFETIME,
                     )
                     self.assertEqual(argv[argv.index("--cpus") + 1], expected)
 
@@ -365,12 +382,56 @@ class DockerProfileTests(unittest.TestCase):
         self.assertEqual(docker_configuration["entrypoint"], "/bin/sleep")
         self.assertIs(docker_configuration["healthcheck_disabled"], True)
         self.assertEqual(docker_configuration["pull_policy"], "never")
-        self.assertEqual(docker_configuration["command"], ["60"])
+        self.assertEqual(configuration["schema"], "failroom.strict-docker-profile.v2")
+        self.assertEqual(
+            docker_configuration["command"],
+            {"lifetime": "attempt-deadline", "start_margin_seconds": 10},
+        )
+
+    def test_pid1_lifetime_is_the_bounded_final_argument(self):
+        profile = self._profile()
+
+        for seconds in (1, _LIFETIME):
+            with self.subTest(seconds=seconds):
+                argv = compile_create_argv(
+                    profile, self._binding(), "operation-789", lifetime_seconds=seconds
+                )
+                self.assertEqual(argv[argv.index("--entrypoint") + 1], "/bin/sleep")
+                self.assertEqual(argv[-2], profile.image)
+                self.assertEqual(argv[-1], str(seconds))
+
+        for seconds in (0, -1, True, 1.0, "60", None, _LIFETIME + 1):
+            with self.subTest(seconds=seconds):
+                with self.assertRaisesRegex(
+                    ProfileConfigurationError, "^INVALID_DOCKER_LIFETIME$"
+                ):
+                    compile_create_argv(
+                        profile,
+                        self._binding(),
+                        "operation-789",
+                        lifetime_seconds=seconds,
+                    )
+
+    def test_profile_ttl_must_leave_room_after_the_start_margin(self):
+        with self.assertRaisesRegex(
+            ProfileConfigurationError, "^INVALID_DOCKER_PROFILE$"
+        ):
+            replace(self._profile(), absolute_ttl_seconds=10)
+
+        profile = replace(self._profile(), absolute_ttl_seconds=11)
+        argv = compile_create_argv(
+            profile, self._binding(), "operation-789", lifetime_seconds=1
+        )
+        self.assertEqual(argv[-1], "1")
 
     def test_container_name_is_deterministic_and_binding_unambiguous(self):
         profile = self._profile()
-        first = compile_create_argv(profile, DockerBinding("a-b", "c", 1), "x")
-        second = compile_create_argv(profile, DockerBinding("a", "b-c", 1), "x")
+        first = compile_create_argv(
+            profile, DockerBinding("a-b", "c", 1), "x", lifetime_seconds=_LIFETIME
+        )
+        second = compile_create_argv(
+            profile, DockerBinding("a", "b-c", 1), "x", lifetime_seconds=_LIFETIME
+        )
         first_name = first[first.index("--name") + 1]
 
         self.assertNotEqual(first_name, second[second.index("--name") + 1])
@@ -381,7 +442,12 @@ class DockerProfileTests(unittest.TestCase):
         )
 
     def test_builds_deterministic_hardened_docker_create_argv(self):
-        argv = compile_create_argv(self._profile(), self._binding(), "operation-789")
+        argv = compile_create_argv(
+            self._profile(),
+            self._binding(),
+            "operation-789",
+            lifetime_seconds=_LIFETIME,
+        )
 
         self.assertIsInstance(argv, tuple)
         self.assertEqual(
@@ -456,11 +522,17 @@ class DockerProfileTests(unittest.TestCase):
                 "--device-write-bps",
                 "/dev/loop0:1048576",
                 self._profile_values()["image"],
-                "60",
+                "290",
             ),
         )
         self.assertEqual(
-            argv, compile_create_argv(self._profile(), self._binding(), "operation-789")
+            argv,
+            compile_create_argv(
+                self._profile(),
+                self._binding(),
+                "operation-789",
+                lifetime_seconds=_LIFETIME,
+            ),
         )
 
         prohibited = {

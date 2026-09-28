@@ -28,6 +28,9 @@ _IMAGE = re.compile(
 )
 _IDENTIFIER = re.compile(r"[a-z0-9](?:[a-z0-9_.-]{0,61}[a-z0-9])?")
 _ABSOLUTE_PATH = re.compile(r"/(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+")
+# PID 1 sleeps until this many seconds before the attempt deadline so that a
+# bounded create-to-start delay can never carry the container past it.
+_LIFETIME_START_MARGIN_SECONDS = 10
 
 
 class ProfileConfigurationError(ValueError):
@@ -177,6 +180,7 @@ def _validate_profile(profile: object) -> None:
         and _is_positive_int(profile.connection_limit)
         and _is_positive_int(profile.session_limit)
         and _is_positive_int(profile.absolute_ttl_seconds)
+        and profile.absolute_ttl_seconds > _LIFETIME_START_MARGIN_SECONDS
     ):
         raise ProfileConfigurationError("INVALID_DOCKER_PROFILE")
 
@@ -186,10 +190,21 @@ def _validate_operation_id(operation_id: object) -> None:
         raise ProfileConfigurationError("INVALID_DOCKER_OPERATION")
 
 
+def _max_lifetime_seconds(profile: StrictDockerProfile) -> int:
+    return profile.absolute_ttl_seconds - _LIFETIME_START_MARGIN_SECONDS
+
+
+def _validate_lifetime(profile: StrictDockerProfile, lifetime_seconds: object) -> None:
+    if type(lifetime_seconds) is not int:
+        raise ProfileConfigurationError("INVALID_DOCKER_LIFETIME")
+    if not 1 <= lifetime_seconds <= _max_lifetime_seconds(profile):
+        raise ProfileConfigurationError("INVALID_DOCKER_LIFETIME")
+
+
 def _profile_configuration(profile: StrictDockerProfile) -> dict[str, object]:
     """Return every profile field and fixed Docker setting for fingerprinting."""
     return {
-        "schema": "failroom.strict-docker-profile.v1",
+        "schema": "failroom.strict-docker-profile.v2",
         "image": profile.image,
         "identity": {"uid": profile.uid, "gid": profile.gid},
         "seccomp": {"path": profile.seccomp_path, "digest": profile.seccomp_digest},
@@ -241,7 +256,10 @@ def _profile_configuration(profile: StrictDockerProfile) -> dict[str, object]:
                 "read_bps": profile.io_read_bps,
                 "write_bps": profile.io_write_bps,
             },
-            "command": ["60"],
+            "command": {
+                "lifetime": "attempt-deadline",
+                "start_margin_seconds": _LIFETIME_START_MARGIN_SECONDS,
+            },
         },
         "terminal_output_limit_bytes": profile.terminal_output_limit_bytes,
         "connection_limit": profile.connection_limit,
@@ -275,15 +293,20 @@ def compile_create_argv(
     profile: StrictDockerProfile,
     binding: DockerBinding,
     operation_id: str,
+    *,
+    lifetime_seconds: int,
 ) -> tuple[str, ...]:
     """Build fixed Docker CLI argv without executing the command.
 
     Binding and operation identifiers are independently validated before being
-    incorporated into labels or the deterministic container name.
+    incorporated into labels or the deterministic container name. The caller
+    derives ``lifetime_seconds`` from the attempt's immutable deadline; PID 1
+    sleeps only that long, so the container stops on its own at the deadline.
     """
     _validate_profile(profile)
     _validate_binding(binding)
     _validate_operation_id(operation_id)
+    _validate_lifetime(profile, lifetime_seconds)
     return (
         "docker",
         "container",
@@ -357,5 +380,5 @@ def compile_create_argv(
         "--device-write-bps",
         profile.io_device_path + ":" + str(profile.io_write_bps),
         profile.image,
-        "60",
+        str(lifetime_seconds),
     )

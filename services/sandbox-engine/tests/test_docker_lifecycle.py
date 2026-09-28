@@ -11,7 +11,11 @@ from decimal import Decimal, localcontext
 import test_docker_profile
 
 from failroom_sandbox.docker_cli import DockerCli, DockerError, ProcessResult
-from failroom_sandbox.docker_lifecycle import DockerDiagnosticLifecycle
+from failroom_sandbox.docker_lifecycle import (
+    ContainerLifetime,
+    CreatedContainer,
+    DockerDiagnosticLifecycle,
+)
 from failroom_sandbox.docker_profile import DockerBinding, compile_create_argv
 from failroom_sandbox.models import QualificationContext, RuntimeIdentity
 from failroom_sandbox.qualification import ProfileNotQualified
@@ -21,18 +25,25 @@ CID = "c" * 64
 IMAGE_ID = "sha256:" + "d" * 64
 BINDING = DockerBinding("attempt-123", "sandbox-456", 1)
 OP = "operation-789"
+NOW = datetime(2026, 9, 28, 12, 0, tzinfo=UTC)
+DEADLINE = NOW + timedelta(seconds=300)
+# The test profile TTL (300) minus the 10-second start margin.
+LIFETIME_SECONDS = 290
 
 
 def observation(profile, seccomp_path):
     return {
         "Id": CID,
-        "Name": "/" + compile_create_argv(profile, BINDING, OP)[4],
+        "Name": "/"
+        + compile_create_argv(profile, BINDING, OP, lifetime_seconds=LIFETIME_SECONDS)[
+            4
+        ],
         "Image": IMAGE_ID,
         "Config": {
             "Image": profile.image,
             "User": "10001:10001",
             "Entrypoint": ["/bin/sleep"],
-            "Cmd": ["60"],
+            "Cmd": [str(LIFETIME_SECONDS)],
             "Healthcheck": {"Test": ["NONE"]},
             "Env": ["PATH=/usr/bin:/bin"],
             "Volumes": None,
@@ -113,6 +124,16 @@ class Policy:
             self.active = False
 
 
+class Clock:
+    """A trusted test clock that tests advance explicitly."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __call__(self):
+        return self.value
+
+
 class Engine:
     def __init__(self, profile, seccomp_path):
         self.calls = []
@@ -135,6 +156,8 @@ class Engine:
             return ProcessResult(0, json.dumps([self.image]).encode(), b"")
         if args[:2] == ("container", "create"):
             self.created = True
+            # Docker records the arguments after the image as the command.
+            self.resource["Config"]["Cmd"] = [args[-1]]
             if self.after_create:
                 self.after_create(self.resource)
             return ProcessResult(0, (CID + "\n").encode(), b"")
@@ -179,9 +202,183 @@ class DockerLifecycleTests(unittest.TestCase):
             runner=self.engine,
         )
         self.lifecycle = DockerDiagnosticLifecycle(self.cli, self.policy)
+        self.clock = Clock(NOW)
+        self.lifetime = ContainerLifetime(DEADLINE, self.clock)
 
     def create(self):
-        return self.lifecycle.create_diagnostic(self.profile, BINDING, OP)
+        return self.lifecycle.create_diagnostic(
+            self.profile, BINDING, OP, lifetime=self.lifetime
+        )
+
+    def prepare(self):
+        return self.lifecycle.prepare(self.profile, BINDING, OP, lifetime=self.lifetime)
+
+    def reset_engine(self):
+        self.engine = Engine(self.profile, self.policy.path)
+        self.cli = DockerCli(
+            context="desktop-linux",
+            timeout=5,
+            max_output_bytes=65536,
+            runner=self.engine,
+        )
+        self.lifecycle = DockerDiagnosticLifecycle(self.cli, self.policy)
+
+    def docker_calls(self, *commands):
+        return [call for call in self.engine.calls if call[3:5] in commands]
+
+    def test_pid1_sleeps_only_until_the_start_margin_before_the_deadline(self):
+        cases = (
+            (timedelta(seconds=300), "290"),
+            (timedelta(seconds=100), "90"),
+            (timedelta(seconds=100, milliseconds=999), "90"),
+            (timedelta(seconds=11), "1"),
+            # A deadline beyond the profile TTL is still capped by the TTL.
+            (timedelta(seconds=1000), "290"),
+        )
+        for remaining, expected in cases:
+            with self.subTest(remaining=remaining):
+                self.reset_engine()
+                self.lifetime = ContainerLifetime(NOW + remaining, self.clock)
+                result = self.create()
+                (create,) = self.docker_calls(("container", "create"))
+                self.assertEqual(create[create.index("--entrypoint") + 1], "/bin/sleep")
+                self.assertEqual(create[-1], expected)
+                self.assertEqual(self.engine.resource["Config"]["Cmd"], [expected])
+                self.assertTrue(result.running)
+
+    def test_deadline_inside_the_start_margin_is_denied_before_docker_create(self):
+        for remaining in (
+            timedelta(seconds=10, milliseconds=999),
+            timedelta(seconds=10),
+            timedelta(0),
+            timedelta(seconds=-5),
+        ):
+            with self.subTest(remaining=remaining):
+                self.reset_engine()
+                self.lifetime = ContainerLifetime(NOW + remaining, self.clock)
+                with self.assertRaisesRegex(DockerError, "^INVALID_DOCKER_REQUEST$"):
+                    self.create()
+                self.assertEqual(
+                    self.docker_calls(
+                        ("container", "create"),
+                        ("container", "inspect"),
+                        ("container", "start"),
+                    ),
+                    [],
+                )
+
+    def test_start_is_refused_when_pid1_would_outlive_the_deadline(self):
+        with self.prepare() as operation:
+            created = operation.create_verified()
+            self.clock.value = NOW + timedelta(seconds=11)
+            with self.assertRaisesRegex(DockerError, "^PROFILE_UNVERIFIED$"):
+                operation.start_verified(created)
+        self.assertEqual(self.docker_calls(("container", "start")), [])
+
+    def test_start_at_the_exact_deadline_boundary_is_allowed(self):
+        with self.prepare() as operation:
+            created = operation.create_verified()
+            self.clock.value = NOW + timedelta(seconds=10)
+            result = operation.start_verified(created)
+        self.assertTrue(result.running)
+
+    def test_slow_start_past_the_deadline_is_rejected_after_observation(self):
+        def delay_start(_resource):
+            self.clock.value = NOW + timedelta(seconds=11)
+
+        self.engine.after_start = delay_start
+        with self.prepare() as operation:
+            created = operation.create_verified()
+            with self.assertRaisesRegex(DockerError, "^PROFILE_UNVERIFIED$"):
+                operation.start_verified(created)
+        self.assertEqual(len(self.docker_calls(("container", "start"))), 1)
+
+    def test_reconciled_running_container_must_still_end_by_the_deadline(self):
+        for elapsed, allowed in ((5, True), (11, False)):
+            with self.subTest(elapsed=elapsed):
+                self.reset_engine()
+                self.engine.created = True
+                self.engine.resource["State"] = {"Running": True, "Status": "running"}
+                self.clock.value = NOW + timedelta(seconds=elapsed)
+                with self.prepare() as operation:
+                    created = operation.create_verified()
+                    self.assertTrue(created.running)
+                    if allowed:
+                        self.assertTrue(operation.start_verified(created).running)
+                    else:
+                        with self.assertRaisesRegex(
+                            DockerError, "^PROFILE_UNVERIFIED$"
+                        ):
+                            operation.start_verified(created)
+                self.assertEqual(
+                    self.docker_calls(("container", "create"), ("container", "start")),
+                    [],
+                )
+        self.clock.value = NOW
+
+    def test_malformed_or_oversized_pid1_lifetime_is_cleaned_without_start(self):
+        for command in (
+            ["0"],
+            ["291"],
+            ["060"],
+            ["1e3"],
+            [" 60"],
+            ["60", "1"],
+            [60],
+            [],
+            None,
+        ):
+            with self.subTest(command=command):
+                self.reset_engine()
+                self.engine.after_create = lambda r, command=command: r[
+                    "Config"
+                ].update(Cmd=command)
+                with self.assertRaisesRegex(DockerError, "^PROFILE_UNVERIFIED$"):
+                    self.create()
+                self.assertFalse(self.engine.created)
+                self.assertEqual(self.docker_calls(("container", "start")), [])
+
+    def test_create_and_start_require_an_explicit_lifetime(self):
+        with self.lifecycle.prepare(self.profile, BINDING, OP) as operation:
+            with self.assertRaisesRegex(DockerError, "^INVALID_DOCKER_REQUEST$"):
+                operation.create_verified()
+            with self.assertRaisesRegex(DockerError, "^INVALID_DOCKER_REQUEST$"):
+                operation.start_verified(CreatedContainer(CID, False))
+        self.assertEqual(
+            self.docker_calls(("container", "create"), ("container", "start")), []
+        )
+        with self.assertRaisesRegex(DockerError, "^INVALID_DOCKER_REQUEST$"):
+            with self.lifecycle.prepare(self.profile, BINDING, OP, lifetime="tomorrow"):
+                pass
+
+    def test_lifetime_requires_an_aware_deadline_and_a_trusted_clock(self):
+        for deadline, now in (
+            (DEADLINE.replace(tzinfo=None), self.clock),
+            ("2026-09-28T12:05:00+00:00", self.clock),
+            (DEADLINE, "not-callable"),
+        ):
+            with self.subTest(deadline=deadline, now=now):
+                with self.assertRaisesRegex(DockerError, "^INVALID_DOCKER_REQUEST$"):
+                    ContainerLifetime(deadline, now)
+
+        def failing_clock():
+            raise OSError("clock unavailable")
+
+        for clock in (lambda: NOW.replace(tzinfo=None), lambda: "now", failing_clock):
+            with self.subTest(clock=clock):
+                self.reset_engine()
+                self.lifetime = ContainerLifetime(DEADLINE, clock)
+                with self.assertRaisesRegex(DockerError, "^INVALID_DOCKER_REQUEST$"):
+                    self.create()
+                self.assertEqual(self.docker_calls(("container", "create")), [])
+
+    def test_running_evidence_binds_the_verified_lifetime(self):
+        first = self.create().evidence_digest
+        self.reset_engine()
+        self.lifetime = ContainerLifetime(NOW + timedelta(seconds=200), self.clock)
+        second = self.create().evidence_digest
+        self.assertRegex(first, r"^sha256:[0-9a-f]{64}$")
+        self.assertNotEqual(first, second)
 
     def test_create_inspects_image_and_pinned_policy_before_start(self):
         result = self.create()
@@ -206,7 +403,7 @@ class DockerLifecycleTests(unittest.TestCase):
             target_ready_timeout_seconds=5,
         )
 
-        with self.lifecycle.prepare(self.profile, BINDING, OP) as operation:
+        with self.prepare() as operation:
             created = operation.create_verified()
             operation.start_verified(created)
             result = operation.bootstrap_disk_full(created, scenario)
@@ -452,7 +649,7 @@ class DockerLifecycleTests(unittest.TestCase):
         self.assertFalse(self.engine.created)
 
     def test_prepared_operation_persists_pin_through_create_then_start(self):
-        with self.lifecycle.prepare(self.profile, BINDING, OP) as operation:
+        with self.prepare() as operation:
             created = operation.create_verified()
             self.assertEqual(created.container_id, CID)
             self.assertFalse(created.running)
@@ -466,7 +663,7 @@ class DockerLifecycleTests(unittest.TestCase):
         self.engine.after_start = lambda _: (_ for _ in ()).throw(
             DockerError("RUNTIME_UNAVAILABLE")
         )
-        with self.lifecycle.prepare(self.profile, BINDING, OP) as operation:
+        with self.prepare() as operation:
             created = operation.create_verified()
             result = operation.start_verified(created)
         self.assertTrue(result.running)
@@ -481,7 +678,7 @@ class DockerLifecycleTests(unittest.TestCase):
         self.engine.resource["Config"]["Labels"]["failroom.operation_id"] = "other"
         self.engine.calls.clear()
         with self.assertRaisesRegex(DockerError, "^OWNERSHIP_MISMATCH$"):
-            with self.lifecycle.prepare(self.profile, BINDING, OP) as operation:
+            with self.prepare() as operation:
                 operation.create_verified()
         self.assertFalse(
             any(
@@ -495,10 +692,10 @@ class DockerLifecycleTests(unittest.TestCase):
             DockerError("RUNTIME_UNAVAILABLE")
         )
         with self.assertRaises(DockerError):
-            with self.lifecycle.prepare(self.profile, BINDING, OP) as operation:
+            with self.prepare() as operation:
                 operation.create_verified()
         self.engine.after_create = None
-        with self.lifecycle.prepare(self.profile, BINDING, OP) as operation:
+        with self.prepare() as operation:
             self.assertEqual(operation.create_verified().container_id, CID)
         self.assertEqual(
             sum(call[3:5] == ("container", "create") for call in self.engine.calls),
