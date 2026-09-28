@@ -3,7 +3,7 @@
 import hashlib
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from failroom_sandbox.docker_cli import DockerError
 from failroom_sandbox.docker_lifecycle import (
@@ -46,9 +46,18 @@ class ProvisioningSession(Protocol):
     def start_verified(self, created: CreatedContainer) -> ContainerObservation: ...
 
 
+@runtime_checkable
+class DiskFullBootstrapSession(Protocol):
+    """An optional trusted bootstrap that must finish before READY."""
+
+    def bootstrap_disk_full(
+        self, created: CreatedContainer, started: ContainerObservation
+    ) -> ContainerObservation: ...
+
+
 class ProvisioningRuntime(Protocol):
     def open(
-        self, binding: DockerBinding, runtime_operation_id: str
+        self, binding: DockerBinding, runtime_operation_id: str, room_id: str
     ) -> AbstractContextManager[ProvisioningSession]: ...
 
 
@@ -108,6 +117,7 @@ class LifecycleOrchestrator:
             self._require_runtime_binding(current)
             if current.state != ResourceState.REQUESTED:
                 raise StoreError("INVALID_TRANSITION")
+            room_id = self._backend.room_id_for_binding(backend_identity, current.ref)
 
             creating = self._control.transition(
                 control_identity,
@@ -121,7 +131,13 @@ class LifecycleOrchestrator:
             if current.version != creating.version:
                 raise StoreError("STALE_BINDING")
             self._run_runtime(
-                current, receipt, backend_identity, control_identity, key, now
+                current,
+                room_id,
+                receipt,
+                backend_identity,
+                control_identity,
+                key,
+                now,
             )
         except LifecycleError:
             raise
@@ -131,6 +147,7 @@ class LifecycleOrchestrator:
     def _run_runtime(
         self,
         current: Resource,
+        room_id: str,
         receipt: Receipt,
         backend_identity: ServiceIdentity,
         control_identity: ServiceIdentity,
@@ -144,7 +161,7 @@ class LifecycleOrchestrator:
         )
         try:
             with self._runtime.open(
-                binding, current.runtime_operation_id or ""
+                binding, current.runtime_operation_id or "", room_id
             ) as session:
                 try:
                     created = session.create_verified()
@@ -191,6 +208,25 @@ class LifecycleOrchestrator:
                         phase="start",
                     )
                     raise LifecycleError(self._failure_code(error, "start")) from None
+                if isinstance(session, DiskFullBootstrapSession):
+                    try:
+                        observation = session.bootstrap_disk_full(created, observation)
+                        if type(observation) is not ContainerObservation:
+                            raise DockerError("INVALID_DOCKER_RESPONSE")
+                    except DockerError as error:
+                        self._fail(
+                            current,
+                            control_identity,
+                            backend_identity,
+                            receipt,
+                            key,
+                            now,
+                            error,
+                            phase="bootstrap",
+                        )
+                        raise LifecycleError(
+                            self._failure_code(error, "bootstrap")
+                        ) from None
         except LifecycleError:
             raise
         except DockerError as error:
@@ -250,7 +286,9 @@ class LifecycleOrchestrator:
     def _failure_code(error: DockerError, phase: str) -> str:
         if error.code == "RUNTIME_UNAVAILABLE":
             return error.code
-        return "CREATE_FAILED" if phase == "create" else "START_FAILED"
+        if phase == "create":
+            return "CREATE_FAILED"
+        return "START_FAILED"
 
     def _fail(
         self,

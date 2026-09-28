@@ -8,6 +8,10 @@ import threading
 from dataclasses import dataclass
 from typing import BinaryIO, Protocol, cast
 
+from .scenario import DISK_FULL_FILLER_PATH
+
+_TARGET_SUPERVISOR_USER = "0:0"
+
 
 class DockerError(RuntimeError):
     def __init__(self, code: str) -> None:
@@ -127,6 +131,38 @@ def _container_selector(value: str) -> None:
         raise DockerError("INVALID_DOCKER_REQUEST")
 
 
+def _sandbox_user(uid: int, gid: int) -> str:
+    if (
+        type(uid) is not int
+        or type(gid) is not int
+        or not 1 <= uid <= 2_147_483_647
+        or not 1 <= gid <= 2_147_483_647
+    ):
+        raise DockerError("INVALID_DOCKER_REQUEST")
+    return f"{uid}:{gid}"
+
+
+def _bounded_decimal(stdout: bytes, *, header: str | None, allow_zero: bool) -> int:
+    try:
+        lines = stdout.decode("ascii").splitlines()
+        if header is not None:
+            if len(lines) != 2 or lines[0].strip() != header:
+                raise ValueError
+            value = lines[1].strip()
+        else:
+            if len(lines) != 1:
+                raise ValueError
+            value = lines[0].strip()
+        if re.fullmatch(r"[0-9]{1,13}", value) is None:
+            raise ValueError
+        number = int(value)
+        if number > 1 << 40 or (not allow_zero and number == 0):
+            raise ValueError
+        return number
+    except (UnicodeError, ValueError):
+        raise DockerError("INVALID_DOCKER_RESPONSE") from None
+
+
 class DockerCli:
     """Explicit context, time and memory bounds; argv never goes through a shell."""
 
@@ -179,7 +215,9 @@ class DockerCli:
     def inspect_image(self, image: str) -> dict[str, object]:
         if (
             type(image) is not str
-            or re.fullmatch(r"[a-z0-9][a-z0-9./:_-]*@sha256:[a-f0-9]{64}", image)
+            or re.fullmatch(
+                r"(?:[a-z0-9][a-z0-9./:_-]*@)?sha256:[a-f0-9]{64}", image
+            )
             is None
         ):
             raise DockerError("INVALID_DOCKER_REQUEST")
@@ -214,6 +252,148 @@ class DockerCli:
         ) != len(ids):
             raise DockerError("INVALID_DOCKER_RESPONSE")
         return ids
+
+    def allocate_workspace_file(
+        self, container_id: str, *, uid: int, gid: int, size_bytes: int, path: str
+    ) -> None:
+        """Allocate one bounded file through a fixed trusted Docker argv."""
+
+        _container_selector(container_id)
+        if (
+            type(size_bytes) is not int
+            or not 1 <= size_bytes <= 1 << 40
+            or type(path) is not str
+            or re.fullmatch(r"/workspace/[a-zA-Z0-9._-]{1,128}", path) is None
+            or ".." in path
+        ):
+            raise DockerError("INVALID_DOCKER_REQUEST")
+        user = _sandbox_user(uid, gid)
+        self._call(
+            (
+                "container",
+                "exec",
+                "--user",
+                user,
+                container_id,
+                "/usr/bin/fallocate",
+                "-l",
+                str(size_bytes),
+                path,
+            )
+        )
+
+    def workspace_available_bytes(self, container_id: str, *, uid: int, gid: int) -> int:
+        _container_selector(container_id)
+        result = self._call(
+            (
+                "container",
+                "exec",
+                "--user",
+                _sandbox_user(uid, gid),
+                container_id,
+                "/usr/bin/df",
+                "--output=avail",
+                "-B1",
+                "/workspace",
+            )
+        )
+        return _bounded_decimal(result.stdout, header="Avail", allow_zero=True)
+
+    def disk_full_filler_size(self, container_id: str, *, uid: int, gid: int) -> int:
+        _container_selector(container_id)
+        result = self._call(
+            (
+                "container",
+                "exec",
+                "--user",
+                _sandbox_user(uid, gid),
+                container_id,
+                "/usr/bin/stat",
+                "--format=%s",
+                "--",
+                DISK_FULL_FILLER_PATH,
+            )
+        )
+        return _bounded_decimal(result.stdout, header=None, allow_zero=False)
+
+    def disk_full_filler_absent(
+        self, container_id: str, *, uid: int, gid: int
+    ) -> bool:
+        """Check the fixed filler path without accepting daemon errors as absence."""
+
+        _container_selector(container_id)
+        result = self._call(
+            (
+                "container",
+                "exec",
+                "--user",
+                _sandbox_user(uid, gid),
+                container_id,
+                "/usr/bin/test",
+                "!",
+                "-e",
+                DISK_FULL_FILLER_PATH,
+            ),
+            allow_failure=True,
+        )
+        if result.stdout or result.stderr:
+            raise DockerError("INVALID_DOCKER_RESPONSE")
+        if result.returncode == 0:
+            return True
+        if result.returncode == 1:
+            return False
+        raise DockerError("RUNTIME_UNAVAILABLE")
+
+    def disk_full_target_initialization_failed(self, container_id: str) -> bool:
+        return not self._disk_full_target_result(
+            container_id, action="initialize"
+        )
+
+    def start_disk_full_target(self, container_id: str) -> None:
+        _container_selector(container_id)
+        self._call(
+            (
+                "container", "exec", "--detach", "--user", _TARGET_SUPERVISOR_USER,
+                container_id, "/usr/local/bin/failroom-disk-target", "run",
+            )
+        )
+
+    def disk_full_target_healthy(self, container_id: str) -> bool:
+        return self._disk_full_target_result(
+            container_id, action="status"
+        )
+
+    def _disk_full_target_result(
+        self, container_id: str, *, action: str
+    ) -> bool:
+        _container_selector(container_id)
+        result = self._call(
+            ("container", "exec", "--user", _TARGET_SUPERVISOR_USER, container_id,
+             "/usr/local/bin/failroom-disk-target", action),
+            allow_failure=True,
+        )
+        if result.stdout or result.stderr:
+            raise DockerError("INVALID_DOCKER_RESPONSE")
+        if result.returncode == 0:
+            return True
+        if result.returncode == 1:
+            return False
+        raise DockerError("RUNTIME_UNAVAILABLE")
+
+    def remove_disk_full_filler(self, container_id: str, *, uid: int, gid: int) -> None:
+        _container_selector(container_id)
+        self._call(
+            (
+                "container",
+                "exec",
+                "--user",
+                _sandbox_user(uid, gid),
+                container_id,
+                "/usr/bin/rm",
+                "--",
+                DISK_FULL_FILLER_PATH,
+            )
+        )
 
     def create(self, argv: tuple[str, ...]) -> str:
         if argv[:3] != ("docker", "container", "create"):

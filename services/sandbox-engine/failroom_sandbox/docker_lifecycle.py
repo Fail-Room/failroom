@@ -20,6 +20,8 @@ from .docker_profile import (
 from .fingerprints import configuration_digest
 from .models import QualificationContext, QualificationReport
 from .qualification import require_qualified_profile
+from .scenario import DiskFullScenario
+from .scenario_runtime import DiskFullBootstrapRuntime, ScenarioObservation
 
 
 class PolicyStore(Protocol):
@@ -140,7 +142,7 @@ def _cleanable_mounts(data: dict[str, object]) -> set[str]:
         dest = mount.get("Destination")
         if (
             mount.get("Type") != "tmpfs"
-            or dest not in ("/workspace", "/tmp")
+            or dest not in ("/workspace", "/tmp", "/run/failroom-target")
             or mount.get("Source") not in ("", None)
             or dest in destinations
         ):
@@ -153,7 +155,7 @@ def _cleanable_mounts(data: dict[str, object]) -> set[str]:
         tmpfs = host.get("Tmpfs")
         if (
             type(tmpfs) is dict
-            and set(tmpfs) == {"/workspace", "/tmp"}
+            and set(tmpfs) == {"/workspace", "/tmp", "/run/failroom-target"}
             and all(type(value) is str for value in tmpfs.values())
         ):
             destinations = set(tmpfs)
@@ -161,7 +163,7 @@ def _cleanable_mounts(data: dict[str, object]) -> set[str]:
 
 
 def _safe_mounts(data: dict[str, object]) -> None:
-    if _cleanable_mounts(data) != {"/workspace", "/tmp"}:
+    if _cleanable_mounts(data) != {"/workspace", "/tmp", "/run/failroom-target"}:
         raise DockerError("CLEANUP_INCOMPLETE")
 
 
@@ -194,6 +196,11 @@ def _verify_profile(
         "Tmpfs": {
             "/workspace": f"rw,size={profile.workspace_tmpfs_bytes},nosuid,nodev,noexec",
             "/tmp": f"rw,size={profile.temp_tmpfs_bytes},nosuid,nodev,noexec",
+            "/run/failroom-target": (
+                "rw,size="
+                + str(profile.target_supervisor_tmpfs_bytes)
+                + ",mode=0700,nosuid,nodev,noexec"
+            ),
         },
         "BlkioDeviceReadBps": [
             {"Path": profile.io_device_path, "Rate": profile.io_read_bps}
@@ -255,12 +262,17 @@ def _verified_image(cli: DockerCli, profile: StrictDockerProfile) -> dict[str, o
     image_config = _object(image.get("Config"))
     digests = image.get("RepoDigests")
     volumes = image_config.get("Volumes")
+    image_id = image.get("Id")
+    profile_is_local_id = re.fullmatch(r"sha256:[a-f0-9]{64}", profile.image) is not None
     if (
         image.get("Os") != "linux"
-        or type(image.get("Id")) is not str
-        or re.fullmatch(r"sha256:[a-f0-9]{64}", str(image["Id"])) is None
-        or type(digests) is not list
-        or profile.image not in digests
+        or type(image_id) is not str
+        or re.fullmatch(r"sha256:[a-f0-9]{64}", image_id) is None
+        or (profile_is_local_id and image_id != profile.image)
+        or (
+            not profile_is_local_id
+            and (type(digests) is not list or profile.image not in digests)
+        )
         or ("Volumes" in image_config and (not _empty(volumes) or volumes == []))
         or "Env" not in image_config
     ):
@@ -333,6 +345,32 @@ class PreparedDockerOperation:
             True,
             self._lifecycle._running_evidence(self, data),
         )
+
+    def bootstrap_disk_full(
+        self, created: CreatedContainer, scenario: DiskFullScenario
+    ) -> ScenarioObservation:
+        if type(created) is not CreatedContainer:
+            raise DockerError("INVALID_DOCKER_REQUEST")
+        return DiskFullBootstrapRuntime(
+            self._lifecycle._cli,
+            self._profile,
+            self._binding,
+            self._operation_id,
+            lambda container_id: self._lifecycle._inspect_exact_created(
+                self, container_id
+            ),
+        ).apply(created.container_id, scenario)
+
+    def verify_disk_full_recovery(
+        self, container_id: str, scenario: DiskFullScenario
+    ) -> ScenarioObservation:
+        return DiskFullBootstrapRuntime(
+            self._lifecycle._cli,
+            self._profile,
+            self._binding,
+            self._operation_id,
+            lambda cid: self._lifecycle._inspect_exact_created(self, cid),
+        ).verify_recovery(container_id, scenario)
 
     def cleanup_after_failure(self) -> None:
         if self._cleanup_id is None:

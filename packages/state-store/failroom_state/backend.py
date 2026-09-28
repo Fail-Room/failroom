@@ -110,6 +110,15 @@ class BackendStore:
         with self._database._transaction() as connection:
             return attempt_record(owned(connection, identity, attempt_id))
 
+    def room_id_for_binding(
+        self, identity: ServiceIdentity, ref: ResourceRef
+    ) -> str:
+        """Read the trusted Room selector for the exact current resource binding."""
+        service(identity, Role.BACKEND, Action.CREATE)
+        ref_valid(ref)
+        with self._database._transaction() as connection:
+            return str(binding(connection, ref)["room_id"])
+
     def leave(
         self, identity: UserIdentity, ref: ResourceRef, *, key: str, now: Clock
     ) -> Receipt:
@@ -241,6 +250,96 @@ class BackendStore:
                 fingerprint,
                 ref,
                 "READY",
+                expected_version + 1,
+            )
+
+    def publish_running(
+        self,
+        identity: ServiceIdentity,
+        ref: ResourceRef,
+        *,
+        expected_version: int,
+        key: str,
+        now: Clock,
+    ) -> Receipt:
+        return self._publish_runtime_state(
+            identity,
+            ref,
+            expected_version=expected_version,
+            key=key,
+            now=now,
+            source="READY",
+            target="RUNNING",
+        )
+
+    def publish_resolved(
+        self,
+        identity: ServiceIdentity,
+        ref: ResourceRef,
+        *,
+        expected_version: int,
+        key: str,
+        now: Clock,
+    ) -> Receipt:
+        return self._publish_runtime_state(
+            identity,
+            ref,
+            expected_version=expected_version,
+            key=key,
+            now=now,
+            source="RUNNING",
+            target="RESOLVED",
+        )
+
+    def _publish_runtime_state(
+        self,
+        identity: ServiceIdentity,
+        ref: ResourceRef,
+        *,
+        expected_version: int,
+        key: str,
+        now: Clock,
+        source: str,
+        target: str,
+    ) -> Receipt:
+        actor = service(identity, Role.BACKEND, Action.PUBLISH)
+        ref_valid(ref)
+        fingerprint = request_hash(
+            "publish-" + target.lower(),
+            [ref.attempt_id, ref.sandbox_id, ref.generation, expected_version],
+        )
+        with self._database._transaction() as connection:
+            clock = read_clock(now)
+            row = binding(connection, ref)
+            _live(connection, row, clock)
+            previous = replay(connection, actor, key, fingerprint)
+            if previous is not None:
+                return previous
+            cas(row, expected_version)
+            resource = connection.execute(
+                "SELECT * FROM sandbox_resources WHERE sandbox_id=?",
+                (ref.sandbox_id,),
+            ).fetchone()
+            if (
+                row["state"] != source
+                or resource is None
+                or resource["state"] != target
+                or resource["destroy_intent"]
+                or (target == "RESOLVED" and resource["evidence_digest"] is None)
+            ):
+                raise StoreError("INVALID_TRANSITION")
+            connection.execute(
+                "UPDATE room_attempts SET state=?,version=version+1 WHERE attempt_id=?",
+                (target, ref.attempt_id),
+            )
+            return finish(
+                connection,
+                actor,
+                "publish-" + target.lower(),
+                key,
+                fingerprint,
+                ref,
+                target,
                 expected_version + 1,
             )
 
