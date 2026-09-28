@@ -265,7 +265,9 @@ def _verified_image(cli: DockerCli, profile: StrictDockerProfile) -> dict[str, o
     digests = image.get("RepoDigests")
     volumes = image_config.get("Volumes")
     image_id = image.get("Id")
-    profile_is_local_id = re.fullmatch(r"sha256:[a-f0-9]{64}", profile.image) is not None
+    profile_is_local_id = (
+        re.fullmatch(r"sha256:[a-f0-9]{64}", profile.image) is not None
+    )
     if (
         image.get("Os") != "linux"
         or type(image_id) is not str

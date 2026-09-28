@@ -39,7 +39,9 @@ class RecoveryVerificationServiceTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.now = datetime(2026, 9, 17, tzinfo=UTC)
-        database = Database(Path(self.temp.name) / "state.sqlite3", busy_timeout_ms=5000)
+        database = Database(
+            Path(self.temp.name) / "state.sqlite3", busy_timeout_ms=5000
+        )
         database.initialize()
         self.backend = BackendStore(database)
         self.control = ControlPlaneStore(database)
@@ -114,9 +116,7 @@ class RecoveryVerificationServiceTests(unittest.TestCase):
 
     def test_owned_request_resolves_only_after_trusted_recovery_evidence(self):
         attempt = self._ready()
-        runtime = RecordingRecoveryRuntime(
-            ScenarioObservation("sha256:" + "b" * 64)
-        )
+        runtime = RecordingRecoveryRuntime(ScenarioObservation("sha256:" + "b" * 64))
 
         status = self._service(runtime).verify(
             self.user, attempt.attempt_id, key="verify-recovery"
@@ -131,9 +131,7 @@ class RecoveryVerificationServiceTests(unittest.TestCase):
 
     def test_foreign_request_never_invokes_trusted_runtime(self):
         attempt = self._ready()
-        runtime = RecordingRecoveryRuntime(
-            ScenarioObservation("sha256:" + "b" * 64)
-        )
+        runtime = RecordingRecoveryRuntime(ScenarioObservation("sha256:" + "b" * 64))
 
         with self.assertRaises(RecoveryError) as raised:
             self._service(runtime).verify(
@@ -164,9 +162,7 @@ class RecoveryVerificationServiceTests(unittest.TestCase):
 
     def test_resolved_retry_with_same_key_does_not_reinvoke_runtime(self):
         attempt = self._ready()
-        runtime = RecordingRecoveryRuntime(
-            ScenarioObservation("sha256:" + "b" * 64)
-        )
+        runtime = RecordingRecoveryRuntime(ScenarioObservation("sha256:" + "b" * 64))
         service = self._service(runtime)
 
         first = service.verify(self.user, attempt.attempt_id, key="recovery-retry")

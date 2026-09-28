@@ -101,7 +101,9 @@ class DiskFullBootstrapRuntimeTests(unittest.TestCase):
             profile(),
             BINDING,
             "operation-789",
-            lambda container_id: (_ for _ in ()).throw(DockerError("OWNERSHIP_MISMATCH")),
+            lambda container_id: (_ for _ in ()).throw(
+                DockerError("OWNERSHIP_MISMATCH")
+            ),
         )
 
         with self.assertRaisesRegex(DockerError, "^OWNERSHIP_MISMATCH$"):

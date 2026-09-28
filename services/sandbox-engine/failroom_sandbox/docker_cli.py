@@ -215,9 +215,7 @@ class DockerCli:
     def inspect_image(self, image: str) -> dict[str, object]:
         if (
             type(image) is not str
-            or re.fullmatch(
-                r"(?:[a-z0-9][a-z0-9./:_-]*@)?sha256:[a-f0-9]{64}", image
-            )
+            or re.fullmatch(r"(?:[a-z0-9][a-z0-9./:_-]*@)?sha256:[a-f0-9]{64}", image)
             is None
         ):
             raise DockerError("INVALID_DOCKER_REQUEST")
@@ -282,7 +280,9 @@ class DockerCli:
             )
         )
 
-    def workspace_available_bytes(self, container_id: str, *, uid: int, gid: int) -> int:
+    def workspace_available_bytes(
+        self, container_id: str, *, uid: int, gid: int
+    ) -> int:
         _container_selector(container_id)
         result = self._call(
             (
@@ -316,9 +316,7 @@ class DockerCli:
         )
         return _bounded_decimal(result.stdout, header=None, allow_zero=False)
 
-    def disk_full_filler_absent(
-        self, container_id: str, *, uid: int, gid: int
-    ) -> bool:
+    def disk_full_filler_absent(self, container_id: str, *, uid: int, gid: int) -> bool:
         """Check the fixed filler path without accepting daemon errors as absence."""
 
         _container_selector(container_id)
@@ -345,31 +343,38 @@ class DockerCli:
         raise DockerError("RUNTIME_UNAVAILABLE")
 
     def disk_full_target_initialization_failed(self, container_id: str) -> bool:
-        return not self._disk_full_target_result(
-            container_id, action="initialize"
-        )
+        return not self._disk_full_target_result(container_id, action="initialize")
 
     def start_disk_full_target(self, container_id: str) -> None:
         _container_selector(container_id)
         self._call(
             (
-                "container", "exec", "--detach", "--user", _TARGET_SUPERVISOR_USER,
-                container_id, "/usr/local/bin/failroom-disk-target", "run",
+                "container",
+                "exec",
+                "--detach",
+                "--user",
+                _TARGET_SUPERVISOR_USER,
+                container_id,
+                "/usr/local/bin/failroom-disk-target",
+                "run",
             )
         )
 
     def disk_full_target_healthy(self, container_id: str) -> bool:
-        return self._disk_full_target_result(
-            container_id, action="status"
-        )
+        return self._disk_full_target_result(container_id, action="status")
 
-    def _disk_full_target_result(
-        self, container_id: str, *, action: str
-    ) -> bool:
+    def _disk_full_target_result(self, container_id: str, *, action: str) -> bool:
         _container_selector(container_id)
         result = self._call(
-            ("container", "exec", "--user", _TARGET_SUPERVISOR_USER, container_id,
-             "/usr/local/bin/failroom-disk-target", action),
+            (
+                "container",
+                "exec",
+                "--user",
+                _TARGET_SUPERVISOR_USER,
+                container_id,
+                "/usr/local/bin/failroom-disk-target",
+                action,
+            ),
             allow_failure=True,
         )
         if result.stdout or result.stderr:

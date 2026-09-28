@@ -65,7 +65,9 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
     ) -> dict[str, object]:
         deadline = time.monotonic() + 5
         while True:
-            response = client.get("/v1/attempts/" + attempt_id + "/status", headers=headers)
+            response = client.get(
+                "/v1/attempts/" + attempt_id + "/status", headers=headers
+            )
             if response.status_code == 200 and response.json().get("state") == expected:
                 return response.json()
             if time.monotonic() >= deadline:
@@ -159,9 +161,7 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
                     },
                 )
                 self.assertEqual(unrecovered.status_code, 409)
-                self.assertEqual(
-                    unrecovered.json(), {"code": "RECOVERY_NOT_VERIFIED"}
-                )
+                self.assertEqual(unrecovered.json(), {"code": "RECOVERY_NOT_VERIFIED"})
                 status = client.get(
                     "/v1/attempts/" + attempt_id + "/status", headers=headers
                 )

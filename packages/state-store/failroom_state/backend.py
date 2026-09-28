@@ -110,9 +110,7 @@ class BackendStore:
         with self._database._transaction() as connection:
             return attempt_record(owned(connection, identity, attempt_id))
 
-    def room_id_for_binding(
-        self, identity: ServiceIdentity, ref: ResourceRef
-    ) -> str:
+    def room_id_for_binding(self, identity: ServiceIdentity, ref: ResourceRef) -> str:
         """Read the trusted Room selector for the exact current resource binding."""
         service(identity, Role.BACKEND, Action.CREATE)
         ref_valid(ref)

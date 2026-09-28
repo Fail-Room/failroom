@@ -365,7 +365,9 @@ class LinuxControlPlaneIntegrationTests(unittest.TestCase):
                 self.inspect_cli.list_containers(_exact_label_filters(old_binding)), ()
             )
             self.assertEqual(
-                self.inspect_cli.list_containers(_exact_label_filters(candidate_binding)),
+                self.inspect_cli.list_containers(
+                    _exact_label_filters(candidate_binding)
+                ),
                 (),
             )
         finally:

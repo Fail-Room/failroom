@@ -258,7 +258,9 @@ class CapabilityHttpTests(unittest.TestCase):
         self.assertEqual(set(response.json()), {"capability", "expires_at"})
         self.assertNotIn("sandbox_id", response.json())
 
-    def test_recovery_endpoint_requires_idempotency_and_returns_only_safe_status(self) -> None:
+    def test_recovery_endpoint_requires_idempotency_and_returns_only_safe_status(
+        self,
+    ) -> None:
         attempt_id = self._ready()
 
         missing_key = self.client.post(

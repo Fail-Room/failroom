@@ -132,7 +132,10 @@ class LinuxDiskFullIntegrationTests(unittest.TestCase):
             timeout=float(_required("FAILROOM_DOCKER_TIMEOUT_SECONDS")),
         )
         image_id = result.stdout.decode("ascii", errors="ignore").strip()
-        if result.returncode != 0 or re.fullmatch(r"sha256:[a-f0-9]{64}", image_id) is None:
+        if (
+            result.returncode != 0
+            or re.fullmatch(r"sha256:[a-f0-9]{64}", image_id) is None
+        ):
             self.fail("TARGET_IMAGE_BUILD_FAILED")
         return image_id
 
@@ -227,7 +230,9 @@ class LinuxDiskFullIntegrationTests(unittest.TestCase):
                 receipt.ref.sandbox_id,
                 receipt.ref.generation,
             )
-            self.assertEqual(self.cli.list_containers(_exact_label_filters(binding)), ())
+            self.assertEqual(
+                self.cli.list_containers(_exact_label_filters(binding)), ()
+            )
         finally:
             if receipt is not None:
                 resource = self.control.inspect(self.control_identity, receipt.ref)
