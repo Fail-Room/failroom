@@ -95,7 +95,8 @@ def _assert_hardening(
     test_case.assertEqual(config["User"], f"{profile.uid}:{profile.gid}")
     test_case.assertEqual(host["NetworkMode"], "none")
     test_case.assertIsNone(host["Binds"])
-    test_case.assertIsNone(host["Mounts"])
+    # Docker Desktop omits an empty HostConfig.Mounts; a present value must be null.
+    test_case.assertIsNone(host.get("Mounts"))
     test_case.assertIsNone(host["VolumesFrom"])
     test_case.assertEqual(host["Devices"], [])
     test_case.assertIsNone(host["DeviceRequests"])
@@ -113,14 +114,17 @@ def _assert_hardening(
             ),
         },
     )
-    test_case.assertEqual(
-        mounts,
-        [
-            {"Type": "tmpfs", "Destination": "/workspace", "Source": ""},
-            {"Type": "tmpfs", "Destination": "/tmp", "Source": ""},
-            {"Type": "tmpfs", "Destination": "/run/failroom-target", "Source": ""},
-        ],
-    )
+    expected_mounts = [
+        {"Type": "tmpfs", "Destination": "/workspace", "Source": ""},
+        {"Type": "tmpfs", "Destination": "/tmp", "Source": ""},
+        {"Type": "tmpfs", "Destination": "/run/failroom-target", "Source": ""},
+    ]
+    # Docker Desktop lists no tmpfs entries here; HostConfig.Tmpfs above stays
+    # the exact tmpfs contract, and any listed mount must be exactly these.
+    if mounts:
+        test_case.assertEqual(mounts, expected_mounts)
+    else:
+        test_case.assertEqual(mounts, [])
     test_case.assertNotIn("docker.sock", repr(data))
 
 

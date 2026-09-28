@@ -292,13 +292,20 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
                             "type": "input",
                             "data": (
                                 "rm -- /workspace/.failroom-disk-full && "
-                                + "printf '"
+                                + "printf '\\033[32m"
                                 + marker
-                                + "\\n'\n"
+                                + "\\033[0m\\n'\n"
                             ),
                         }
                     )
-                    self.assertIn(marker, self._receive_until(socket, marker))
+                    # The echoed command also contains the marker; only the
+                    # printf that runs after a successful rm emits the ANSI byte.
+                    self.assertIn(
+                        marker,
+                        self._receive_until(
+                            socket, marker, required_fragment="\x1b[32m"
+                        ),
+                    )
                     socket.send_json({"type": "close"})
 
                 recovered = client.post(
@@ -320,7 +327,9 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
                         },
                     )
                     self.assertEqual(left.status_code, 202)
-                    self.assertEqual(left.json()["state"], "STOPPING")
+                    # Leave runs one bounded cleanup pass, which may already
+                    # finish destruction; either way it must end DESTROYED.
+                    self.assertIn(left.json()["state"], {"STOPPING", "DESTROYED"})
                     self.assertTrue(left.json()["destroy_intent"])
                     destroyed = self._wait_for_attempt_state(
                         client, attempt_id, headers, "DESTROYED"
