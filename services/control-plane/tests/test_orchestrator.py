@@ -84,7 +84,11 @@ class FakeRuntime:
         self.lifetimes.append(lifetime)
         self.calls.append("open")
         try:
-            yield FakeDiskFullSession(self) if self.bootstrap_enabled else FakeSession(self)
+            yield (
+                FakeDiskFullSession(self)
+                if self.bootstrap_enabled
+                else FakeSession(self)
+            )
         finally:
             self.calls.append("close")
 

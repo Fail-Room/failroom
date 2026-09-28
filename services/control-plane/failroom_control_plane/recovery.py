@@ -119,9 +119,7 @@ class RecoveryVerificationService:
             or not {Action.CREATE, Action.PUBLISH}.issubset(backend_identity.scopes)
             or type(control_identity) is not ServiceIdentity
             or control_identity.role is not Role.CONTROL_PLANE
-            or not {Action.INSPECT, Action.TRANSITION}.issubset(
-                control_identity.scopes
-            )
+            or not {Action.INSPECT, Action.TRANSITION}.issubset(control_identity.scopes)
             or not callable(now)
         ):
             raise RecoveryError("INVALID_REQUEST")
@@ -132,7 +130,9 @@ class RecoveryVerificationService:
         self._control_identity = control_identity
         self._now = now
 
-    def verify(self, identity: UserIdentity, attempt_id: str, *, key: str) -> RoomStatus:
+    def verify(
+        self, identity: UserIdentity, attempt_id: str, *, key: str
+    ) -> RoomStatus:
         try:
             context = self._context(identity, attempt_id)
             attempt, resource = context.attempt, context.resource
@@ -218,9 +218,7 @@ class RecoveryVerificationService:
             room_id,
         )
 
-    def _verify_runtime(
-        self, room_id: str, resource: Resource
-    ) -> ScenarioObservation:
+    def _verify_runtime(self, room_id: str, resource: Resource) -> ScenarioObservation:
         if (
             type(resource.runtime_operation_id) is not str
             or type(resource.container_id) is not str

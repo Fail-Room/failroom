@@ -21,9 +21,7 @@ _DISK_FULL_DECLARATION = {
 class RoomScenarioRegistry:
     """Resolve only reviewed Room IDs to declarative trusted scenarios."""
 
-    def resolve(
-        self, room_id: str, *, workspace_bytes: int
-    ) -> DiskFullScenario | None:
+    def resolve(self, room_id: str, *, workspace_bytes: int) -> DiskFullScenario | None:
         if room_id != "disk-full":
             return None
         return parse_disk_full_scenario(

@@ -65,8 +65,9 @@ class DockerCliTests(unittest.TestCase):
                 "path": "/workspace/../tmp/a",
             },
         ):
-            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(
-                DockerError, "^INVALID_DOCKER_REQUEST$"
+            with (
+                self.subTest(kwargs=kwargs),
+                self.assertRaisesRegex(DockerError, "^INVALID_DOCKER_REQUEST$"),
             ):
                 cli.allocate_workspace_file("a" * 64, **kwargs)
 
@@ -153,9 +154,7 @@ class DockerCliTests(unittest.TestCase):
             context="desktop-linux", timeout=5, max_output_bytes=1024, runner=runner
         )
 
-        self.assertTrue(
-            cli.disk_full_filler_absent("a" * 64, uid=1000, gid=1000)
-        )
+        self.assertTrue(cli.disk_full_filler_absent("a" * 64, uid=1000, gid=1000))
         self.assertEqual(
             calls,
             [
@@ -195,17 +194,32 @@ class DockerCliTests(unittest.TestCase):
 
     def test_uses_fixed_target_service_exec_argv(self):
         calls = []
-        results = iter((ProcessResult(1, b"", b""), ProcessResult(0, b"", b""), ProcessResult(0, b"", b"")))
-        cli = DockerCli(context="desktop-linux", timeout=5, max_output_bytes=1024, runner=lambda argv, **kwargs: (calls.append(argv), next(results))[1])
+        results = iter(
+            (
+                ProcessResult(1, b"", b""),
+                ProcessResult(0, b"", b""),
+                ProcessResult(0, b"", b""),
+            )
+        )
+        cli = DockerCli(
+            context="desktop-linux",
+            timeout=5,
+            max_output_bytes=1024,
+            runner=lambda argv, **kwargs: (calls.append(argv), next(results))[1],
+        )
 
         self.assertTrue(cli.disk_full_target_initialization_failed("a" * 64))
         cli.start_disk_full_target("a" * 64)
         self.assertTrue(cli.disk_full_target_healthy("a" * 64))
 
-        self.assertEqual(calls[0][-2:], ("/usr/local/bin/failroom-disk-target", "initialize"))
+        self.assertEqual(
+            calls[0][-2:], ("/usr/local/bin/failroom-disk-target", "initialize")
+        )
         self.assertEqual(calls[0][5:7], ("--user", "0:0"))
         self.assertEqual(calls[1][4:8], ("exec", "--detach", "--user", "0:0"))
-        self.assertEqual(calls[2][-2:], ("/usr/local/bin/failroom-disk-target", "status"))
+        self.assertEqual(
+            calls[2][-2:], ("/usr/local/bin/failroom-disk-target", "status")
+        )
         self.assertEqual(calls[2][5:7], ("--user", "0:0"))
 
     def test_process_timeout_and_output_limit_are_enforced(self):
@@ -275,7 +289,10 @@ class DockerCliTests(unittest.TestCase):
 
         cli.inspect_image(image_id)
 
-        self.assertEqual(calls, [("docker", "--context", "desktop-linux", "image", "inspect", image_id)])
+        self.assertEqual(
+            calls,
+            [("docker", "--context", "desktop-linux", "image", "inspect", image_id)],
+        )
 
     def test_runner_errors_do_not_expose_paths_or_output(self):
         def fail(*args, **kwargs):
