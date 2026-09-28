@@ -67,6 +67,7 @@ class DockerRuntimeAdapterTests(unittest.TestCase):
             filler_path="/workspace/.failroom-disk-full",
             filler_bytes=60_000_000,
             recovery_free_bytes=8_000_000,
+            target_working_set_bytes=8_000_000,
         )
 
         @contextmanager
@@ -112,6 +113,7 @@ class DockerRuntimeAdapterTests(unittest.TestCase):
             filler_path="/workspace/.failroom-disk-full",
             filler_bytes=60_000_000,
             recovery_free_bytes=8_000_000,
+            target_working_set_bytes=8_000_000,
         )
         operation.verify_disk_full_recovery.assert_called_once_with("c" * 64, scenario)
 

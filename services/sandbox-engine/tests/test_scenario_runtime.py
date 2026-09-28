@@ -12,6 +12,7 @@ SCENARIO = DiskFullScenario(
     filler_path="/workspace/.failroom-disk-full",
     filler_bytes=60_000_000,
     recovery_free_bytes=8_000_000,
+    target_working_set_bytes=8_000_000,
 )
 
 
@@ -28,6 +29,7 @@ def profile() -> StrictDockerProfile:
         pids_limit=64,
         workspace_tmpfs_bytes=67_108_864,
         temp_tmpfs_bytes=16_777_216,
+        target_supervisor_tmpfs_bytes=1_048_576,
         shm_size_bytes=16_777_216,
         fd_limit=256,
         io_device_path="/dev/loop0",
@@ -44,9 +46,16 @@ class DiskFullBootstrapRuntimeTests(unittest.TestCase):
     def test_rechecks_the_exact_running_binding_around_fixed_allocation(self):
         events: list[str] = []
 
+        results = iter((ProcessResult(0, b"", b""), ProcessResult(1, b"", b"")))
+
         def runner(argv, **kwargs):
-            events.append("allocate")
-            return ProcessResult(0, b"", b"")
+            del kwargs
+            events.append(
+                "target-initialize"
+                if argv[-2:] == ("/usr/local/bin/failroom-disk-target", "initialize")
+                else "allocate"
+            )
+            return next(results)
 
         def inspect(container_id: str) -> dict[str, object]:
             self.assertEqual(container_id, CID)
@@ -68,7 +77,10 @@ class DiskFullBootstrapRuntimeTests(unittest.TestCase):
 
         observation = runtime.apply(CID, SCENARIO)
 
-        self.assertEqual(events, ["inspect", "allocate", "inspect"])
+        self.assertEqual(
+            events,
+            ["inspect", "allocate", "target-initialize", "inspect"],
+        )
         self.assertRegex(observation.evidence_digest, r"^sha256:[a-f0-9]{64}$")
 
     def test_rejects_a_foreign_binding_before_any_allocation(self):
@@ -122,11 +134,22 @@ class DiskFullBootstrapRuntimeTests(unittest.TestCase):
 
     def test_recovery_requires_absent_filler_and_threshold_between_exact_checks(self):
         events: list[str] = []
-        results = iter((ProcessResult(0, b"", b""), ProcessResult(0, b"Avail\n8000000\n", b"")))
+        results = iter(
+            (
+                ProcessResult(0, b"", b""),
+                ProcessResult(0, b"Avail\n8000000\n", b""),
+                ProcessResult(0, b"", b""),
+                ProcessResult(0, b"", b""),
+            )
+        )
 
         def runner(argv, **kwargs):
             del kwargs
-            events.append(argv[-1])
+            events.append(
+                argv[-1]
+                if argv[-2] != "/usr/local/bin/failroom-disk-target"
+                else "target-" + argv[-1]
+            )
             return next(results)
 
         def inspect(container_id: str) -> dict[str, object]:
@@ -151,9 +174,51 @@ class DiskFullBootstrapRuntimeTests(unittest.TestCase):
 
         self.assertEqual(
             events,
-            ["inspect", "/workspace/.failroom-disk-full", "/workspace", "inspect"],
+            [
+                "inspect",
+                "/workspace/.failroom-disk-full",
+                "/workspace",
+                "target-run",
+                "target-status",
+                "inspect",
+            ],
         )
         self.assertRegex(observation.evidence_digest, r"^sha256:[a-f0-9]{64}$")
+
+    def test_recovery_rejects_a_target_that_is_not_healthy(self):
+        results = iter(
+            (
+                ProcessResult(0, b"", b""),
+                ProcessResult(0, b"Avail\n8000000\n", b""),
+                ProcessResult(0, b"", b""),
+                ProcessResult(1, b"", b""),
+            )
+        )
+        calls: list[tuple[str, ...]] = []
+        runtime = DiskFullBootstrapRuntime(
+            DockerCli(
+                context="desktop-linux",
+                timeout=5,
+                max_output_bytes=1024,
+                runner=lambda argv, **kwargs: (calls.append(argv), next(results))[1],
+            ),
+            profile(),
+            BINDING,
+            "operation-789",
+            lambda container_id: {"State": {"Running": container_id == CID}},
+        )
+
+        with self.assertRaisesRegex(DockerError, "^PROFILE_UNVERIFIED$"):
+            runtime.verify_recovery(CID, SCENARIO)
+
+        self.assertEqual(
+            calls[-2][-2:],
+            ("/usr/local/bin/failroom-disk-target", "run"),
+        )
+        self.assertEqual(
+            calls[-1][-2:],
+            ("/usr/local/bin/failroom-disk-target", "status"),
+        )
 
 
 if __name__ == "__main__":

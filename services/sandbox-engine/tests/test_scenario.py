@@ -3,6 +3,7 @@ from dataclasses import FrozenInstanceError
 
 from failroom_sandbox.scenario import (
     DISK_FULL_FILLER_PATH,
+    DISK_FULL_TARGET_WORKING_SET_BYTES,
     DiskFullScenario,
     ScenarioError,
     parse_disk_full_scenario,
@@ -16,6 +17,7 @@ class DiskFullScenarioTests(unittest.TestCase):
             "version": "disk-full-v1",
             "filler_bytes": 60_000_000,
             "recovery_free_bytes": 8_000_000,
+            "target_working_set_bytes": 8_000_000,
         }
 
     def test_parses_the_fixed_minimal_declaration(self) -> None:
@@ -29,10 +31,15 @@ class DiskFullScenarioTests(unittest.TestCase):
                 filler_path=DISK_FULL_FILLER_PATH,
                 filler_bytes=60_000_000,
                 recovery_free_bytes=8_000_000,
+                target_working_set_bytes=8_000_000,
             ),
         )
         with self.assertRaises(FrozenInstanceError):
             scenario.filler_bytes = 1
+        self.assertEqual(
+            scenario.target_working_set_bytes,
+            DISK_FULL_TARGET_WORKING_SET_BYTES,
+        )
 
     def test_rejects_executable_or_unbounded_declaration_fields(self) -> None:
         invalid = (
@@ -42,7 +49,14 @@ class DiskFullScenarioTests(unittest.TestCase):
             {**self.declaration, "filler_bytes": self.workspace_bytes},
             {**self.declaration, "recovery_free_bytes": 0},
             {**self.declaration, "recovery_free_bytes": self.workspace_bytes},
-            {"version": "disk-full-v1", "filler_bytes": 60_000_000},
+            {**self.declaration, "target_working_set_bytes": 0},
+            {**self.declaration, "target_working_set_bytes": 7_000_000},
+            {**self.declaration, "target_working_set_bytes": 8_000_001},
+            {
+                "version": "disk-full-v1",
+                "filler_bytes": 60_000_000,
+                "recovery_free_bytes": 8_000_000,
+            },
             {**self.declaration, "version": "disk-full-v2"},
         )
 

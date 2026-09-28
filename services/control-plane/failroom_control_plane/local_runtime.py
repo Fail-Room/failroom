@@ -176,6 +176,9 @@ class LocalRuntimeConfig:
                     values, "FAILROOM_WORKSPACE_TMPFS_BYTES"
                 ),
                 temp_tmpfs_bytes=_integer(values, "FAILROOM_TEMP_TMPFS_BYTES"),
+                target_supervisor_tmpfs_bytes=_integer(
+                    values, "FAILROOM_TARGET_SUPERVISOR_TMPFS_BYTES"
+                ),
                 shm_size_bytes=_integer(values, "FAILROOM_SHM_BYTES"),
                 fd_limit=_integer(values, "FAILROOM_FD_LIMIT"),
                 io_device_path=_required(values, "FAILROOM_IO_DEVICE"),
