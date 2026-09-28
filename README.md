@@ -34,7 +34,7 @@ The intended terminal path is:
 
 `Browser → xterm.js → authorized WebSocket → terminal gateway → PTY → isolated Linux sandbox`
 
-The planned architecture uses Next.js with xterm.js for the browser interface and FastAPI for backend authorization and control. It separates those layers from the terminal gateway, trusted sandbox control plane, untrusted user sandbox, and Room scenario definitions. Internal profile qualification, the verified diagnostic Docker lifecycle, the trusted in-process control-plane composition, the bounded signed capability codec, the consumed attachment-lease contract, and SQLite state modules are implemented. The control plane enforces explicit configuration, state-before-runtime ordering, persisted runtime bindings, operator-only migration, and evidence-gated cleanup for the diagnostic slice; no HTTP authentication or learner runtime is connected.
+The planned architecture uses Next.js with xterm.js for the browser interface and FastAPI for backend authorization and control. It separates those layers from the terminal gateway, trusted sandbox control plane, untrusted user sandbox, and Room scenario definitions. Internal profile qualification, the verified diagnostic Docker lifecycle, the trusted in-process control-plane composition, the bounded signed capability codec, the consumed attachment-lease contract, and SQLite state modules are implemented. The control plane enforces explicit configuration, state-before-runtime ordering, persisted runtime bindings, operator-only migration, and evidence-gated cleanup. It also runs an operator-only local runtime that serves Enter Room, Room Status, a real PTY terminal over WebSocket, Reset Room, recovery verification, and Leave Room for the Disk Full Room on a loopback address with one local bearer credential. The browser interface remains planned.
 
 ## Security Boundary
 
@@ -44,7 +44,9 @@ As a product design objective, failures should have real consequences inside a R
 
 ## Current Development Status
 
-Phase 0 established documentation and repository rules. Phase 1 now includes a tested profile qualification gate, a verified diagnostic Docker lifecycle, a transactional SQLite state store, a trusted in-process control-plane composition, a bounded capability codec, and an atomic attachment-lease contract with explicit v2-to-v3 migration. These are internal contracts, not a public HTTP API or learner allocator. Real Docker integration remains opt-in and UNVERIFIED in the current Windows environment; there is still no runnable web application, learner terminal, authentication endpoint, or deployment.
+Phase 0 established documentation and repository rules. The repository now contains a tested profile qualification gate, a verified diagnostic Docker lifecycle, a transactional SQLite state store with explicit migrations through v4, a trusted control-plane composition, a bounded capability codec, an atomic attachment-lease contract, Reset Room, and the Disk Full scenario. The control plane's operator-only local runtime connects them into a loopback HTTP and WebSocket path to a real PTY.
+
+That runtime provisions sandboxes without a qualification report, so it is a local proof of concept for the operator on their own host, not a learner-facing service. A trusted qualification collector and allocation gate are the next required step. Real Docker evidence comes from opt-in tests on a trusted Linux controller and is UNVERIFIED on Windows. There is still no web application, browser terminal, production authentication, or deployment.
 
 ## Roadmap
 
@@ -64,7 +66,7 @@ Phase 0 established documentation and repository rules. Phase 1 now includes a t
 
 ## Local Development
 
-The [sandbox engine](services/sandbox-engine/README.md), [state store](packages/state-store/README.md), [control plane](services/control-plane/README.md), and [API contract package](services/api/README.md) are Python 3.12 modules with reproducible test, lint, format, and type checks. Docker and control-plane integration are opt-in and require a trusted Linux host with explicit operator inputs. Web, HTTP API, learner runtime and terminal setup remain planned.
+The [sandbox engine](services/sandbox-engine/README.md), [state store](packages/state-store/README.md), [control plane](services/control-plane/README.md), and [API contract package](services/api/README.md) are Python 3.12 modules with reproducible test, lint, format, and type checks. Docker and control-plane integration are opt-in and require a trusted Linux host with explicit operator inputs. The control-plane README also documents the operator-only local runtime and its limitations. A web interface and learner-facing setup remain planned.
 
 ## Contributing
 
