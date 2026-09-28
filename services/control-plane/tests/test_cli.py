@@ -220,6 +220,7 @@ class MigrationCliTests(unittest.TestCase):
 
         self.assertEqual((result, stdout, stderr), (2, "", "RUNTIME_UNAVAILABLE\n"))
 
+    @unittest.skipUnless(sys.platform == "linux", "Linux ownership evidence required")
     def test_verify_local_loads_explicit_operator_environment_file(self) -> None:
         environment_file = Path(self.temp.name) / "operator.env"
         environment_file.write_text("FAILROOM_LOCAL_BIND_HOST=127.0.0.1\n")

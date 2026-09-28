@@ -500,9 +500,9 @@ class DockerLifecycleTests(unittest.TestCase):
         self.assertRegex(result, r"^sha256:[0-9a-f]{64}$")
 
     def test_docker_desktop_inline_seccomp_matches_pinned_policy(self):
-        with tempfile.NamedTemporaryFile("wb") as policy_file:
+        with tempfile.NamedTemporaryFile("wb", delete_on_close=False) as policy_file:
             policy_file.write(self.seccomp_policy.encode("utf-8"))
-            policy_file.flush()
+            policy_file.close()
             self.policy.path = policy_file.name
             self.engine.resource["HostConfig"]["SecurityOpt"][1] = (
                 "seccomp="
@@ -513,9 +513,9 @@ class DockerLifecycleTests(unittest.TestCase):
         self.assertTrue(result.running)
 
     def test_docker_desktop_inline_seccomp_drift_is_rejected(self):
-        with tempfile.NamedTemporaryFile("wb") as policy_file:
+        with tempfile.NamedTemporaryFile("wb", delete_on_close=False) as policy_file:
             policy_file.write(self.seccomp_policy.encode("utf-8"))
-            policy_file.flush()
+            policy_file.close()
             self.policy.path = policy_file.name
             self.engine.resource["HostConfig"]["SecurityOpt"][1] = (
                 'seccomp={"defaultAction":"SCMP_ACT_ALLOW"}'

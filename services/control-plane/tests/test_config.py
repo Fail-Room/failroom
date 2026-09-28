@@ -1,22 +1,45 @@
 import hashlib
 import unittest
-from dataclasses import replace
 from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 
-import test_docker_profile
 from failroom_sandbox.docker_profile import StrictDockerProfile
 
 from failroom_control_plane.config import ConfigurationError, ControllerConfig
 
+_POLICY = '{"defaultAction":"SCMP_ACT_ERRNO"}'
+
+
+def profile() -> StrictDockerProfile:
+    return StrictDockerProfile(
+        image="registry.example.com:5000/failroom/diagnostic@sha256:" + "a" * 64,
+        uid=10001,
+        gid=10001,
+        seccomp_path="/etc/failroom/seccomp.json",
+        seccomp_digest="sha256:" + hashlib.sha256(_POLICY.encode()).hexdigest(),
+        cpu_limit=Decimal("0.5"),
+        memory_limit_bytes=134_217_728,
+        memory_swap_limit_bytes=134_217_728,
+        pids_limit=64,
+        workspace_tmpfs_bytes=67_108_864,
+        temp_tmpfs_bytes=16_777_216,
+        target_supervisor_tmpfs_bytes=1_048_576,
+        shm_size_bytes=16_777_216,
+        fd_limit=256,
+        io_device_path="/dev/loop0",
+        io_read_bps=1_048_576,
+        io_write_bps=1_048_576,
+        terminal_output_limit_bytes=1_048_576,
+        connection_limit=1,
+        session_limit=1,
+        absolute_ttl_seconds=300,
+    )
+
 
 class ControllerConfigTests(unittest.TestCase):
     def setUp(self) -> None:
-        policy = '{"defaultAction":"SCMP_ACT_ERRNO"}'
-        self.profile = replace(
-            test_docker_profile.DockerProfileTests()._profile(),
-            seccomp_digest="sha256:" + hashlib.sha256(policy.encode()).hexdigest(),
-        )
+        self.profile = profile()
         self.database_path = Path.cwd() / "private-state" / "failroom.sqlite3"
         self.seccomp_store = Path.cwd() / "private-state" / "seccomp"
 

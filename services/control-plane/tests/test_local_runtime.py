@@ -1,5 +1,6 @@
 import hashlib
 import os
+import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -46,7 +47,7 @@ class LocalRuntimeConfigTests(unittest.TestCase):
             "33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517",
             "FAILROOM_DOCKER_UID": "1000",
             "FAILROOM_DOCKER_GID": "1000",
-            "FAILROOM_SECCOMP_PATH": str(root / "seccomp-default.json"),
+            "FAILROOM_SECCOMP_PATH": "/etc/failroom/seccomp/default.json",
             "FAILROOM_SECCOMP_DIGEST": "sha256:" + "a" * 64,
             "FAILROOM_CPU_LIMIT": "1",
             "FAILROOM_MEMORY_BYTES": "536870912",
@@ -117,6 +118,7 @@ class LocalRuntimeConfigTests(unittest.TestCase):
         )
         self.assertNotIn(token, repr(config))
 
+    @unittest.skipUnless(sys.platform == "linux", "Linux seccomp policy store required")
     def test_builds_distinct_service_identities(self) -> None:
         with patch.dict(os.environ, self.environment, clear=True):
             config = LocalRuntimeConfig.from_environment()
@@ -139,6 +141,7 @@ class LocalRuntimeConfigTests(unittest.TestCase):
         self.assertIs(failroom_control_plane.LocalRuntimeError, LocalRuntimeError)
         self.assertIs(failroom_control_plane.build_runtime, build_runtime)
 
+    @unittest.skipUnless(sys.platform == "linux", "Linux seccomp policy store required")
     def test_runtime_app_runs_maintenance_at_listener_boundaries(self) -> None:
         with patch.dict(os.environ, self.environment, clear=True):
             config = LocalRuntimeConfig.from_environment()
@@ -186,6 +189,7 @@ class LocalRuntimeConfigTests(unittest.TestCase):
             ],
         )
 
+    @unittest.skipUnless(sys.platform == "linux", "Linux seccomp policy store required")
     def test_build_runtime_runs_preflight_before_constructing_application(self) -> None:
         with patch.dict(os.environ, self.environment, clear=True):
             config = LocalRuntimeConfig.from_environment()
