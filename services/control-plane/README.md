@@ -88,12 +88,12 @@ as fatal: it closes the connection and the PTY session.
 ## Local runtime (operator-only proof of concept)
 
 > **Limitation:** the local runtime provisions Disk Full Room sandboxes through
-> the diagnostic Docker lifecycle without collecting or checking a
-> qualification report before allocation. It therefore does not meet the
-> qualification requirement in [SECURITY.md](../../docs/SECURITY.md). Use it only
-> as the local operator on your own host, and do not offer it to learners or
-> other users. A trusted qualification collector and allocation gate remain
-> planned.
+> the diagnostic Docker lifecycle without checking a qualification report
+> before allocation. It therefore does not meet the qualification requirement
+> in [SECURITY.md](../../docs/SECURITY.md). Use it only as the local operator on
+> your own host, and do not offer it to learners or other users.
+> `qualify-local` collects a report but does not gate allocation; collecting
+> its scenario checks and the allocation gate remain planned.
 
 `failroom-control-plane serve-local` composes the state store, the Docker
 lifecycle and PTY adapters, the capability authority, and the HTTP/WebSocket
@@ -114,6 +114,24 @@ routes into one process:
 normal shutdown. Neither command prints configuration values, paths, or
 credentials; a failure prints one fixed code to standard error and exits with
 status 2.
+
+`failroom-control-plane qualify-local` performs steps 1 and 2, then collects
+one qualification report and prints it. It needs every setting below and
+`FAILROOM_QUALIFICATION_MAX_AGE_SECONDS`. It removes stopped sandboxes a
+crashed collection left behind, creates a sentinel and a probe sandbox with the
+strict profile, runs the fixed probe, judges the twelve container checks, and
+removes both sandboxes before printing. The six scenario checks (terminal
+output, connection and session limits, absolute TTL, disconnect cleanup and
+restart cleanup) are reported `UNVERIFIED` with `reason=NOT_COLLECTED` until
+they are collected, so the report does not pass yet. The output is one
+`QUALIFICATION_CONTEXT` line with the engine ID, boot ID, daemon epoch and
+digests; one `CHECK <check> <outcome> <observed_at> <evidence digest>` line per
+check, with a fixed `reason=` code when it does not pass; and
+`QUALIFICATION_PASSED` or `QUALIFICATION_DENIED <code:check>...`. It exits with
+status 0 when the report passes, 3 when it does not, and 2 with one fixed code
+on a configuration, runtime or cleanup failure. It stores nothing, and
+`serve-local` still allocates without a report. One collection took about 8
+seconds on Docker Desktop 29.4.2.
 
 The runtime binds only to `127.0.0.1` or `::1` and accepts exactly one bearer
 token, which it keeps only as a SHA-256 digest. The token authenticates one
@@ -181,6 +199,7 @@ by `StrictDockerProfile` as described in the
 | `FAILROOM_TERMINAL_OUTPUT_BYTES` | Cumulative terminal output limit, at most 1048576 because the WebSocket relay uses the same limit. |
 | `FAILROOM_CONNECTION_LIMIT`, `FAILROOM_SESSION_LIMIT` | Concurrent authorized terminal connections and open PTY sessions allowed per sandbox generation; a connection beyond either is closed with `4429`. |
 | `FAILROOM_ABSOLUTE_TTL_SECONDS` | Absolute attempt lifetime. The container's PID 1 exits no later than the attempt deadline. |
+| `FAILROOM_QUALIFICATION_MAX_AGE_SECONDS` | Required only by `qualify-local`: report validity, 60–86400 seconds. The collector's sentinel sandbox lives this long, capped by the absolute lifetime. |
 | `FAILROOM_TERMINAL_INPUT_BYTES` | Largest input frame, 1–1048576 and not larger than the frame limit. |
 | `FAILROOM_TERMINAL_SESSION_SECONDS` | Wall-clock PTY session limit, 1–3600. |
 | `FAILROOM_TERMINAL_ROWS`, `FAILROOM_TERMINAL_COLUMNS` | Largest accepted resize, 1–500 rows and 1–1000 columns. |
@@ -312,6 +331,7 @@ export FAILROOM_TERMINAL_OUTPUT_BYTES=1048576
 export FAILROOM_CONNECTION_LIMIT=4
 export FAILROOM_SESSION_LIMIT=1
 export FAILROOM_ABSOLUTE_TTL_SECONDS=300
+export FAILROOM_QUALIFICATION_MAX_AGE_SECONDS=3600
 ```
 
 The terminal and local runtime tests also need the terminal and capability
@@ -351,6 +371,7 @@ export FAILROOM_MAINTENANCE_LIMIT=10
 | `test_linux_docker_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Provisioning through the orchestrator, container hardening, Docker's init as PID 1 from a read-only mount, Leave and Reset cleanup with every generation absent afterwards, and a PID 1 that outlives 60 seconds and stops by the attempt deadline |
 | `test_linux_disk_full_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | The Disk Full filler reduces workspace capacity and recovery restores it; the test builds the Disk Full image itself |
 | `test_linux_terminal_integration.py` | `FAILROOM_TERMINAL_INTEGRATION=1` | Input and output, ANSI bytes, resize, Ctrl+C interruption, one-time capability replay denial, termination and reaping of the shell's session and background jobs after disconnect, and refusal with `4429` of a terminal beyond the profile's connection or session limit until one closes, through a real PTY |
+| `test_linux_qualification_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Report-only qualification: the twelve container checks pass on the strict profile, the scenario checks report `UNVERIFIED`, a stopped leftover sandbox is removed, a container outside the profile fails the checks it violates, and no collector sandbox remains |
 | `test_linux_local_runtime_integration.py` | `FAILROOM_LOCAL_RUNTIME_INTEGRATION=1` | Enter Room, capability, terminal, recovery verification, Reset Room, and Leave Room through the local app; denial of unreviewed and unauthorized Rooms, of a reused capability, and of a capability issued before a reset; reset maintenance; and a terminal that stays responsive for 70 seconds |
 
 Run one module, or every module whose flags are set:

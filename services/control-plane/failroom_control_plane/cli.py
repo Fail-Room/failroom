@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import NoReturn, TextIO
 
 import uvicorn
+from failroom_sandbox.docker_lifecycle import DockerDiagnosticLifecycle
+from failroom_sandbox.models import QualificationDecision
+from failroom_sandbox.qualification import evaluate_qualification
 from failroom_state import Database, StoreError
 
 from .local_environment import load_operator_environment
@@ -16,7 +19,16 @@ from .local_runtime import (
     LocalRuntimeError,
     build_runtime,
     preflight_runtime,
+    qualification_max_age,
 )
+from .qualification_collector import (
+    QualificationCollection,
+    QualificationCollector,
+    QualificationError,
+    format_collection,
+)
+
+Qualification = tuple[QualificationCollection, QualificationDecision]
 
 __all__ = ("main",)
 
@@ -50,6 +62,8 @@ def _parser() -> argparse.ArgumentParser:
     serve_local.add_argument("--environment-file")
     verify_local = subparsers.add_parser("verify-local", add_help=False)
     verify_local.add_argument("--environment-file")
+    qualify_local = subparsers.add_parser("qualify-local", add_help=False)
+    qualify_local.add_argument("--environment-file")
     return parser
 
 
@@ -83,12 +97,33 @@ def _verify_local(environment: Mapping[str, str] | None = None) -> None:
     preflight_runtime(config)
 
 
+def _qualify_local(environment: Mapping[str, str] | None = None) -> Qualification:
+    """Collect and evaluate one report without storing it or gating allocation."""
+    config = _runtime_config(environment)
+    max_age = qualification_max_age(environment)
+    preflight_runtime(config)
+    docker = config.controller.docker_cli()
+    collector = QualificationCollector(
+        docker,
+        DockerDiagnosticLifecycle(docker, config.controller.seccomp_policy_store()),
+        config.controller.profile,
+        max_age=max_age,
+        now=lambda: datetime.now(UTC),
+    )
+    collection = collector.collect()
+    report = collection.report
+    return collection, evaluate_qualification(
+        report.context, report, now=datetime.now(UTC), max_age=max_age
+    )
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
     database_factory: type[Database] | None = None,
     local_runner: Callable[[Mapping[str, str] | None], None] | None = None,
     local_verifier: Callable[[Mapping[str, str] | None], None] | None = None,
+    local_qualifier: Callable[[Mapping[str, str] | None], Qualification] | None = None,
     stdout: TextIO = sys.stdout,
     stderr: TextIO = sys.stderr,
 ) -> int:
@@ -96,6 +131,13 @@ def main(
     factory = Database if database_factory is None else database_factory
     try:
         args = _parser().parse_args(argv)
+        if args.command == "qualify-local":
+            environment = _operator_environment(args.environment_file)
+            qualifier = _qualify_local if local_qualifier is None else local_qualifier
+            collection, decision = qualifier(environment)
+            for line in format_collection(collection, decision):
+                stdout.write(line + "\n")
+            return 0 if decision.allowed else 3
         if args.command == "serve-local":
             environment = _operator_environment(args.environment_file)
             runner = _serve_local if local_runner is None else local_runner
@@ -121,7 +163,7 @@ def main(
         code = error.code if error.code in _SAFE_STORE_CODES else "STORE_FAILURE"
         stderr.write(code + "\n")
         return 2
-    except LocalRuntimeError as error:
+    except (LocalRuntimeError, QualificationError) as error:
         stderr.write(error.code + "\n")
         return 2
     except (SystemExit, ValueError, TypeError, OSError):

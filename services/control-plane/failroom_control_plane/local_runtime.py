@@ -109,6 +109,15 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def qualification_max_age(environment: Mapping[str, str] | None = None) -> timedelta:
+    """Read the required qualification report validity, 60 seconds to one day."""
+    values = os.environ if environment is None else environment
+    seconds = _integer(values, "FAILROOM_QUALIFICATION_MAX_AGE_SECONDS")
+    if not 60 <= seconds <= 86_400:
+        raise LocalRuntimeError()
+    return timedelta(seconds=seconds)
+
+
 @dataclass(frozen=True)
 class LocalRuntimeConfig:
     bind_host: str
