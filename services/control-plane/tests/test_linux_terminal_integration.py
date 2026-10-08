@@ -367,11 +367,28 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
             with TestClient(self._app()).websocket_connect("/v1/terminal") as socket:
                 socket.send_json({"type": "authorize", "capability": issued.token})
                 self.assertEqual(socket.receive_json(), {"type": "authorized"})
-                socket.send_json({"type": "input", "data": "sleep 30\n"})
+                # Echoed input carries the markers but never the ANSI bytes, so
+                # each wait below observes real command output.
+                started = "FAILROOM_SLEEP_STARTED"
+                socket.send_json(
+                    {
+                        "type": "input",
+                        "data": f"printf '\\033[33m{started}\\033[0m\\n'; sleep 30\n",
+                    }
+                )
+                self._receive_until(socket, started, required_fragment="\x1b[33m")
+                signal_sent = time.monotonic()
                 socket.send_json({"type": "signal", "value": 2})
                 marker = "FAILROOM_INTERRUPT_MARKER"
-                socket.send_json({"type": "input", "data": f"printf {marker}\\n"})
-                self._receive_until(socket, marker)
+                socket.send_json(
+                    {
+                        "type": "input",
+                        "data": f"printf '\\033[32m{marker}\\033[0m\\n'\n",
+                    }
+                )
+                self._receive_until(socket, marker, required_fragment="\x1b[32m")
+                # The marker runs only after the 30-second sleep has ended.
+                self.assertLess(time.monotonic() - signal_sent, 5)
                 socket.send_json({"type": "close"})
 
             with TestClient(self._app()).websocket_connect("/v1/terminal") as socket:
