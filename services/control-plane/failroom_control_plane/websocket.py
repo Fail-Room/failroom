@@ -14,9 +14,10 @@ from failroom_state import AttachmentLease
 from fastapi import FastAPI, WebSocket
 from starlette.websockets import WebSocketDisconnect
 
-from .terminal import TerminalError, TerminalSession
+from .terminal import TerminalAdmission, TerminalError, TerminalSession
 
 Clock = Callable[[], datetime]
+_TERMINAL_CLOSE_CODES = {"ATTACHMENT_DENIED": 4403, "LIMIT_REACHED": 4429}
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,8 @@ class TerminalGatewayProtocol(Protocol):
 
 @runtime_checkable
 class TerminalAttachmentProtocol(Protocol):
+    def admit(self, lease: AttachmentLease) -> TerminalAdmission: ...
+
     def attach(self, lease: AttachmentLease) -> TerminalSession: ...
 
 
@@ -125,6 +128,7 @@ async def serve_terminal(
     close_sent = False
     disconnected = False
     requested_close_code: int | None = None
+    admission: TerminalAdmission | None = None
     session: TerminalSession | None = None
     output_task: asyncio.Task[None] | None = None
 
@@ -206,10 +210,13 @@ async def serve_terminal(
             await close_once(4403)
             return
 
+        # A socket names its sandbox only through the consumed capability, so
+        # it counts against that sandbox's connection limit from here on.
         try:
+            admission = terminal.admit(attachment.lease)
             session = await asyncio.to_thread(terminal.attach, attachment.lease)
         except TerminalError as error:
-            await close_once(4403 if error.code == "ATTACHMENT_DENIED" else 1011)
+            await close_once(_TERMINAL_CLOSE_CODES.get(error.code, 1011))
             return
         except Exception:
             await close_once(1011)
@@ -286,16 +293,20 @@ async def serve_terminal(
             await close_once(4400)
             break
     finally:
-        if output_task is not None:
-            output_task.cancel()
-            await asyncio.gather(output_task, return_exceptions=True)
-        if session is not None:
-            try:
-                await asyncio.to_thread(session.close)
-            except Exception:
-                pass
-        if not disconnected:
-            await close_once(requested_close_code or 1000)
+        try:
+            if output_task is not None:
+                output_task.cancel()
+                await asyncio.gather(output_task, return_exceptions=True)
+            if session is not None:
+                try:
+                    await asyncio.to_thread(session.close)
+                except Exception:
+                    pass
+            if not disconnected:
+                await close_once(requested_close_code or 1000)
+        finally:
+            if admission is not None:
+                admission.release()
 
 
 def mount_terminal_route(

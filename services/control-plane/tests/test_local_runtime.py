@@ -22,6 +22,7 @@ from failroom_control_plane.maintenance import (
     LifecycleMaintenanceService,
     MaintenanceError,
 )
+from failroom_control_plane.terminal import ControlPlaneTerminalService
 
 
 class LocalRuntimeConfigTests(unittest.TestCase):
@@ -134,6 +135,24 @@ class LocalRuntimeConfigTests(unittest.TestCase):
             },
             {"local-backend", "local-control-plane", "local-gateway"},
         )
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux seccomp policy store required")
+    def test_terminal_limits_come_from_the_profile(self) -> None:
+        self.environment["FAILROOM_CONNECTION_LIMIT"] = "3"
+        self.environment["FAILROOM_SESSION_LIMIT"] = "2"
+        with patch.dict(os.environ, self.environment, clear=True):
+            config = LocalRuntimeConfig.from_environment()
+        with (
+            patch("failroom_control_plane.local_runtime.preflight_runtime"),
+            patch(
+                "failroom_control_plane.local_runtime.ControlPlaneTerminalService",
+                wraps=ControlPlaneTerminalService,
+            ) as terminal,
+        ):
+            build_runtime(config, now=lambda: datetime(2026, 9, 15, tzinfo=UTC))
+        self.assertEqual(terminal.call_count, 1)
+        self.assertEqual(terminal.call_args.kwargs["connection_limit"], 3)
+        self.assertEqual(terminal.call_args.kwargs["session_limit"], 2)
 
     def test_public_package_exports_local_runtime_interfaces(self) -> None:
         self.assertIs(failroom_control_plane.LocalRuntime, LocalRuntime)

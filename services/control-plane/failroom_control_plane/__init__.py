@@ -30,6 +30,7 @@ from .runtime_docker import (
 )
 from .terminal import (
     ControlPlaneTerminalService,
+    TerminalAdmission,
     TerminalError,
     TerminalRuntime,
     TerminalSession,
@@ -63,6 +64,7 @@ __all__ = (
     "RecoveryVerificationService",
     "RoomStatus",
     "ResetError",
+    "TerminalAdmission",
     "TerminalError",
     "TerminalRuntime",
     "TerminalSession",
