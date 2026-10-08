@@ -109,14 +109,15 @@ WS /sandboxes/{sandbox_id}/terminal
 
 The API contract package can issue and verify a bounded HMAC terminal capability containing unique `jti`, `user_id`, `attempt_id`, `sandbox_id`, `generation`, `session_epoch`, `expiry`, and `scope`. The operator-only local runtime issues it at `POST /v1/attempts/{attempt_id}/terminal-capability` and accepts it as the first JSON frame on the `/v1/terminal` WebSocket; the [control-plane README](../services/control-plane/README.md) documents the frames. Its gateway validates signature, expiry, and scope and consumes the capability through in-process calls rather than the internal HTTP contract above. Public routes for a learner-facing backend remain undecided.
 
-The backend owns the learner-facing status and reset facades. Their exact public routes may change, but their conceptual contracts are:
+The backend owns the learner-facing status, Leave Room, and reset facades. The operator-only local runtime serves them at the routes below; a learner-facing backend may change the routes but keeps these contracts:
 
 ```http
-GET /rooms/{attempt_id}/status
-POST /rooms/{attempt_id}/reset
+GET /v1/attempts/{attempt_id}/status
+POST /v1/attempts/{attempt_id}/leave
+POST /v1/attempts/{attempt_id}/reset
 ```
 
-The status facade revalidates authenticated user and Room ownership, reads control-plane state through the trusted internal inspect API, and returns filtered attempt and health information. The reset facade validates ownership and state, then runs the backend compound orchestration described below. It is not forwarded as a compound control-plane reset mutation.
+The status facade revalidates authenticated user and Room ownership and returns filtered attempt information. The local runtime returns only the attempt ID, Room ID, lifecycle state, immutable expiry, and destroy intent; adding control-plane health read through the trusted internal inspect API remains planned. The Leave Room facade requires an idempotency key, revalidates the owned attempt, records durable destroy intent, and runs one bounded cleanup pass; it does not report destruction before cleanup has verified it. The reset facade validates ownership and state and records the reset; the backend compound orchestration described below then replaces the sandbox, and the local runtime drives it in its maintenance passes. It is not forwarded as a compound control-plane reset mutation.
 
 For every user-facing HTTP path, the backend validates authenticated user, Room ownership, allowed action, and current attempt binding independently of the sandbox ID. A sandbox ID is never authorization. Internal control-plane calls accept only authenticated trusted service identities; mutations additionally require action scope, the backend-preallocated resource identity and generation, and an idempotency key, all compared with the authoritative resource record before side effects. WebSocket attachment follows the one-time capability and final lease checks above. Raw capabilities and leases are never logged.
 
