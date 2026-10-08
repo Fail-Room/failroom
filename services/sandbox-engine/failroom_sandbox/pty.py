@@ -2,6 +2,7 @@
 
 import os
 import re
+import select
 import signal
 import struct
 import subprocess
@@ -24,6 +25,44 @@ _CONTAINER_ID = re.compile(r"^[a-f0-9]{64}$")
 _CONTEXT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _COMMAND = ("/bin/bash",)
 _SIGNALS = frozenset({int(signal.SIGINT)})
+# The wrapper reports its in-container PID before any learner input and then
+# becomes /bin/bash, so that PID identifies the shell's session.
+_SESSION_WRAPPER = (
+    "/bin/sh",
+    "-c",
+    'printf "FAILROOM_PTY_SESSION=%s\\n" "$$"; exec /bin/bash',
+)
+_SESSION_MARKER = re.compile(rb"FAILROOM_PTY_SESSION=([1-9][0-9]{0,9})\r?\n")
+_MARKER_MAX_BYTES = 64
+_MARKER_TIMEOUT_SECONDS = 10.0
+_CLEANUP_TIMEOUT_SECONDS = 10.0
+# Kills every live process of the shell's session: members first so the shell
+# can still reap them, then the shell. Processes that left the session with
+# setsid are bounded by the sandbox's PID 1 lifetime instead.
+_CLEANUP_SCRIPT = r"""target=$1
+case $target in ''|*[!0-9]*) exit 2 ;; esac
+members() {
+  for stat in /proc/[0-9]*/stat; do
+    read -r line 2>/dev/null <"$stat" || continue
+    pid=${line%% *}
+    rest=${line##*") "}
+    set -- $rest
+    [ "$1" != Z ] && [ "$4" = "$target" ] && printf '%s\n' "$pid"
+  done
+}
+pass=0
+while [ "$pass" -lt 5 ]; do
+  pass=$((pass + 1))
+  found=0
+  for pid in $(members); do
+    found=1
+    [ "$pid" = "$target" ] || kill -KILL "$pid" 2>/dev/null
+  done
+  [ "$found" = 0 ] && exit 0
+  sleep 0.2
+  kill -KILL "$target" 2>/dev/null
+done
+exit 0"""
 
 
 class PtyError(RuntimeError):
@@ -90,6 +129,7 @@ class _Process(Protocol):
 
 
 PtyOpener = Callable[[tuple[str, ...], int], _Process]
+PtyCleanup = Callable[[tuple[str, ...]], None]
 
 
 def _open_process(argv: tuple[str, ...], slave_fd: int) -> _Process:
@@ -103,11 +143,98 @@ def _open_process(argv: tuple[str, ...], slave_fd: int) -> _Process:
     )
 
 
+def _run_cleanup(argv: tuple[str, ...]) -> None:
+    subprocess.run(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=_CLEANUP_TIMEOUT_SECONDS,
+        check=False,
+    )
+
+
+def _parse_session_marker(buffer: bytes) -> tuple[int, bytes] | None:
+    """Return the session PID and the output after a complete marker line."""
+    match = _SESSION_MARKER.match(buffer)
+    if match is None:
+        return None
+    return int(match.group(1)), buffer[match.end() :]
+
+
+def _read_session_marker(master_fd: int) -> tuple[int, bytes]:
+    deadline = time.monotonic() + _MARKER_TIMEOUT_SECONDS
+    buffer = b""
+    while b"\n" not in buffer:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or len(buffer) >= _MARKER_MAX_BYTES:
+            raise PtyError("PTY_UNAVAILABLE")
+        ready, _, _ = select.select([master_fd], [], [], remaining)
+        if not ready:
+            continue
+        try:
+            chunk = os.read(master_fd, _MARKER_MAX_BYTES - len(buffer))
+        except BlockingIOError:
+            continue
+        except OSError:
+            raise PtyError("PTY_UNAVAILABLE") from None
+        if not chunk:
+            raise PtyError("PTY_UNAVAILABLE")
+        buffer += chunk
+    parsed = _parse_session_marker(buffer)
+    if parsed is None:
+        raise PtyError("PTY_UNAVAILABLE")
+    return parsed
+
+
+def _cleanup_argv(context: str, container_id: str, session: int) -> tuple[str, ...]:
+    return (
+        "docker",
+        "--context",
+        context,
+        "exec",
+        container_id,
+        "/bin/sh",
+        "-c",
+        _CLEANUP_SCRIPT,
+        "failroom-pty-cleanup",
+        str(session),
+    )
+
+
+def _terminate_client(process: _Process) -> None:
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        process.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=1.0)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
 class _SubprocessPtySession:
-    def __init__(self, master_fd: int, process: _Process, limits: PtyLimits) -> None:
+    def __init__(
+        self,
+        master_fd: int,
+        process: _Process,
+        limits: PtyLimits,
+        *,
+        pending: bytes = b"",
+        cleanup: Callable[[], None] | None = None,
+    ) -> None:
         self._master_fd = master_fd
         self._process = process
         self._limits = limits
+        self._pending = pending
+        self._cleanup = cleanup
         self._started = time.monotonic()
         self._output_bytes = 0
         self._closed = False
@@ -127,6 +254,11 @@ class _SubprocessPtySession:
         if remaining <= 0:
             self.close()
             raise PtyError("OUTPUT_LIMIT")
+        if self._pending:
+            data = self._pending[: min(maximum, remaining)]
+            self._pending = self._pending[len(data) :]
+            self._output_bytes += len(data)
+            return data
         try:
             data = os.read(self._master_fd, min(maximum, remaining))
         except BlockingIOError:
@@ -184,24 +316,14 @@ class _SubprocessPtySession:
             return
         self._closed = True
         try:
-            try:
-                os.killpg(
-                    os.getpgid(self._process.pid),
-                    signal.SIGTERM,
-                )
-            except (ProcessLookupError, OSError):
-                pass
-            try:
-                self._process.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
+            # Stop the shell's session inside the sandbox before the local
+            # client; ending `docker exec` alone leaves the remote shell running.
+            if self._cleanup is not None:
                 try:
-                    self._process.kill()
-                except OSError:
+                    self._cleanup()
+                except Exception:
                     pass
-                try:
-                    self._process.wait(timeout=1.0)
-                except (OSError, subprocess.TimeoutExpired):
-                    pass
+            _terminate_client(self._process)
         finally:
             try:
                 os.close(self._master_fd)
@@ -218,17 +340,20 @@ class DockerPtyRuntime:
         context: str,
         limits: PtyLimits,
         opener: PtyOpener = _open_process,
+        cleanup_runner: PtyCleanup = _run_cleanup,
     ) -> None:
         if (
             type(context) is not str
             or _CONTEXT.fullmatch(context) is None
             or type(limits) is not PtyLimits
             or not callable(opener)
+            or not callable(cleanup_runner)
         ):
             raise PtyError("INVALID_CONFIGURATION")
         self._context = context
         self._limits = limits
         self._opener = opener
+        self._cleanup_runner = cleanup_runner
 
     def open(self, container_id: str, *, command: tuple[str, ...]) -> PtySession:
         if (
@@ -242,6 +367,7 @@ class DockerPtyRuntime:
         if tty is None:
             raise PtyError("PTY_UNAVAILABLE")
         master_fd, slave_fd = os.openpty()
+        process: _Process | None = None
         try:
             tty.setraw(slave_fd)
             argv = (
@@ -252,19 +378,29 @@ class DockerPtyRuntime:
                 "--interactive",
                 "--tty",
                 container_id,
-                *_COMMAND,
+                *_SESSION_WRAPPER,
             )
             process = self._opener(argv, slave_fd)
             os.close(slave_fd)
+            slave_fd = -1
             os.set_blocking(master_fd, False)
-            return _SubprocessPtySession(master_fd, process, self._limits)
+            session, pending = _read_session_marker(master_fd)
+            cleanup_argv = _cleanup_argv(self._context, container_id, session)
+            runner = self._cleanup_runner
+            return _SubprocessPtySession(
+                master_fd,
+                process,
+                self._limits,
+                pending=pending,
+                cleanup=lambda: runner(cleanup_argv),
+            )
         except Exception:
-            try:
-                os.close(slave_fd)
-            except OSError:
-                pass
-            try:
-                os.close(master_fd)
-            except OSError:
-                pass
+            if process is not None:
+                _terminate_client(process)
+            for descriptor in (slave_fd, master_fd):
+                if descriptor >= 0:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
             raise PtyError("PTY_UNAVAILABLE") from None

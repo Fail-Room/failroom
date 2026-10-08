@@ -128,17 +128,30 @@ validated an attachment lease and exact container binding. It accepts only a
 command, then invokes the exact Docker CLI form:
 
 ```text
-docker --context <context> exec --interactive --tty <container_id> /bin/bash
+docker --context <context> exec --interactive --tty <container_id> /bin/sh -c 'printf "FAILROOM_PTY_SESSION=%s\n" "$$"; exec /bin/bash'
 ```
+
+The fixed wrapper prints the shell's in-container PID before any learner input
+and then replaces itself with `/bin/bash`. `open()` consumes that first line,
+which must arrive within 10 seconds and match exactly, and fails closed with
+`PTY_UNAVAILABLE` otherwise; output that follows it is relayed normally.
 
 The session enforces explicit input, cumulative output, wall-clock session,
 terminal row/column, and signal bounds. The current signal contract permits
 only `SIGINT` (`Ctrl+C`) and writes the PTY interrupt byte so the remote
 foreground process is interrupted without killing the local `docker exec`
-client. `close()` is idempotent and terminates the process group. Non-Linux
-interpreters fail closed; the Windows unit suite does not claim Linux PTY or
-Docker isolation evidence. The primitive never exposes a host runtime socket,
-host shell, or host filesystem to the learner sandbox.
+client. `close()` is idempotent. It first runs one fixed command,
+`docker --context <context> exec <container_id> /bin/sh -c <cleanup script>
+failroom-pty-cleanup <pid>`, which kills every live process in the shell's
+session inside the sandbox, members before the shell, and then terminates the
+local `docker exec` client's process group. Ending the local client alone does
+not stop the shell inside the sandbox. A process that leaves the session with
+`setsid` is not stopped by `close()`; the sandbox's PID 1 lifetime bounds it.
+Both commands rely on `/bin/sh`, `kill` and `sleep` in the reviewed image.
+
+Non-Linux interpreters fail closed; the Windows unit suite does not claim Linux
+PTY or Docker isolation evidence. The primitive never exposes a host runtime
+socket, host shell, or host filesystem to the learner sandbox.
 
 ## Trust and integration boundary
 
