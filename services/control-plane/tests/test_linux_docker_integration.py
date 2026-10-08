@@ -1,6 +1,7 @@
 """Opt-in proof of the durable control-plane Docker lifecycle on Linux."""
 
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -139,6 +140,7 @@ def _assert_hardening(
     mounts = data["Mounts"]
     test_case.assertEqual(config["User"], f"{profile.uid}:{profile.gid}")
     test_case.assertEqual(host["NetworkMode"], "none")
+    test_case.assertIs(host["Init"], True)
     test_case.assertIsNone(host["Binds"])
     test_case.assertIsNone(host.get("Mounts"))
     test_case.assertIsNone(host["VolumesFrom"])
@@ -168,6 +170,43 @@ def _assert_hardening(
     else:
         test_case.assertEqual(mounts, [])
     test_case.assertNotIn("docker.sock", repr(data))
+
+
+def _sandbox_file(container_id: str, path: str) -> str:
+    result = subprocess.run(
+        (
+            "docker",
+            "--context",
+            _required("FAILROOM_DOCKER_CONTEXT"),
+            "exec",
+            container_id,
+            "/bin/cat",
+            path,
+        ),
+        capture_output=True,
+        check=True,
+        timeout=float(_required("FAILROOM_DOCKER_TIMEOUT_SECONDS")),
+    )
+    return result.stdout.decode("utf-8")
+
+
+def _assert_reaping_init(
+    test_case: unittest.TestCase, container_id: str, lifetime: str
+) -> None:
+    """PID 1 is Docker's init running only the sleep, from a read-only mount."""
+    test_case.assertEqual(
+        _sandbox_file(container_id, "/proc/1/cmdline").split("\0"),
+        ["/sbin/docker-init", "--", "/bin/sleep", lifetime, ""],
+    )
+    mountinfo = _sandbox_file(container_id, "/proc/self/mountinfo")
+    init_mounts = [
+        fields[5].split(",")
+        for fields in map(str.split, mountinfo.splitlines())
+        # Images with merged /usr resolve /sbin to /usr/sbin.
+        if fields[4] in ("/sbin/docker-init", "/usr/sbin/docker-init")
+    ]
+    test_case.assertEqual(len(init_mounts), 1)
+    test_case.assertIn("ro", init_mounts[0])
 
 
 def _exact_label_filters(binding: DockerBinding) -> tuple[str, ...]:
@@ -260,6 +299,7 @@ class LinuxControlPlaneIntegrationTests(unittest.TestCase):
             data = self.inspect_cli.inspect_container(resource.container_id)
             self.assertIsNotNone(data)
             _assert_hardening(self, data, self.profile)
+            _assert_reaping_init(self, resource.container_id, data["Config"]["Cmd"][0])
 
             self.backend.leave(
                 self.user,

@@ -94,6 +94,7 @@ def _assert_hardening(
     mounts = data["Mounts"]
     test_case.assertEqual(config["User"], f"{profile.uid}:{profile.gid}")
     test_case.assertEqual(host["NetworkMode"], "none")
+    test_case.assertIs(host["Init"], True)
     test_case.assertIsNone(host["Binds"])
     # Docker Desktop omits an empty HostConfig.Mounts; a present value must be null.
     test_case.assertIsNone(host.get("Mounts"))

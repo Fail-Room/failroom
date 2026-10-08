@@ -251,6 +251,7 @@ def _verify_profile(
         "IpcMode": "private",
         "CgroupnsMode": "private",
         "Runtime": "runc",
+        "Init": True,
         "PublishAllPorts": False,
         "Memory": profile.memory_limit_bytes,
         "MemorySwap": profile.memory_swap_limit_bytes,

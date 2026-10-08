@@ -379,10 +379,11 @@ class DockerProfileTests(unittest.TestCase):
         self.assertEqual(docker_configuration["restart"], "no")
         self.assertEqual(docker_configuration["log_driver"], "none")
         self.assertEqual(docker_configuration["runtime"], "runc")
+        self.assertIs(docker_configuration["init"], True)
         self.assertEqual(docker_configuration["entrypoint"], "/bin/sleep")
         self.assertIs(docker_configuration["healthcheck_disabled"], True)
         self.assertEqual(docker_configuration["pull_policy"], "never")
-        self.assertEqual(configuration["schema"], "failroom.strict-docker-profile.v2")
+        self.assertEqual(configuration["schema"], "failroom.strict-docker-profile.v3")
         self.assertEqual(
             docker_configuration["command"],
             {"lifetime": "attempt-deadline", "start_margin_seconds": 10},
@@ -396,6 +397,7 @@ class DockerProfileTests(unittest.TestCase):
                 argv = compile_create_argv(
                     profile, self._binding(), "operation-789", lifetime_seconds=seconds
                 )
+                self.assertEqual(argv.count("--init"), 1)
                 self.assertEqual(argv[argv.index("--entrypoint") + 1], "/bin/sleep")
                 self.assertEqual(argv[-2], profile.image)
                 self.assertEqual(argv[-1], str(seconds))
@@ -490,6 +492,7 @@ class DockerProfileTests(unittest.TestCase):
                 "none",
                 "--runtime",
                 "runc",
+                "--init",
                 "--entrypoint",
                 "/bin/sleep",
                 "--no-healthcheck",

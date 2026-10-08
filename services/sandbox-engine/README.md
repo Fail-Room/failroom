@@ -79,6 +79,13 @@ values, terminal/session/TTL limits, and an absolute seccomp policy path and
 digest. It compiles fixed Docker arguments for `runc`, private PID/IPC/cgroup
 namespaces, `network=none`, read-only root, dropped capabilities,
 `no-new-privileges`, disabled health checks, no restart and disabled logging.
+PID 1 is Docker's init (`--init`). Its only child is `/bin/sleep`, which ends at
+the attempt deadline, and it reaps processes orphaned to it, so killed
+processes do not remain as zombies. Docker supplies the init binary as a
+read-only bind of its own `docker-init` at `/sbin/docker-init`; Docker fixes
+both paths, no profile field sets them, and the mount is not listed in the
+inspected `Mounts`. Post-create verification requires `HostConfig.Init` to be
+`true`.
 There are no profile fields for host mounts, volumes, devices, ports, extra
 capabilities, arbitrary commands, or a learner-selected image.
 
@@ -145,8 +152,10 @@ client. `close()` is idempotent. It first runs one fixed command,
 failroom-pty-cleanup <pid>`, which kills every live process in the shell's
 session inside the sandbox, members before the shell, and then terminates the
 local `docker exec` client's process group. Ending the local client alone does
-not stop the shell inside the sandbox. A process that leaves the session with
-`setsid` is not stopped by `close()`; the sandbox's PID 1 lifetime bounds it.
+not stop the shell inside the sandbox. Killed processes that had been orphaned
+to the sandbox's PID 1 are reaped by Docker's init. A process that leaves the
+session with `setsid` is not stopped by `close()`; the sandbox's PID 1 lifetime
+bounds it.
 Both commands rely on `/bin/sh`, `kill` and `sleep` in the reviewed image.
 
 Non-Linux interpreters fail closed; the Windows unit suite does not claim Linux
