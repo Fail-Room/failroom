@@ -34,7 +34,7 @@ The intended terminal path is:
 
 `Browser → xterm.js → authorized WebSocket → terminal gateway → PTY → isolated Linux sandbox`
 
-The planned architecture uses Next.js with xterm.js for the browser interface and FastAPI for backend authorization and control. It separates those layers from the terminal gateway, trusted sandbox control plane, untrusted user sandbox, and Room scenario definitions. Internal profile qualification, the verified diagnostic Docker lifecycle, the trusted in-process control-plane composition, the bounded signed capability codec, the consumed attachment-lease contract, and SQLite state modules are implemented. The control plane enforces explicit configuration, state-before-runtime ordering, persisted runtime bindings, operator-only migration, and evidence-gated cleanup for the diagnostic slice; no HTTP authentication or learner runtime is connected.
+The planned architecture uses Next.js with xterm.js for the browser interface and FastAPI for backend authorization and control. It separates those layers from the terminal gateway, trusted sandbox control plane, untrusted user sandbox, and Room scenario definitions. Internal profile qualification, the verified diagnostic Docker lifecycle, the trusted in-process control-plane composition, the bounded signed capability codec, the consumed attachment-lease contract, SQLite state modules, and injected FastAPI/WebSocket/PTY route factories are implemented. The control plane enforces explicit configuration, state-before-runtime ordering, persisted runtime bindings, operator-only migration, and evidence-gated cleanup for the diagnostic slice; no deployed HTTP service, browser UI, or production identity provider is connected.
 
 ## Security Boundary
 
@@ -44,7 +44,7 @@ As a product design objective, failures should have real consequences inside a R
 
 ## Current Development Status
 
-Phase 0 established documentation and repository rules. Phase 1 now includes a tested profile qualification gate, a verified diagnostic Docker lifecycle, a transactional SQLite state store, a trusted in-process control-plane composition, a bounded capability codec, and an atomic attachment-lease contract with explicit v2-to-v3 migration. These are internal contracts, not a public HTTP API or learner allocator. Real Docker integration remains opt-in and UNVERIFIED in the current Windows environment; there is still no runnable web application, learner terminal, authentication endpoint, or deployment.
+Phase 0 established documentation and repository rules. Phase 1 now includes a tested profile qualification gate, a diagnostic Docker lifecycle, a transactional SQLite state store, a trusted in-process control-plane composition, bounded capability and attachment-lease contracts, and injected route factories for terminal capability, terminal transport, Room Status, and Leave Room. Room Status returns only owner-scoped attempt fields; Leave Room requires an idempotency key and performs one bounded durable-cleanup pass. These are locally composed application contracts, not a deployed learner service or full lifecycle implementation. Real Docker integration remains opt-in and UNVERIFIED in the current Windows environment; no runnable web application, production identity provider, independent TTL scheduler, or Reset Room exists.
 
 ## Roadmap
 
@@ -64,7 +64,7 @@ Phase 0 established documentation and repository rules. Phase 1 now includes a t
 
 ## Local Development
 
-The [sandbox engine](services/sandbox-engine/README.md), [state store](packages/state-store/README.md), [control plane](services/control-plane/README.md), and [API contract package](services/api/README.md) are Python 3.12 modules with reproducible test, lint, format, and type checks. Docker and control-plane integration are opt-in and require a trusted Linux host with explicit operator inputs. Web, HTTP API, learner runtime and terminal setup remain planned.
+The [sandbox engine](services/sandbox-engine/README.md), [state store](packages/state-store/README.md), [control plane](services/control-plane/README.md), and [API contract package](services/api/README.md) are Python 3.12 modules with reproducible test, lint, format, and type checks. Docker and control-plane integration are opt-in and require a trusted Linux host with explicit operator inputs. Browser UI, deployment, production identity integration, Reset Room, and an independently scheduled TTL worker remain planned.
 
 ## Contributing
 

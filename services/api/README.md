@@ -1,9 +1,10 @@
 # Failroom API Contract Package
 
 Internal Phase 1 capability primitives for trusted services. This package provides
-a bounded HMAC codec for the short-lived terminal capability contract; it does not
-run an HTTP listener, authenticate users, distribute keys, consume `jti` values,
-open a WebSocket, or attach a PTY.
+a bounded HMAC codec for the short-lived terminal capability contract and an
+injected bearer-credential verifier. It does not run an HTTP listener, integrate
+with a production identity provider, distribute keys, open a WebSocket, or attach
+a PTY.
 
 ## Capability contract
 
@@ -26,7 +27,9 @@ backend contract. The state store must still re-check ownership, generation,
 session epoch, expiry and resource state before consuming the capability.
 
 The codec does not prove that a user is authenticated or that a Room is attachable.
-Those checks, key custody, HTTP issuance and gateway transport remain planned.
+The injected verifier provides only the caller-supplied local credential boundary;
+key custody, production identity integration, deployment authentication, and
+browser transport remain outside this package.
 Never put the key, raw capability or decoded claims in a learner sandbox, URL, log,
 metric label or terminal output.
 

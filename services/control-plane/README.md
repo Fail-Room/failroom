@@ -54,6 +54,21 @@ background workers, or learner-facing commands in this package. The HTTP and
 WebSocket route factories do not start a server; callers must explicitly inject
 all authority, gateway, terminal, and limit dependencies.
 
+## Room Status and Leave Room
+
+When `create_app()` receives a `RoomLifecycleService`, it also mounts
+`GET /v1/attempts/{attempt_id}/status` and
+`POST /v1/attempts/{attempt_id}/leave`. Both routes verify an injected identity
+before reading the backend-owned attempt. Status exposes only the attempt ID,
+Room ID, lifecycle state, immutable expiry, and destroy intent; it never
+returns sandbox identity, generation, container metadata, or lease data.
+
+Leave Room requires `Idempotency-Key`, uses the owner-filtered attempt binding
+when it records durable stop intent, and then invokes exactly one bounded
+`DockerCleanupWorker`-compatible cleanup pass. A `202` result confirms the
+intent and current filtered status, not verified destruction. Scheduling,
+retrying, and independent TTL enforcement remain the caller's responsibility.
+
 ## Terminal vertical slice
 
 `ControlPlaneTerminalService` re-inspects the exact `ResourceRef` associated

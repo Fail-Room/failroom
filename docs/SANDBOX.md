@@ -2,7 +2,7 @@
 
 ## Status and Scope
 
-This document is the planned lifecycle, terminal, isolation, and cleanup contract for Failroom sandboxes. Phase 1 now implements internal qualification, verified diagnostic Docker profile/lifecycle checks, authoritative persistence, a trusted in-process control-plane composition, explicit v1-to-v2 and v2-to-v3 migrations, a bounded signed capability codec and an atomic attachment-lease contract. It has not proved a learner terminal slice with browser authentication endpoints, gateway transport, PTY attachment, independent TTL scheduling, or full runtime isolation. The opt-in Linux Docker evidence remains UNVERIFIED in the current Windows environment. Phase 2 will generalize the lifecycle into reset, multiple concurrent sandboxes, the complete reusable state machine and transition/race matrices, and broader reconciliation.
+This document is the planned lifecycle, terminal, isolation, and cleanup contract for Failroom sandboxes. Phase 1 now implements internal qualification, diagnostic Docker profile/lifecycle checks, authoritative persistence, a trusted in-process control-plane composition, explicit v1-to-v2 and v2-to-v3 migrations, bounded signed capability and attachment-lease contracts, and injected HTTP/WebSocket/PTY route factories. Room Status and Leave Room are owner-scoped local composition routes; Leave Room records stop intent and invokes one bounded cleanup pass. It has not proved a browser UI, production authentication, independently scheduled TTL enforcement, full runtime isolation, or complete learner lifecycle. The opt-in Linux Docker evidence remains UNVERIFIED in the current Windows environment. Phase 2 will generalize the lifecycle into reset, multiple concurrent sandboxes, the complete reusable state machine and transition/race matrices, and broader reconciliation.
 
 A sandbox is an internal disposable runtime resource for one Room attempt. It is not a product identity, an authorization credential, or a durable user environment.
 
@@ -107,16 +107,17 @@ The conceptual browser-facing gateway endpoint is separate from those service-au
 WS /sandboxes/{sandbox_id}/terminal
 ```
 
-The API contract package can issue and verify a bounded HMAC terminal capability containing unique `jti`, `user_id`, `attempt_id`, `sandbox_id`, `generation`, `session_epoch`, `expiry`, and `scope`. The future gateway must validate signature, expiry, and scope locally, then call the authenticated verify-and-consume contract; no HTTP issuer or gateway transport exists yet. The exact public route and WebSocket transport framing remain Phase 1 decisions.
+The API contract package can issue and verify a bounded HMAC terminal capability containing unique `jti`, `user_id`, `attempt_id`, `sandbox_id`, `generation`, `session_epoch`, `expiry`, and `scope`. The injected terminal gateway route validates signature, expiry, and scope locally, then calls the authenticated verify-and-consume contract before requesting the final attachment lease. Its bounded framing and Docker PTY adapter are implemented, but browser UI, deployment authentication, and production transport operation remain planned.
 
-The backend owns the learner-facing status and reset facades. Their exact public routes may change, but their conceptual contracts are:
+The backend owns the learner-facing status, leave, and reset facades. The first two local composition routes are implemented; reset remains conceptual:
 
 ```http
-GET /rooms/{attempt_id}/status
+GET /v1/attempts/{attempt_id}/status
+POST /v1/attempts/{attempt_id}/leave
 POST /rooms/{attempt_id}/reset
 ```
 
-The status facade revalidates authenticated user and Room ownership, reads control-plane state through the trusted internal inspect API, and returns filtered attempt and health information. The reset facade validates ownership and state, then runs the backend compound orchestration described below. It is not forwarded as a compound control-plane reset mutation.
+The implemented status facade revalidates the injected authenticated user and Room ownership, then returns only attempt ID, Room ID, lifecycle state, immutable expiry, and destroy intent. The implemented leave facade requires an idempotency key, revalidates the owned attempt binding, records durable stop intent, and invokes one bounded cleanup pass; it does not claim verified destruction until the cleanup worker records it. The reset facade validates ownership and state, then runs the backend compound orchestration described below. It is not forwarded as a compound control-plane reset mutation.
 
 For every user-facing HTTP path, the backend validates authenticated user, Room ownership, allowed action, and current attempt binding independently of the sandbox ID. A sandbox ID is never authorization. Internal control-plane calls accept only authenticated trusted service identities; mutations additionally require action scope, the backend-preallocated resource identity and generation, and an idempotency key, all compared with the authoritative resource record before side effects. WebSocket attachment follows the one-time capability and final lease checks above. Raw capabilities and leases are never logged.
 
