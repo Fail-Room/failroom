@@ -1,8 +1,11 @@
 """Opt-in proof of the trusted Linux Docker terminal vertical slice."""
 
 import os
+import re
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -48,6 +51,15 @@ _TERMINAL_REQUIRED = (
     "FAILROOM_TERMINAL_FRAME_BYTES",
     "FAILROOM_TERMINAL_POLL_INTERVAL_SECONDS",
 )
+_LIST_PROCESSES = r"""for stat in /proc/[0-9]*/stat; do
+  read -r line 2>/dev/null <"$stat" || continue
+  pid=${line%% *}
+  rest=${line##*") "}
+  set -- $rest
+  printf '%s %s %s ' "$pid" "$1" "$4"
+  tr '\000\n' '  ' <"/proc/$pid/cmdline" 2>/dev/null
+  echo
+done"""
 
 
 class TerminalOutputEvidenceTests(unittest.TestCase):
@@ -239,6 +251,34 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
                 return output
         raise AssertionError("terminal marker not observed")
 
+    @staticmethod
+    def _processes(container_id: str) -> list[tuple[str, str, str, str]]:
+        """Return (pid, state, session, command) for processes in the sandbox."""
+        result = subprocess.run(
+            (
+                "docker",
+                "--context",
+                _required("FAILROOM_DOCKER_CONTEXT"),
+                "exec",
+                container_id,
+                "/bin/sh",
+                "-c",
+                _LIST_PROCESSES,
+            ),
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=float(_required("FAILROOM_DOCKER_TIMEOUT_SECONDS")),
+        )
+        processes = []
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) < 3 or not fields[0].isdigit():
+                raise AssertionError("unexpected process listing line")
+            pid, state, session, *command = fields
+            processes.append((pid, state, session, " ".join(command)))
+        return processes
+
     def _cleanup(self, receipt) -> None:
         resource = self.control.inspect(self.control_identity, receipt.ref)
         if resource.state != "DESTROYED":
@@ -319,6 +359,54 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
                 with self.assertRaises(WebSocketDisconnect) as raised:
                     socket.receive_json()
             self.assertEqual(raised.exception.code, 4403)
+        finally:
+            self._cleanup(receipt)
+
+    def test_disconnect_terminates_the_shell_session_in_the_sandbox(self) -> None:
+        receipt = self._provision()
+        try:
+            issued = self.authority.issue(
+                self.user,
+                receipt.attempt_id,
+                now=lambda: self.now,
+            )
+            resource = self.control.inspect(self.control_identity, receipt.ref)
+            container_id = resource.container_id
+            with TestClient(self._app()).websocket_connect("/v1/terminal") as socket:
+                socket.send_json({"type": "authorize", "capability": issued.token})
+                self.assertEqual(socket.receive_json(), {"type": "authorized"})
+                socket.send_json(
+                    {"type": "input", "data": "sleep 1000 & (sleep 1001 &)\n"}
+                )
+                socket.send_json(
+                    {
+                        "type": "input",
+                        "data": "printf '\\033[32mFAILROOM_SHELL=%s\\033[0m\\n' $$\n",
+                    }
+                )
+                output = self._receive_until(
+                    socket, "FAILROOM_SHELL=", required_fragment="\x1b[32m"
+                )
+                match = re.search(r"FAILROOM_SHELL=([0-9]+)", output)
+                self.assertIsNotNone(match)
+                shell = match.group(1)
+                before = self._processes(container_id)
+                commands = {command for _, _, sid, command in before if sid == shell}
+                self.assertIn("sleep 1000", commands)
+                self.assertIn("sleep 1001", commands)
+                socket.send_json({"type": "close"})
+
+            deadline = time.monotonic() + 15
+            while True:
+                live = [
+                    process
+                    for process in self._processes(container_id)
+                    if process[1] != "Z" and process[2] == shell
+                ]
+                if not live or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.25)
+            self.assertEqual(live, [])
         finally:
             self._cleanup(receipt)
 
