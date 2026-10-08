@@ -54,7 +54,7 @@ Commands:
 - uv run --locked ruff format --check .
 - uv run --locked mypy failroom_api
 
-This package only issues and verifies bounded HMAC capability claims. The state-store v2-to-v3 migration must be run explicitly with a new absolute backup path before attachment leases are available.
+This package only issues and verifies bounded HMAC capability claims. The state-store v2-to-v3 migration must be run explicitly with a new absolute backup path before attachment leases are available. The v3-to-v4 migration must likewise use a new absolute backup path before durable Reset Room active/candidate bindings are available.
 
 ## Delivery Principles
 

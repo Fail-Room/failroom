@@ -3,6 +3,7 @@
 import os
 import sys
 import tempfile
+import time
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -201,12 +202,17 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
         return app
 
     @staticmethod
-    def _receive_until(socket, marker: str) -> str:
+    def _receive_until(socket, expected: str) -> str:
+        received: list[str] = []
         for _ in range(200):
             message = socket.receive_json()
-            if message.get("type") == "output" and marker in message.get("data", ""):
-                return message["data"]
-        raise AssertionError("terminal marker not observed")
+            data = message.get("data")
+            if message.get("type") == "output" and type(data) is str:
+                received.append(data)
+                output = "".join(received)
+                if expected in output:
+                    return output
+        raise AssertionError("expected terminal output not observed")
 
     def _cleanup(self, receipt) -> None:
         resource = self.control.inspect(self.control_identity, receipt.ref)
@@ -251,14 +257,15 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
                 self.assertEqual(socket.receive_json(), {"type": "authorized"})
                 socket.send_json({"type": "resize", "rows": 30, "columns": 120})
                 marker = "FAILROOM_ANSI_MARKER"
+                expected = f"\x1b[31m{marker}\x1b[0m"
                 socket.send_json(
                     {
                         "type": "input",
                         "data": f"printf '\\033[31m{marker}\\033[0m\\n'\n",
                     }
                 )
-                output = self._receive_until(socket, marker)
-                self.assertIn("\x1b[31m", output)
+                output = self._receive_until(socket, expected)
+                self.assertIn(expected, output)
                 socket.send_json({"type": "close"})
         finally:
             self._cleanup(receipt)
@@ -274,11 +281,30 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
             with TestClient(self._app()).websocket_connect("/v1/terminal") as socket:
                 socket.send_json({"type": "authorize", "capability": issued.token})
                 self.assertEqual(socket.receive_json(), {"type": "authorized"})
-                socket.send_json({"type": "input", "data": "sleep 30\n"})
+                started_marker = "FAILROOM_SLEEP_STARTED"
+                started_expected = f"\x1b[33m{started_marker}\x1b[0m"
+                socket.send_json(
+                    {
+                        "type": "input",
+                        "data": (
+                            f"printf '\\033[33m{started_marker}\\033[0m\\n'; sleep 30\n"
+                        ),
+                    }
+                )
+                self._receive_until(socket, started_expected)
+                signal_started = time.monotonic()
                 socket.send_json({"type": "signal", "value": 2})
                 marker = "FAILROOM_INTERRUPT_MARKER"
-                socket.send_json({"type": "input", "data": f"printf {marker}\\n"})
-                self._receive_until(socket, marker)
+                expected = f"\x1b[32m{marker}\x1b[0m"
+                socket.send_json(
+                    {
+                        "type": "input",
+                        "data": f"printf '\\033[32m{marker}\\033[0m\\n'\n",
+                    }
+                )
+                output = self._receive_until(socket, expected)
+                self.assertIn(expected, output)
+                self.assertLess(time.monotonic() - signal_started, 5)
                 socket.send_json({"type": "close"})
 
             with TestClient(self._app()).websocket_connect("/v1/terminal") as socket:

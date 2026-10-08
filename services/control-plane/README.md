@@ -97,6 +97,13 @@ SQLite 백업을 먼저 만든 뒤 원본의 무결성과 스키마를 검증한
 failroom-control-plane migrate --database /var/lib/failroom/state.sqlite3 --backup /var/lib/failroom/state-before-v3.sqlite3 --target-version 3 --busy-timeout-ms 5000
 ```
 
+Reset Room 세대 바인딩이 필요한 v4로 올릴 때는 v3 데이터베이스와 별도의 새
+절대 백업 경로를 사용하고 `--target-version 4`를 명시한다.
+
+```text
+failroom-control-plane migrate --database /var/lib/failroom/state.sqlite3 --backup /var/lib/failroom/state-before-v4.sqlite3 --target-version 4 --busy-timeout-ms 5000
+```
+
 ## Linux Docker integration evidence
 
 The real Docker lifecycle evidence test is opt-in and requires a trusted Linux
