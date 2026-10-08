@@ -229,8 +229,10 @@ times out, `4400` for an invalid frame, `4403` when authorization or attachment
 is denied, `4409` for an oversized frame or input, and `1011` for a runtime
 failure, including a rejected signal value. Every
 disconnect closes the PTY session and kills the shell's session inside the
-sandbox, including its background jobs. A process started with `setsid` leaves
-that session and keeps running until the sandbox's PID 1 lifetime ends.
+sandbox, including its background jobs; Docker's init, the sandbox's PID 1,
+reaps any of them that had been orphaned to it, so none remain as zombies. A
+process started with `setsid` leaves that session and keeps running until the
+sandbox's PID 1 lifetime ends.
 
 ## Operator migration
 
@@ -337,9 +339,9 @@ export FAILROOM_MAINTENANCE_LIMIT=10
 
 | Test module | Opt-in flag | What it proves |
 | --- | --- | --- |
-| `test_linux_docker_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Provisioning through the orchestrator, container hardening, Leave and Reset cleanup with every generation absent afterwards, and a PID 1 that outlives 60 seconds and stops by the attempt deadline |
+| `test_linux_docker_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Provisioning through the orchestrator, container hardening, Docker's init as PID 1 from a read-only mount, Leave and Reset cleanup with every generation absent afterwards, and a PID 1 that outlives 60 seconds and stops by the attempt deadline |
 | `test_linux_disk_full_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | The Disk Full filler reduces workspace capacity and recovery restores it; the test builds the Disk Full image itself |
-| `test_linux_terminal_integration.py` | `FAILROOM_TERMINAL_INTEGRATION=1` | Input and output, ANSI bytes, resize, Ctrl+C interruption, one-time capability replay denial, and termination of the shell's session and background jobs after disconnect through a real PTY |
+| `test_linux_terminal_integration.py` | `FAILROOM_TERMINAL_INTEGRATION=1` | Input and output, ANSI bytes, resize, Ctrl+C interruption, one-time capability replay denial, and termination and reaping of the shell's session and background jobs after disconnect through a real PTY |
 | `test_linux_local_runtime_integration.py` | `FAILROOM_LOCAL_RUNTIME_INTEGRATION=1` | Enter Room, capability, terminal, recovery verification, Reset Room, and Leave Room through the local app; denial of unreviewed and unauthorized Rooms, of a reused capability, and of a capability issued before a reset; reset maintenance; and a terminal that stays responsive for 70 seconds |
 
 Run one module, or every module whose flags are set:

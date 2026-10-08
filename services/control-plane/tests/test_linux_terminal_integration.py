@@ -396,17 +396,19 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
                 self.assertIn("sleep 1001", commands)
                 socket.send_json({"type": "close"})
 
+            # Zombies keep their session ID, so this also requires the init
+            # process to reap the orphaned `sleep 1001` after it is killed.
             deadline = time.monotonic() + 15
             while True:
-                live = [
+                leftover = [
                     process
                     for process in self._processes(container_id)
-                    if process[1] != "Z" and process[2] == shell
+                    if process[2] == shell
                 ]
-                if not live or time.monotonic() >= deadline:
+                if not leftover or time.monotonic() >= deadline:
                     break
                 time.sleep(0.25)
-            self.assertEqual(live, [])
+            self.assertEqual(leftover, [])
         finally:
             self._cleanup(receipt)
 

@@ -204,7 +204,7 @@ def _validate_lifetime(profile: StrictDockerProfile, lifetime_seconds: object) -
 def _profile_configuration(profile: StrictDockerProfile) -> dict[str, object]:
     """Return every profile field and fixed Docker setting for fingerprinting."""
     return {
-        "schema": "failroom.strict-docker-profile.v2",
+        "schema": "failroom.strict-docker-profile.v3",
         "image": profile.image,
         "identity": {"uid": profile.uid, "gid": profile.gid},
         "seccomp": {"path": profile.seccomp_path, "digest": profile.seccomp_digest},
@@ -222,6 +222,7 @@ def _profile_configuration(profile: StrictDockerProfile) -> dict[str, object]:
             "restart": "no",
             "log_driver": "none",
             "runtime": "runc",
+            "init": True,
             "entrypoint": "/bin/sleep",
             "healthcheck_disabled": True,
             "pull_policy": "never",
@@ -300,8 +301,10 @@ def compile_create_argv(
 
     Binding and operation identifiers are independently validated before being
     incorporated into labels or the deterministic container name. The caller
-    derives ``lifetime_seconds`` from the attempt's immutable deadline; PID 1
-    sleeps only that long, so the container stops on its own at the deadline.
+    derives ``lifetime_seconds`` from the attempt's immutable deadline. PID 1 is
+    Docker's init, which reaps orphaned processes and exits when its only
+    child, ``/bin/sleep``, ends after that long, so the container stops on its
+    own at the deadline.
     """
     _validate_profile(profile)
     _validate_binding(binding)
@@ -344,6 +347,7 @@ def compile_create_argv(
         "none",
         "--runtime",
         "runc",
+        "--init",
         "--entrypoint",
         "/bin/sleep",
         "--no-healthcheck",

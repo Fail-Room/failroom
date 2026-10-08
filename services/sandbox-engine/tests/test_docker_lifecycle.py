@@ -69,6 +69,7 @@ def observation(profile, seccomp_path):
             "IpcMode": "private",
             "CgroupnsMode": "private",
             "Runtime": "runc",
+            "Init": True,
             "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
             "LogConfig": {"Type": "none", "Config": {}},
             "Memory": 134217728,
@@ -241,6 +242,7 @@ class DockerLifecycleTests(unittest.TestCase):
                 self.lifetime = ContainerLifetime(NOW + remaining, self.clock)
                 result = self.create()
                 (create,) = self.docker_calls(("container", "create"))
+                self.assertEqual(create.count("--init"), 1)
                 self.assertEqual(create[create.index("--entrypoint") + 1], "/bin/sleep")
                 self.assertEqual(create[-1], expected)
                 self.assertEqual(self.engine.resource["Config"]["Cmd"], [expected])
@@ -550,6 +552,24 @@ class DockerLifecycleTests(unittest.TestCase):
         self.assertFalse(
             any(c[3:5] == ("container", "start") for c in self.engine.calls)
         )
+
+    def test_container_without_the_reaping_init_is_cleaned_without_start(self):
+        def without_init(resource):
+            del resource["HostConfig"]["Init"]
+
+        for name, mutate in (
+            ("missing", without_init),
+            ("false", lambda r: r["HostConfig"].update(Init=False)),
+            ("null", lambda r: r["HostConfig"].update(Init=None)),
+            ("integer", lambda r: r["HostConfig"].update(Init=1)),
+        ):
+            with self.subTest(init=name):
+                self.reset_engine()
+                self.engine.after_create = mutate
+                with self.assertRaisesRegex(DockerError, "^PROFILE_UNVERIFIED$"):
+                    self.create()
+                self.assertFalse(self.engine.created)
+                self.assertEqual(self.docker_calls(("container", "start")), [])
 
     def test_seccomp_inspect_path_must_match_the_pinned_snapshot(self):
         self.engine.resource["HostConfig"]["SecurityOpt"][1] = (
