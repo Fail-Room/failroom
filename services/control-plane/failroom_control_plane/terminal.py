@@ -1,14 +1,16 @@
 """Control-plane authority checks for one immediate terminal attachment."""
 
+import threading
 from collections.abc import Callable
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
-from failroom_sandbox.pty import PtyError, PtySession
+from failroom_sandbox.pty import PtySession
 from failroom_state import (
     Action,
     AttachmentLease,
     ControlPlaneStore,
+    ResourceRef,
     ResourceState,
     Role,
     ServiceIdentity,
@@ -26,6 +28,7 @@ class TerminalError(Exception):
         if code not in {
             "ATTACHMENT_DENIED",
             "INVALID_CONFIGURATION",
+            "LIMIT_REACHED",
             "PTY_UNAVAILABLE",
         }:
             code = "ATTACHMENT_DENIED"
@@ -50,9 +53,54 @@ class TerminalSession(Protocol):
     def close(self) -> None: ...
 
 
+class TerminalAdmission(Protocol):
+    def release(self) -> None: ...
+
+
+class _Slot:
+    """One counted holder; only its first release returns the slot."""
+
+    def __init__(
+        self, lock: threading.Lock, held: dict[ResourceRef, int], ref: ResourceRef
+    ) -> None:
+        self._lock = lock
+        self._held = held
+        self._ref = ref
+        self._released = False
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+            remaining = self._held[self._ref] - 1
+            if remaining:
+                self._held[self._ref] = remaining
+            else:
+                del self._held[self._ref]
+
+
+class _SandboxSlots:
+    """Bound concurrent holders per exact sandbox generation in process memory."""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._lock = threading.Lock()
+        self._held: dict[ResourceRef, int] = {}
+
+    def acquire(self, ref: ResourceRef) -> _Slot:
+        with self._lock:
+            held = self._held.get(ref, 0)
+            if held >= self._limit:
+                raise TerminalError("LIMIT_REACHED")
+            self._held[ref] = held + 1
+        return _Slot(self._lock, self._held, ref)
+
+
 class _OwnedTerminalSession:
-    def __init__(self, session: PtySession) -> None:
+    def __init__(self, session: PtySession, slot: TerminalAdmission) -> None:
         self._session = session
+        self._slot = slot
         self._closed = False
 
     def read(self, maximum: int) -> bytes:
@@ -71,11 +119,18 @@ class _OwnedTerminalSession:
         if self._closed:
             return
         self._closed = True
-        self._session.close()
+        try:
+            self._session.close()
+        finally:
+            self._slot.release()
 
 
 class ControlPlaneTerminalService:
-    """Bind a consumed attachment lease to the exact current PTY resource."""
+    """Bind a consumed attachment lease to the exact current PTY resource.
+
+    Authorized connections and open sessions are counted per exact sandbox
+    generation in this process's memory and bounded by the profile limits.
+    """
 
     def __init__(
         self,
@@ -83,6 +138,9 @@ class ControlPlaneTerminalService:
         runtime: TerminalRuntime,
         identity: ServiceIdentity,
         now: Clock,
+        *,
+        connection_limit: int,
+        session_limit: int,
     ) -> None:
         if (
             type(control) is not ControlPlaneStore
@@ -91,12 +149,24 @@ class ControlPlaneTerminalService:
             or identity.role is not Role.CONTROL_PLANE
             or Action.INSPECT not in identity.scopes
             or not callable(now)
+            or type(connection_limit) is not int
+            or connection_limit < 1
+            or type(session_limit) is not int
+            or session_limit < 1
         ):
             raise TerminalError("INVALID_CONFIGURATION")
         self._control = control
         self._runtime = runtime
         self._identity = identity
         self._now = now
+        self._connections = _SandboxSlots(connection_limit)
+        self._sessions = _SandboxSlots(session_limit)
+
+    def admit(self, lease: AttachmentLease) -> TerminalAdmission:
+        """Count one authorized connection against its sandbox generation."""
+        if type(lease) is not AttachmentLease or type(lease.ref) is not ResourceRef:
+            raise TerminalError("ATTACHMENT_DENIED")
+        return self._connections.acquire(lease.ref)
 
     def attach(self, lease: AttachmentLease) -> TerminalSession:
         if type(lease) is not AttachmentLease:
@@ -123,10 +193,10 @@ class ControlPlaneTerminalService:
             raise
         except (StoreError, TypeError, ValueError):
             raise TerminalError("ATTACHMENT_DENIED") from None
+        slot = self._sessions.acquire(lease.ref)
         try:
             session = self._runtime.open(resource.container_id, command=_COMMAND)
-        except PtyError:
-            raise TerminalError("PTY_UNAVAILABLE") from None
         except Exception:
+            slot.release()
             raise TerminalError("PTY_UNAVAILABLE") from None
-        return _OwnedTerminalSession(session)
+        return _OwnedTerminalSession(session, slot)

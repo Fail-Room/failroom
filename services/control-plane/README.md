@@ -63,7 +63,10 @@ maintenance.
 `ControlPlaneTerminalService` re-inspects the exact `ResourceRef` associated
 with a consumed `AttachmentLease` immediately before opening `/bin/bash`. It
 rejects expired leases, stale references, non-`READY`/`RUNNING` resources,
-expiry or destroy intent, and missing container identity. The WebSocket route
+expiry or destroy intent, and missing container identity. It also counts
+authorized connections and open PTY sessions per sandbox generation (attempt,
+sandbox and generation) and refuses one beyond the profile's
+`connection_limit` or `session_limit` before opening a PTY. The WebSocket route
 accepts one bounded JSON authorization frame, calls the gateway once, and then
 relays only bounded `input`, `resize`, `signal`, and `close` frames. It closes
 the PTY session on every disconnect, which also stops the shell's processes
@@ -176,7 +179,7 @@ by `StrictDockerProfile` as described in the
 | `FAILROOM_WORKSPACE_TMPFS_BYTES`, `FAILROOM_TEMP_TMPFS_BYTES`, `FAILROOM_TARGET_SUPERVISOR_TMPFS_BYTES`, `FAILROOM_SHM_BYTES` | Sizes of the workspace, temporary, target-supervisor, and shared-memory mounts. |
 | `FAILROOM_IO_DEVICE`, `FAILROOM_IO_READ_BPS`, `FAILROOM_IO_WRITE_BPS` | Docker host block device to throttle and its read and write limits. |
 | `FAILROOM_TERMINAL_OUTPUT_BYTES` | Cumulative terminal output limit, at most 1048576 because the WebSocket relay uses the same limit. |
-| `FAILROOM_CONNECTION_LIMIT`, `FAILROOM_SESSION_LIMIT` | Terminal connection and session limits of the profile. |
+| `FAILROOM_CONNECTION_LIMIT`, `FAILROOM_SESSION_LIMIT` | Concurrent authorized terminal connections and open PTY sessions allowed per sandbox generation; a connection beyond either is closed with `4429`. |
 | `FAILROOM_ABSOLUTE_TTL_SECONDS` | Absolute attempt lifetime. The container's PID 1 exits no later than the attempt deadline. |
 | `FAILROOM_TERMINAL_INPUT_BYTES` | Largest input frame, 1–1048576 and not larger than the frame limit. |
 | `FAILROOM_TERMINAL_SESSION_SECONDS` | Wall-clock PTY session limit, 1–3600. |
@@ -226,8 +229,14 @@ timeout. The server answers `{"type": "authorized"}` and then streams
 accepted), and `close` frames. A capability works once, so a reconnect needs a
 new capability. The server closes the connection with `4408` when authorization
 times out, `4400` for an invalid frame, `4403` when authorization or attachment
-is denied, `4409` for an oversized frame or input, and `1011` for a runtime
-failure, including a rejected signal value. Every
+is denied, `4409` for an oversized frame or input, `4429` when the sandbox
+generation already has as many authorized connections or open sessions as the
+profile allows, and `1011` for a runtime failure, including a rejected signal
+value. A connection counts against these limits only after the gateway has
+consumed its capability, because the capability is what names the sandbox: a
+refused connection has used its capability, and sockets that have not
+authorized are bounded only by the authorization timeout. The counts live in
+the control plane's process memory and start empty when it restarts. Every
 disconnect closes the PTY session and kills the shell's session inside the
 sandbox, including its background jobs; Docker's init, the sandbox's PID 1,
 reaps any of them that had been orphaned to it, so none remain as zombies. A
@@ -341,7 +350,7 @@ export FAILROOM_MAINTENANCE_LIMIT=10
 | --- | --- | --- |
 | `test_linux_docker_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Provisioning through the orchestrator, container hardening, Docker's init as PID 1 from a read-only mount, Leave and Reset cleanup with every generation absent afterwards, and a PID 1 that outlives 60 seconds and stops by the attempt deadline |
 | `test_linux_disk_full_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | The Disk Full filler reduces workspace capacity and recovery restores it; the test builds the Disk Full image itself |
-| `test_linux_terminal_integration.py` | `FAILROOM_TERMINAL_INTEGRATION=1` | Input and output, ANSI bytes, resize, Ctrl+C interruption, one-time capability replay denial, and termination and reaping of the shell's session and background jobs after disconnect through a real PTY |
+| `test_linux_terminal_integration.py` | `FAILROOM_TERMINAL_INTEGRATION=1` | Input and output, ANSI bytes, resize, Ctrl+C interruption, one-time capability replay denial, termination and reaping of the shell's session and background jobs after disconnect, and refusal with `4429` of a terminal beyond the profile's connection or session limit until one closes, through a real PTY |
 | `test_linux_local_runtime_integration.py` | `FAILROOM_LOCAL_RUNTIME_INTEGRATION=1` | Enter Room, capability, terminal, recovery verification, Reset Room, and Leave Room through the local app; denial of unreviewed and unauthorized Rooms, of a reused capability, and of a capability issued before a reset; reset maintenance; and a terminal that stays responsive for 70 seconds |
 
 Run one module, or every module whose flags are set:

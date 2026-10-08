@@ -425,6 +425,8 @@ def build_runtime(config: LocalRuntimeConfig, *, now: Clock) -> LocalRuntime:
             ),
             control_identity,
             now,
+            connection_limit=config.controller.profile.connection_limit,
+            session_limit=config.controller.profile.session_limit,
         )
         app = create_app(
             authority=authority,

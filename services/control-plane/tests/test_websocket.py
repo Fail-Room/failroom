@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from failroom_control_plane.terminal import TerminalError
 from failroom_control_plane.websocket import (
     WebSocketLimits,
     mount_terminal_route,
@@ -59,13 +60,33 @@ class RecordingGateway:
         return self.attachment
 
 
+class RecordingAdmission:
+    def __init__(self) -> None:
+        self.released = 0
+
+    def release(self) -> None:
+        self.released += 1
+
+
 class RecordingTerminal:
     def __init__(self, session: RecordingSession) -> None:
         self.session = session
+        self.admissions: list[RecordingAdmission] = []
         self.leases: list[AttachmentLease] = []
+        self.admit_error: TerminalError | None = None
+        self.attach_error: TerminalError | None = None
+
+    def admit(self, lease: AttachmentLease) -> RecordingAdmission:
+        if self.admit_error is not None:
+            raise self.admit_error
+        admission = RecordingAdmission()
+        self.admissions.append(admission)
+        return admission
 
     def attach(self, lease: AttachmentLease) -> RecordingSession:
         self.leases.append(lease)
+        if self.attach_error is not None:
+            raise self.attach_error
         return self.session
 
 
@@ -121,6 +142,32 @@ class WebSocketTests(unittest.TestCase):
         self.assertEqual(len(self.gateway.calls), 1)
         self.assertEqual(len(self.terminal.leases), 1)
         self.assertEqual(self.session.closed, 1)
+        self.assertEqual([a.released for a in self.terminal.admissions], [1])
+
+    def test_connection_beyond_the_limit_is_closed_before_attach(self) -> None:
+        self.terminal.admit_error = TerminalError("LIMIT_REACHED")
+
+        with self.client.websocket_connect("/v1/terminal") as socket:
+            socket.send_json({"type": "authorize", "capability": "secret-capability"})
+            with self.assertRaises(WebSocketDisconnect) as raised:
+                socket.receive_json()
+
+        self.assertEqual(raised.exception.code, 4429)
+        self.assertEqual(self.terminal.leases, [])
+
+    def test_session_beyond_the_limit_is_closed_and_releases_the_connection(
+        self,
+    ) -> None:
+        self.terminal.attach_error = TerminalError("LIMIT_REACHED")
+
+        with self.client.websocket_connect("/v1/terminal") as socket:
+            socket.send_json({"type": "authorize", "capability": "secret-capability"})
+            with self.assertRaises(WebSocketDisconnect) as raised:
+                socket.receive_json()
+
+        self.assertEqual(raised.exception.code, 4429)
+        self.assertEqual([a.released for a in self.terminal.admissions], [1])
+        self.assertEqual(self.session.closed, 0)
 
     def test_second_authorize_frame_is_protocol_denied(self) -> None:
         with self.client.websocket_connect("/v1/terminal") as socket:
@@ -143,6 +190,7 @@ class WebSocketTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 4403)
         self.assertNotIn("secret-capability", str(raised.exception))
+        self.assertEqual(self.terminal.admissions, [])
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -181,6 +182,8 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
             ),
             self.control_identity,
             lambda: self.now,
+            connection_limit=self.profile.connection_limit,
+            session_limit=self.profile.session_limit,
         )
         self.codec = CapabilityCodec(
             _required("FAILROOM_CAPABILITY_SECRET").encode("utf-8"),
@@ -250,6 +253,23 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
             ):
                 return output
         raise AssertionError("terminal marker not observed")
+
+    def _authorize(self, receipt) -> dict[str, str]:
+        issued = self.authority.issue(
+            self.user,
+            receipt.attempt_id,
+            now=lambda: self.now,
+        )
+        return {"type": "authorize", "capability": issued.token}
+
+    @staticmethod
+    def _close_and_wait(socket) -> None:
+        """Request close and wait until the server has closed the terminal."""
+        socket.send_json({"type": "close"})
+        for _ in range(1000):
+            if socket.receive()["type"] == "websocket.close":
+                return
+        raise AssertionError("terminal close not observed")
 
     @staticmethod
     def _processes(container_id: str) -> list[tuple[str, str, str, str]]:
@@ -409,6 +429,36 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
                     break
                 time.sleep(0.25)
             self.assertEqual(leftover, [])
+        finally:
+            self._cleanup(receipt)
+
+    def test_terminal_beyond_the_profile_limit_is_refused_until_one_closes(
+        self,
+    ) -> None:
+        receipt = self._provision()
+        limit = min(self.profile.connection_limit, self.profile.session_limit)
+        try:
+            with ExitStack() as stack:
+                held = []
+                for _ in range(limit):
+                    socket = stack.enter_context(
+                        TestClient(self._app()).websocket_connect("/v1/terminal")
+                    )
+                    socket.send_json(self._authorize(receipt))
+                    self.assertEqual(socket.receive_json(), {"type": "authorized"})
+                    held.append(socket)
+                with TestClient(self._app()).websocket_connect("/v1/terminal") as extra:
+                    extra.send_json(self._authorize(receipt))
+                    with self.assertRaises(WebSocketDisconnect) as raised:
+                        extra.receive_json()
+                self.assertEqual(raised.exception.code, 4429)
+                for socket in held:
+                    self._close_and_wait(socket)
+
+            with TestClient(self._app()).websocket_connect("/v1/terminal") as socket:
+                socket.send_json(self._authorize(receipt))
+                self.assertEqual(socket.receive_json(), {"type": "authorized"})
+                self._close_and_wait(socket)
         finally:
             self._cleanup(receipt)
 
