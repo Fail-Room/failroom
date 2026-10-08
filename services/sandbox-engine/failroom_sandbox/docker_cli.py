@@ -5,12 +5,28 @@ import math
 import re
 import subprocess
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import BinaryIO, Protocol, cast
 
+from .qualification_probe import PROBE_SCRIPT
 from .scenario import DISK_FULL_FILLER_PATH
 
 _TARGET_SUPERVISOR_USER = "0:0"
+# Daemon facts that change when the runtime a report qualified changes.
+_ENGINE_FIELDS = (
+    "ServerVersion",
+    "KernelVersion",
+    "OperatingSystem",
+    "OSType",
+    "Architecture",
+    "Driver",
+    "CgroupDriver",
+    "CgroupVersion",
+    "DefaultRuntime",
+    "InitBinary",
+)
 
 
 class DockerError(RuntimeError):
@@ -35,6 +51,14 @@ class ProcessResult:
     returncode: int
     stdout: bytes
     stderr: bytes
+
+
+@dataclass(frozen=True)
+class EngineIdentity:
+    """Daemon facts that bind qualification evidence to one runtime."""
+
+    engine_id: str
+    configuration: Mapping[str, object]
 
 
 class Runner(Protocol):
@@ -120,6 +144,28 @@ def _one_object(data: bytes) -> dict[str, object]:
         return cast(dict[str, object], value[0])
     except (ValueError, UnicodeError, RecursionError):
         raise DockerError("INVALID_DOCKER_RESPONSE") from None
+
+
+def _json_object(data: bytes) -> dict[str, object]:
+    try:
+        value = json.loads(
+            data,
+            object_pairs_hook=_unique_object,
+            parse_constant=lambda _: (_ for _ in ()).throw(ValueError()),
+        )
+        if type(value) is not dict:
+            raise ValueError
+        return cast(dict[str, object], value)
+    except (ValueError, UnicodeError, RecursionError):
+        raise DockerError("INVALID_DOCKER_RESPONSE") from None
+
+
+def _printable(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) <= 256
+        and all(32 <= ord(char) <= 126 for char in value)
+    )
 
 
 def _container_selector(value: str) -> None:
@@ -220,6 +266,42 @@ class DockerCli:
         ):
             raise DockerError("INVALID_DOCKER_REQUEST")
         return _one_object(self._call(("image", "inspect", image)).stdout)
+
+    def engine_identity(self) -> EngineIdentity:
+        """Read the fixed daemon facts that identify one qualified runtime."""
+        info = _json_object(self._call(("info", "--format", "{{json .}}")).stdout)
+        engine_id = info.get("ID")
+        options = info.get("SecurityOptions")
+        runtimes = info.get("Runtimes")
+        if (
+            type(engine_id) is not str
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,127}", engine_id) is None
+            or not all(_printable(info.get(name)) for name in _ENGINE_FIELDS)
+            or type(options) is not list
+            or not all(_printable(option) for option in options)
+            or type(runtimes) is not dict
+            or not all(_printable(name) for name in runtimes)
+        ):
+            raise DockerError("INVALID_DOCKER_RESPONSE")
+        configuration: dict[str, object] = {name: info[name] for name in _ENGINE_FIELDS}
+        configuration["SecurityOptions"] = sorted(options)
+        configuration["Runtimes"] = sorted(runtimes)
+        return EngineIdentity(engine_id, MappingProxyType(configuration))
+
+    def run_qualification_probe(self, container_id: str) -> bytes:
+        """Run the fixed probe in a sandbox as its configured user."""
+        _container_selector(container_id)
+        return self._call(
+            (
+                "container",
+                "exec",
+                container_id,
+                "/bin/sh",
+                "-c",
+                PROBE_SCRIPT,
+                "failroom-qualification-probe",
+            )
+        ).stdout
 
     def inspect_container(self, selector: str) -> dict[str, object] | None:
         _container_selector(selector)

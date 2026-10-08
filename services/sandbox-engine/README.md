@@ -166,7 +166,9 @@ socket, host shell, or host filesystem to the learner sandbox.
 
 Only the trusted control plane may assemble contexts and reports. Do not build
 them from a browser request or treat sandbox-generated success text as evidence.
-The collector, artifact storage and actual resource probes are not implemented.
+The fixed qualification probe below gathers container-level evidence;
+collecting the scenario checks, storing evidence artifacts and gating
+allocation are not implemented.
 Artifact hashes are references, not signatures: this evaluator does not establish
 artifact authenticity, inspect their contents, or prove that tests ran.
 
@@ -180,6 +182,30 @@ effects. It must also validate service authentication, ownership, expected
 sandbox/generation, idempotency and lifecycle/expiry intent, and serialize these
 checks with creation. This guard cannot prevent time-of-check/time-of-use races
 on its own. A previous success must never be cached as continuing permission.
+
+## Qualification probe
+
+`PROBE_SCRIPT` is one fixed POSIX shell script. `DockerCli.run_qualification_probe()`
+runs it in a sandbox through `docker exec` as the sandbox's configured user; a
+caller supplies only the container ID. The script reads kernel-reported facts:
+identity, capabilities, `no_new_privs` and the seccomp mode from
+`/proc/self/status`, the boot ID, the process list, `/proc/self/mountinfo`,
+network interfaces and routes, the cgroup v2 CPU, memory, swap, PID and I/O
+limits, and the file descriptor limits. It also tries one TCP connection to the
+documentation address `192.0.2.1` and one write of 1 MiB more than the workspace
+tmpfs holds, then removes what it wrote. It depends on `/bin/sh`, coreutils,
+`sed`, `awk`, `find`, `timeout` and `bash` in the reviewed, digest-pinned image.
+
+`parse_probe_output()` accepts only the fixed keys, each single-valued key once,
+printable ASCII, at most 512 lines, ending with `end=1`. `judge_container_checks()`
+compares the facts with the exact profile and the host-side inspect document for
+the twelve container checks: identity and capabilities, seccomp, the mount
+allow-list, the PID namespace and workload, runtime sockets and host resources,
+the network, and the CPU, memory and swap, PID, tmpfs, I/O and descriptor
+limits. A fact that contradicts the profile fails its check and a fact that
+cannot be read leaves it UNVERIFIED; each result carries a fixed reason code.
+`DockerCli.engine_identity()` reads only the fixed `docker info` fields that
+identify the daemon.
 
 ## Error contract
 
@@ -196,6 +222,6 @@ They do not copy raw evidence, configuration, runtime IDs, paths, or credentials
 | `CHECK_MISSING` / `CHECK_FAILED` / `CHECK_UNVERIFIED` | Mandatory check is not verified as passing |
 | `EVIDENCE_EXPIRED` / `EVIDENCE_FUTURE` | Evidence is outside the allowed observation interval |
 
-Failures in the future runtime collector must produce FAIL or UNVERIFIED, not an
+Failures in the collector must produce FAIL or UNVERIFIED, not an
 empty passing report. Cleanup remains permitted and required even when a profile
 cannot qualify for new creation.

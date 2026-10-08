@@ -4,16 +4,23 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import UTC
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, patch
 
+import test_qualification_collector as qualification
+from failroom_sandbox.models import QualificationDecision
+from failroom_sandbox.qualification import evaluate_qualification
 from failroom_state import StoreError
 
 from failroom_control_plane import cli
 from failroom_control_plane.cli import main
 from failroom_control_plane.local_runtime import LocalRuntimeError
+from failroom_control_plane.qualification_collector import (
+    QualificationError,
+    format_collection,
+)
 
 
 class MigrationCliTests(unittest.TestCase):
@@ -31,6 +38,7 @@ class MigrationCliTests(unittest.TestCase):
         database_factory=None,
         local_runner=None,
         local_verifier=None,
+        local_qualifier=None,
     ):
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -39,6 +47,8 @@ class MigrationCliTests(unittest.TestCase):
             kwargs["local_runner"] = local_runner
         if local_verifier is not None:
             kwargs["local_verifier"] = local_verifier
+        if local_qualifier is not None:
+            kwargs["local_qualifier"] = local_qualifier
         result = main(
             argv,
             database_factory=database_factory,
@@ -291,6 +301,107 @@ class MigrationCliTests(unittest.TestCase):
         from_environment.assert_called_once_with()
         preflight_runtime.assert_called_once_with(config)
         build_runtime.assert_not_called()
+
+    def collection(self):
+        docker = qualification.FakeDocker()
+        return qualification.QualificationCollector(
+            docker,
+            qualification.FakeLifecycle(docker),
+            qualification.profile(),
+            max_age=timedelta(hours=1),
+            now=lambda: qualification.NOW,
+        ).collect()
+
+    def test_qualify_local_prints_the_report_and_exits_by_decision(self) -> None:
+        collection = self.collection()
+        report = collection.report
+        denied = evaluate_qualification(
+            report.context, report, now=qualification.NOW, max_age=timedelta(hours=1)
+        )
+        for decision, code in ((denied, 3), (QualificationDecision(()), 0)):
+            with self.subTest(code=code):
+                qualifier = Mock(return_value=(collection, decision))
+
+                result, stdout, stderr = self.run_cli(
+                    ["qualify-local"], local_qualifier=qualifier
+                )
+
+                self.assertEqual((result, stderr), (code, ""))
+                self.assertEqual(
+                    stdout.splitlines(), list(format_collection(collection, decision))
+                )
+                qualifier.assert_called_once_with(None)
+
+    def test_qualify_local_reduces_collection_failures(self) -> None:
+        for error, code in (
+            (QualificationError("CLEANUP_INCOMPLETE"), "CLEANUP_INCOMPLETE"),
+            (LocalRuntimeError("RUNTIME_UNAVAILABLE"), "RUNTIME_UNAVAILABLE"),
+            (LocalRuntimeError(), "INVALID_CONFIGURATION"),
+        ):
+            with self.subTest(code=code):
+                result, stdout, stderr = self.run_cli(
+                    ["qualify-local"], local_qualifier=Mock(side_effect=error)
+                )
+                self.assertEqual((result, stdout, stderr), (2, "", code + "\n"))
+
+    def test_default_qualifier_reads_max_age_before_any_runtime_call(self) -> None:
+        with (
+            patch(
+                "failroom_control_plane.cli.LocalRuntimeConfig.from_environment",
+                return_value=SimpleNamespace(),
+            ),
+            patch("failroom_control_plane.cli.preflight_runtime") as preflight_runtime,
+        ):
+            with self.assertRaises(LocalRuntimeError):
+                cli._qualify_local({})
+
+        preflight_runtime.assert_not_called()
+
+    def test_default_qualifier_collects_after_preflight_and_evaluates(self) -> None:
+        collection = self.collection()
+        controller = SimpleNamespace(
+            docker_cli=Mock(return_value="docker"),
+            seccomp_policy_store=Mock(return_value="policies"),
+            profile="profile",
+        )
+        config = SimpleNamespace(controller=controller)
+        environment = {"FAILROOM_QUALIFICATION_MAX_AGE_SECONDS": "3600"}
+        calls = []
+
+        with (
+            patch(
+                "failroom_control_plane.cli.LocalRuntimeConfig.from_environment",
+                return_value=config,
+            ),
+            patch(
+                "failroom_control_plane.cli.preflight_runtime",
+                side_effect=lambda value: calls.append(("preflight", value)),
+            ),
+            patch(
+                "failroom_control_plane.cli.DockerDiagnosticLifecycle",
+                return_value="lifecycle",
+            ) as lifecycle,
+            patch("failroom_control_plane.cli.QualificationCollector") as collector,
+        ):
+            collector.return_value.collect.side_effect = lambda: (
+                calls.append(("collect", None)) or collection
+            )
+            result, decision = cli._qualify_local(environment)
+
+        self.assertEqual(calls, [("preflight", config), ("collect", None)])
+        lifecycle.assert_called_once_with("docker", "policies")
+        collector.assert_called_once_with(
+            "docker",
+            "lifecycle",
+            "profile",
+            max_age=timedelta(hours=1),
+            now=ANY,
+        )
+        now = collector.call_args.kwargs["now"]
+        self.assertIsInstance(now(), datetime)
+        self.assertEqual(now().tzinfo, UTC)
+        self.assertIs(result, collection)
+        self.assertFalse(decision.allowed)
 
 
 if __name__ == "__main__":

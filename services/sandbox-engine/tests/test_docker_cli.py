@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 import unittest
@@ -8,6 +9,7 @@ from failroom_sandbox.docker_cli import (
     ProcessResult,
     _run_process,
 )
+from failroom_sandbox.qualification_probe import PROBE_SCRIPT
 
 
 class DockerCliTests(unittest.TestCase):
@@ -313,3 +315,138 @@ class DockerCliTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(DockerError, "^RUNTIME_UNAVAILABLE$"):
             cli.inspect_container("a" * 64)
+
+
+_ENGINE_INFO = {
+    "ID": "84d593e9-7052-471f-aacb-4806ba541464",
+    "Name": "docker-desktop",
+    "Containers": 3,
+    "ServerVersion": "29.4.2",
+    "KernelVersion": "6.18.40.1-microsoft-standard-WSL2",
+    "OperatingSystem": "Docker Desktop (containerized)",
+    "OSType": "linux",
+    "Architecture": "x86_64",
+    "Driver": "overlayfs",
+    "CgroupDriver": "cgroupfs",
+    "CgroupVersion": "2",
+    "DefaultRuntime": "runc",
+    "InitBinary": "docker-init",
+    "SecurityOptions": ["name=seccomp,profile=builtin", "name=cgroupns"],
+    "Runtimes": {"runc": {"path": "runc"}, "io.containerd.runc.v2": {}},
+}
+
+
+class QualificationCommandTests(unittest.TestCase):
+    def cli(self, runner):
+        return DockerCli(
+            context="desktop-linux", timeout=5, max_output_bytes=65536, runner=runner
+        )
+
+    def test_runs_the_fixed_probe_as_the_configured_user(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append(argv)
+            return ProcessResult(0, b"probe=1\nend=1\n", b"")
+
+        output = self.cli(runner).run_qualification_probe("a" * 64)
+
+        self.assertEqual(output, b"probe=1\nend=1\n")
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "docker",
+                    "--context",
+                    "desktop-linux",
+                    "container",
+                    "exec",
+                    "a" * 64,
+                    "/bin/sh",
+                    "-c",
+                    PROBE_SCRIPT,
+                    "failroom-qualification-probe",
+                )
+            ],
+        )
+        self.assertNotIn("--user", calls[0])
+
+    def test_probe_rejects_invalid_targets_and_any_stderr(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append(argv)
+            return ProcessResult(0, b"probe=1\nend=1\n", b"warning")
+
+        cli = self.cli(runner)
+        with self.assertRaisesRegex(DockerError, "^INVALID_DOCKER_REQUEST$"):
+            cli.run_qualification_probe("--privileged")
+        self.assertEqual(calls, [])
+        with self.assertRaisesRegex(DockerError, "^RUNTIME_UNAVAILABLE$"):
+            cli.run_qualification_probe("a" * 64)
+
+    def test_reads_only_the_fixed_engine_identity_fields(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append(argv)
+            return ProcessResult(0, json.dumps(_ENGINE_INFO).encode(), b"")
+
+        identity = self.cli(runner).engine_identity()
+
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "docker",
+                    "--context",
+                    "desktop-linux",
+                    "info",
+                    "--format",
+                    "{{json .}}",
+                )
+            ],
+        )
+        self.assertEqual(identity.engine_id, _ENGINE_INFO["ID"])
+        self.assertEqual(
+            dict(identity.configuration),
+            {
+                "ServerVersion": "29.4.2",
+                "KernelVersion": "6.18.40.1-microsoft-standard-WSL2",
+                "OperatingSystem": "Docker Desktop (containerized)",
+                "OSType": "linux",
+                "Architecture": "x86_64",
+                "Driver": "overlayfs",
+                "CgroupDriver": "cgroupfs",
+                "CgroupVersion": "2",
+                "DefaultRuntime": "runc",
+                "InitBinary": "docker-init",
+                "SecurityOptions": ["name=cgroupns", "name=seccomp,profile=builtin"],
+                "Runtimes": ["io.containerd.runc.v2", "runc"],
+            },
+        )
+
+    def test_engine_identity_rejects_malformed_documents(self):
+        def changed(**fields):
+            return json.dumps({**_ENGINE_INFO, **fields}).encode()
+
+        without_init = {k: v for k, v in _ENGINE_INFO.items() if k != "InitBinary"}
+        cases = {
+            "id with space": changed(ID="engine id"),
+            "missing id": json.dumps(
+                {k: v for k, v in _ENGINE_INFO.items() if k != "ID"}
+            ).encode(),
+            "missing field": json.dumps(without_init).encode(),
+            "integer field": changed(ServerVersion=29),
+            "control character": changed(KernelVersion="6.18\n"),
+            "options not a list": changed(SecurityOptions="name=seccomp"),
+            "runtimes not an object": changed(Runtimes=["runc"]),
+            "duplicate key": b'{"ID": "a", "ID": "b"}',
+            "not an object": json.dumps([_ENGINE_INFO]).encode(),
+            "not json": b"engine",
+        }
+        for name, data in cases.items():
+            with self.subTest(case=name):
+                cli = self.cli(lambda *a, data=data, **k: ProcessResult(0, data, b""))
+                with self.assertRaisesRegex(DockerError, "^INVALID_DOCKER_RESPONSE$"):
+                    cli.engine_identity()

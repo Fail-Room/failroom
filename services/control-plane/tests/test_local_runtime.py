@@ -17,6 +17,7 @@ from failroom_control_plane.local_runtime import (
     LocalRuntimeError,
     build_runtime,
     local_lifespan,
+    qualification_max_age,
 )
 from failroom_control_plane.maintenance import (
     LifecycleMaintenanceService,
@@ -153,6 +154,16 @@ class LocalRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(terminal.call_count, 1)
         self.assertEqual(terminal.call_args.kwargs["connection_limit"], 3)
         self.assertEqual(terminal.call_args.kwargs["session_limit"], 2)
+
+    def test_qualification_max_age_is_required_and_bounded(self) -> None:
+        name = "FAILROOM_QUALIFICATION_MAX_AGE_SECONDS"
+        self.assertEqual(qualification_max_age({name: "3600"}), timedelta(hours=1))
+        self.assertEqual(qualification_max_age({name: "60"}), timedelta(minutes=1))
+        self.assertEqual(qualification_max_age({name: "86400"}), timedelta(days=1))
+        for value in (None, "", "59", "86401", "1.5", "one", "-60"):
+            environment = {} if value is None else {name: value}
+            with self.subTest(value=value), self.assertRaises(LocalRuntimeError):
+                qualification_max_age(environment)
 
     def test_public_package_exports_local_runtime_interfaces(self) -> None:
         self.assertIs(failroom_control_plane.LocalRuntime, LocalRuntime)
