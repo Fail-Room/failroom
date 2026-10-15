@@ -6,10 +6,12 @@ import unittest
 from pathlib import Path
 
 from failroom_control_plane.qualification_workspace import (
+    ID_NAME,
     LOCK_NAME,
     WORKSPACE_NAME,
     LockedWorkspace,
     WorkspaceError,
+    workspace_id,
 )
 
 
@@ -34,6 +36,43 @@ class WorkspaceConfigurationTests(unittest.TestCase):
                 pass
             self.assertEqual(raised.exception.code, "WORKSPACE_UNAVAILABLE")
             self.assertEqual(list(Path(name).iterdir()), [])
+
+
+class WorkspaceIdTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.path = Path(temp.name)
+
+    def test_id_is_created_once_and_then_kept(self) -> None:
+        first = workspace_id(self.path)
+
+        self.assertRegex(first, r"^[0-9a-f]{32}$")
+        self.assertEqual(workspace_id(self.path), first)
+        self.assertEqual(
+            (self.path / ID_NAME).read_bytes(), (first + "\n").encode("ascii")
+        )
+        self.assertEqual([entry.name for entry in self.path.iterdir()], [ID_NAME])
+
+    def test_an_id_that_is_not_one_is_refused(self) -> None:
+        for content in (b"", b"a" * 32, b"A" * 32 + b"\n", b"a" * 31 + b"\n"):
+            with self.subTest(content=content):
+                (self.path / ID_NAME).write_bytes(content)
+                with self.assertRaises(WorkspaceError) as raised:
+                    workspace_id(self.path)
+                self.assertEqual(raised.exception.code, "WORKSPACE_UNSAFE")
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux ownership evidence required")
+    def test_id_is_private_and_never_read_through_a_link(self) -> None:
+        workspace_id(self.path)
+        self.assertEqual(stat.S_IMODE(os.stat(self.path / ID_NAME).st_mode), 0o600)
+
+        elsewhere = self.path / "elsewhere"
+        (self.path / ID_NAME).rename(elsewhere)
+        (self.path / ID_NAME).symlink_to(elsewhere)
+        with self.assertRaises(WorkspaceError) as raised:
+            workspace_id(self.path)
+        self.assertEqual(raised.exception.code, "WORKSPACE_UNSAFE")
 
 
 @unittest.skipUnless(sys.platform == "linux", "Linux ownership evidence required")

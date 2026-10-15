@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from datetime import UTC, datetime, timedelta
@@ -32,18 +33,21 @@ from test_linux_docker_integration import (
 from test_linux_terminal_integration import _terminal_limits
 
 from failroom_control_plane.qualification_collector import (
-    QUALIFICATION_ATTEMPT,
+    QUALIFICATION_ATTEMPT_PREFIX,
     QualificationCollector,
     QualificationError,
+    qualification_attempt,
 )
 from failroom_control_plane.qualification_restart import (
     RESTART_DIRECTORY,
     RestartScenario,
 )
 from failroom_control_plane.qualification_workspace import (
+    ID_NAME,
     LOCK_NAME,
     WORKSPACE_NAME,
     LockedWorkspace,
+    workspace_id,
 )
 from failroom_control_plane.runtime_docker import (
     DockerCleanupRuntime,
@@ -105,8 +109,13 @@ class LinuxQualificationIntegrationTests(unittest.TestCase):
     def sandboxes(self, *labels: str) -> tuple[str, ...]:
         return self.cli.list_containers(("label=failroom.kind=diagnostic", *labels))
 
+    def attempt(self) -> str:
+        """This workspace's attempt label; reading it creates the ID once."""
+        with LockedWorkspace(self.scratch).hold() as workspace:
+            return qualification_attempt(workspace_id(workspace))
+
     def collector_sandboxes(self) -> tuple[str, ...]:
-        return self.sandboxes("label=failroom.attempt_id=" + QUALIFICATION_ATTEMPT)
+        return self.sandboxes("label=failroom.attempt_id=" + self.attempt())
 
     def assert_every_check_passes(self, collection) -> None:
         report = collection.report
@@ -127,7 +136,7 @@ class LinuxQualificationIntegrationTests(unittest.TestCase):
         self.assert_every_check_passes(collection)
         # Neither the Room sandbox nor any scratch state outlives the collection.
         self.assertEqual(set(self.sandboxes()), before)
-        self.assertEqual(self.workspace_entries(), [LOCK_NAME])
+        self.assertEqual(self.workspace_entries(), [LOCK_NAME, ID_NAME])
         self.assertEqual(
             report.context.image_digest,
             self.cli.inspect_image(self.profile.image)["Id"],
@@ -146,7 +155,7 @@ class LinuxQualificationIntegrationTests(unittest.TestCase):
         # PID 1 of the first exits on its own after two seconds, as after a
         # crash; the second still runs when the next collection starts.
         for name, seconds in (("probe-stopped-", 13), ("sentinel-running-", 120)):
-            binding = DockerBinding(QUALIFICATION_ATTEMPT, name + uuid4().hex[:12], 1)
+            binding = DockerBinding(self.attempt(), name + uuid4().hex[:12], 1)
             operation = uuid4().hex
             created = self.lifecycle.create_diagnostic(
                 self.profile,
@@ -200,7 +209,7 @@ class LinuxQualificationIntegrationTests(unittest.TestCase):
             collection = self.collector().collect()
 
             self.assertEqual(self.sandboxes(*labels), ())
-            self.assertEqual(self.workspace_entries(), [LOCK_NAME])
+            self.assertEqual(self.workspace_entries(), [LOCK_NAME, ID_NAME])
             self.assert_every_check_passes(collection)
         finally:
             for container_id in self.sandboxes(*labels):
@@ -208,6 +217,33 @@ class LinuxQualificationIntegrationTests(unittest.TestCase):
                     DockerBinding(binding["attempt_id"], binding["sandbox_id"], 1),
                     container_id,
                 )
+
+    def test_sandbox_of_another_workspace_is_left_alone(self) -> None:
+        # A running sandbox of another database directory's collection.
+        other = tempfile.TemporaryDirectory(dir=self.scratch)
+        self.addCleanup(other.cleanup)
+        with LockedWorkspace(Path(other.name)).hold() as workspace:
+            attempt = qualification_attempt(workspace_id(workspace))
+        self.assertNotEqual(attempt, self.attempt())
+        self.assertTrue(attempt.startswith(QUALIFICATION_ATTEMPT_PREFIX))
+        binding = DockerBinding(attempt, "sentinel-" + uuid4().hex, 1)
+        operation = uuid4().hex
+        created = self.lifecycle.create_diagnostic(
+            self.profile,
+            binding,
+            operation,
+            lifetime=ContainerLifetime(_now() + timedelta(seconds=120), _now),
+        )
+        try:
+            self.collector().collect()
+
+            data = self.cli.inspect_container(created.container_id)
+            self.assertIsNotNone(data)
+            self.assertIs(data["State"]["Running"], True)
+        finally:
+            self.lifecycle.destroy(
+                binding, created.container_id, operation_id=operation
+            )
 
     def test_a_second_collection_is_refused_while_one_holds_the_workspace(
         self,

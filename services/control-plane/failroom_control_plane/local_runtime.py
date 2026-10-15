@@ -4,7 +4,8 @@ import asyncio
 import hashlib
 import math
 import os
-from collections.abc import AsyncIterator, Mapping
+import sys
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -44,6 +45,9 @@ from .http import create_app
 from .lifecycle import RoomLifecycleService
 from .maintenance import LifecycleMaintenanceService, MaintenanceError
 from .orchestrator import LifecycleOrchestrator
+from .qualification_collector import QualificationCollector
+from .qualification_gate import GatedProvisioningRuntime, QualificationGate
+from .qualification_workspace import CollectionWorkspace, LockedWorkspace
 from .recovery import RecoveryVerificationService
 from .reset import RoomResetService
 from .room_scenarios import RoomScenarioRegistry
@@ -134,6 +138,7 @@ class LocalRuntimeConfig:
     websocket_limits: WebSocketLimits
     maintenance_interval: timedelta
     maintenance_limit: int
+    qualification_max_age: timedelta
 
     @classmethod
     def from_environment(
@@ -264,6 +269,7 @@ class LocalRuntimeConfig:
                     values, "FAILROOM_MAINTENANCE_INTERVAL_SECONDS"
                 ),
                 maintenance_limit=maintenance_limit,
+                qualification_max_age=qualification_max_age(values),
             )
         except (ConfigurationError, LocalRuntimeError, ValueError, UnicodeError):
             raise LocalRuntimeError() from None
@@ -276,6 +282,7 @@ class LocalRuntime:
     backend_identity: ServiceIdentity
     control_identity: ServiceIdentity
     gateway_identity: ServiceIdentity
+    qualification: QualificationGate
 
 
 def preflight_runtime(
@@ -313,9 +320,18 @@ async def _maintenance_loop(
             pass
 
 
+def _announce(line: str) -> None:
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+
+
 @asynccontextmanager
 async def local_lifespan(
-    maintenance: LifecycleMaintenanceService, *, interval: timedelta
+    maintenance: LifecycleMaintenanceService,
+    *,
+    interval: timedelta,
+    qualification: QualificationGate | None = None,
+    announce: Callable[[str], None] = _announce,
 ) -> AsyncIterator[None]:
     if interval <= timedelta(0):
         raise LocalRuntimeError()
@@ -323,24 +339,41 @@ async def local_lifespan(
         await asyncio.to_thread(maintenance.run_once)
     except MaintenanceError:
         raise LocalRuntimeError("RUNTIME_UNAVAILABLE") from None
-    task = asyncio.create_task(_maintenance_loop(maintenance, interval))
     try:
-        yield
-    finally:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        if qualification is not None:
+            # Serve even without a passing report: only allocation is refused,
+            # so status, Leave Room and cleanup keep working.
+            announce(await asyncio.to_thread(qualification.start))
+        task = asyncio.create_task(_maintenance_loop(maintenance, interval))
         try:
-            await asyncio.to_thread(maintenance.run_once)
-        except MaintenanceError:
-            pass
+            yield
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            try:
+                await asyncio.to_thread(maintenance.run_once)
+            except MaintenanceError:
+                pass
+    finally:
+        if qualification is not None:
+            try:
+                await asyncio.to_thread(qualification.close)
+            except Exception:
+                # The next collection removes a sentinel left running.
+                announce("QUALIFICATION_CLEANUP_INCOMPLETE")
 
 
 def _application_lifespan(
-    maintenance: LifecycleMaintenanceService, *, interval: timedelta
+    maintenance: LifecycleMaintenanceService,
+    *,
+    interval: timedelta,
+    qualification: QualificationGate,
 ) -> Lifespan[FastAPI]:
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        async with local_lifespan(maintenance, interval=interval):
+        async with local_lifespan(
+            maintenance, interval=interval, qualification=qualification
+        ):
             yield
 
     return lifespan
@@ -370,15 +403,46 @@ def build_runtime(config: LocalRuntimeConfig, *, now: Clock) -> LocalRuntime:
         gateway_identity = ServiceIdentity(
             "local-gateway", Role.GATEWAY, frozenset({Action.ATTACH, Action.CONSUME})
         )
+        docker_cli = config.controller.docker_cli()
         docker_lifecycle = DockerDiagnosticLifecycle(
-            config.controller.docker_cli(), config.controller.seccomp_policy_store()
+            docker_cli, config.controller.seccomp_policy_store()
         )
-        provisioning = DockerProvisioningRuntime(
-            docker_lifecycle, config.controller.profile
-        )
+        rooms = DockerProvisioningRuntime(docker_lifecycle, config.controller.profile)
         recovery = DockerRecoveryRuntime(docker_lifecycle, config.controller.profile)
         cleanup = DockerCleanupRuntime(docker_lifecycle)
-        orchestrator = LifecycleOrchestrator(backend, control, provisioning)
+        pty = DockerPtyRuntime(
+            context=config.controller.docker_context, limits=config.pty_limits
+        )
+
+        def collector(workspace: CollectionWorkspace) -> QualificationCollector:
+            # The collector's own sandboxes, its Room included, are qualification
+            # probes; it provisions them without the gate it is feeding.
+            return QualificationCollector(
+                docker_cli,
+                docker_lifecycle,
+                config.controller.profile,
+                max_age=config.qualification_max_age,
+                now=now,
+                terminal=pty,
+                provisioning=rooms,
+                cleanup=cleanup,
+                workspace=workspace,
+                busy_timeout_ms=config.database_busy_timeout_ms,
+            )
+
+        qualification = QualificationGate(
+            docker_cli,
+            docker_lifecycle,
+            config.controller.profile,
+            workspace=LockedWorkspace(config.controller.database_path.parent),
+            collector=collector,
+            max_age=config.qualification_max_age,
+            now=now,
+        )
+        # Enter Room and reset provisioning both reach Docker only through this.
+        orchestrator = LifecycleOrchestrator(
+            backend, control, GatedProvisioningRuntime(rooms, qualification)
+        )
         cleanup_worker = DockerCleanupWorker(
             control, backend, cleanup, retry_delay=config.controller.cleanup_retry_delay
         )
@@ -429,9 +493,7 @@ def build_runtime(config: LocalRuntimeConfig, *, now: Clock) -> LocalRuntime:
         )
         terminal = ControlPlaneTerminalService(
             control,
-            DockerPtyRuntime(
-                context=config.controller.docker_context, limits=config.pty_limits
-            ),
+            pty,
             control_identity,
             now,
             connection_limit=config.controller.profile.connection_limit,
@@ -456,11 +518,18 @@ def build_runtime(config: LocalRuntimeConfig, *, now: Clock) -> LocalRuntime:
                 now=now,
             ),
             lifespan=_application_lifespan(
-                maintenance, interval=config.maintenance_interval
+                maintenance,
+                interval=config.maintenance_interval,
+                qualification=qualification,
             ),
         )
         return LocalRuntime(
-            app, maintenance, backend_identity, control_identity, gateway_identity
+            app,
+            maintenance,
+            backend_identity,
+            control_identity,
+            gateway_identity,
+            qualification,
         )
     except Exception:
         raise LocalRuntimeError("RUNTIME_UNAVAILABLE") from None

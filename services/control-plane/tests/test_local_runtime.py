@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from failroom_sandbox.docker_cli import DockerError
 from fastapi.testclient import TestClient
 
 import failroom_control_plane
@@ -22,6 +23,11 @@ from failroom_control_plane.local_runtime import (
 from failroom_control_plane.maintenance import (
     LifecycleMaintenanceService,
     MaintenanceError,
+)
+from failroom_control_plane.orchestrator import LifecycleOrchestrator
+from failroom_control_plane.qualification_gate import (
+    GatedProvisioningRuntime,
+    QualificationGate,
 )
 from failroom_control_plane.terminal import ControlPlaneTerminalService
 
@@ -80,6 +86,7 @@ class LocalRuntimeConfigTests(unittest.TestCase):
             "FAILROOM_MAINTENANCE_INTERVAL_SECONDS": "10",
             "FAILROOM_MAINTENANCE_LIMIT": "10",
             "FAILROOM_CLEANUP_RETRY_SECONDS": "10",
+            "FAILROOM_QUALIFICATION_MAX_AGE_SECONDS": "3600",
         }
 
     def test_rejects_missing_bearer_token(self) -> None:
@@ -155,6 +162,39 @@ class LocalRuntimeConfigTests(unittest.TestCase):
         self.assertEqual(terminal.call_args.kwargs["connection_limit"], 3)
         self.assertEqual(terminal.call_args.kwargs["session_limit"], 2)
 
+    def test_local_runtime_requires_the_report_validity(self) -> None:
+        config = LocalRuntimeConfig.from_environment(self.environment)
+        self.assertEqual(config.qualification_max_age, timedelta(hours=1))
+        for value in (None, "59"):
+            environment = dict(self.environment)
+            environment.pop("FAILROOM_QUALIFICATION_MAX_AGE_SECONDS")
+            if value is not None:
+                environment["FAILROOM_QUALIFICATION_MAX_AGE_SECONDS"] = value
+            with self.subTest(value=value), self.assertRaises(LocalRuntimeError):
+                LocalRuntimeConfig.from_environment(environment)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux seccomp policy store required")
+    def test_every_room_allocation_goes_through_the_qualification_gate(self) -> None:
+        config = LocalRuntimeConfig.from_environment(self.environment)
+        with (
+            patch("failroom_control_plane.local_runtime.preflight_runtime"),
+            patch(
+                "failroom_control_plane.local_runtime.LifecycleOrchestrator",
+                wraps=LifecycleOrchestrator,
+            ) as orchestrator,
+        ):
+            runtime = build_runtime(
+                config, now=lambda: datetime(2026, 9, 15, tzinfo=UTC)
+            )
+        (call,) = orchestrator.call_args_list
+        provisioning = call.args[2]
+        self.assertIsInstance(provisioning, GatedProvisioningRuntime)
+        self.assertIsInstance(runtime.qualification, QualificationGate)
+        # Without a started collection the gate refuses before any Docker call.
+        with self.assertRaises(DockerError) as raised:
+            provisioning.open("binding", "operation", "disk-full", lifetime=None)
+        self.assertEqual(raised.exception.code, "PROFILE_UNVERIFIED")
+
     def test_qualification_max_age_is_required_and_bounded(self) -> None:
         name = "FAILROOM_QUALIFICATION_MAX_AGE_SECONDS"
         self.assertEqual(qualification_max_age({name: "3600"}), timedelta(hours=1))
@@ -180,13 +220,19 @@ class LocalRuntimeConfigTests(unittest.TestCase):
             patch.object(
                 LifecycleMaintenanceService, "run_once", autospec=True
             ) as run_once,
+            patch.object(
+                QualificationGate, "start", return_value="QUALIFICATION_PASSED"
+            ) as start,
+            patch.object(QualificationGate, "close") as close,
         ):
             runtime = build_runtime(
                 config, now=lambda: datetime(2026, 9, 15, tzinfo=UTC)
             )
             with TestClient(runtime.app):
                 self.assertEqual(run_once.call_count, 1)
+                self.assertEqual((start.call_count, close.call_count), (1, 0))
         self.assertEqual(run_once.call_count, 2)
+        self.assertEqual(close.call_count, 1)
 
     def test_preflight_verifies_image_before_pinning_seccomp_policy(self) -> None:
         from failroom_control_plane.local_runtime import preflight_runtime
@@ -249,6 +295,55 @@ class LocalRuntimeLifespanTests(unittest.IsolatedAsyncioTestCase):
         async with local_lifespan(maintenance, interval=timedelta(seconds=1)):
             self.assertEqual(maintenance.calls, 1)
         self.assertEqual(maintenance.calls, 2)
+
+    async def test_collects_before_serving_and_releases_after_shutdown(self) -> None:
+        events: list[str] = []
+
+        class Maintenance:
+            def run_once(self) -> None:
+                events.append("maintenance")
+
+        class Qualification:
+            def __init__(self, status: str, closing: Exception | None) -> None:
+                self.status = status
+                self.closing = closing
+
+            def start(self) -> str:
+                events.append("start")
+                return self.status
+
+            def close(self) -> None:
+                events.append("close")
+                if self.closing is not None:
+                    raise self.closing
+
+        cases = (
+            ("QUALIFICATION_PASSED", None, ["QUALIFICATION_PASSED"]),
+            (
+                "QUALIFICATION_UNAVAILABLE RUNTIME_UNAVAILABLE",
+                DockerError("CLEANUP_INCOMPLETE"),
+                [
+                    "QUALIFICATION_UNAVAILABLE RUNTIME_UNAVAILABLE",
+                    "QUALIFICATION_CLEANUP_INCOMPLETE",
+                ],
+            ),
+        )
+        for status, closing, lines in cases:
+            with self.subTest(status=status):
+                events.clear()
+                announced: list[str] = []
+                async with local_lifespan(
+                    Maintenance(),
+                    interval=timedelta(seconds=60),
+                    qualification=Qualification(status, closing),
+                    announce=announced.append,
+                ):
+                    # Even an unavailable report serves; allocation is refused.
+                    self.assertEqual(events, ["maintenance", "start"])
+                self.assertEqual(
+                    events, ["maintenance", "start", "maintenance", "close"]
+                )
+                self.assertEqual(announced, lines)
 
     async def test_refuses_listener_when_initial_maintenance_fails(self) -> None:
         class Maintenance:

@@ -46,7 +46,7 @@ As a product design objective, failures should have real consequences inside a R
 
 Phase 0 established documentation and repository rules. The repository now contains a tested profile qualification gate, a verified diagnostic Docker lifecycle, a transactional SQLite state store with explicit migrations through v4, a trusted control-plane composition, a bounded capability codec, an atomic attachment-lease contract, Reset Room, and the Disk Full scenario. The control plane's operator-only local runtime connects them into a loopback HTTP and WebSocket path to a real PTY.
 
-That runtime provisions sandboxes without a qualification report, so it is a local proof of concept for the operator on their own host, not a learner-facing service. A report-only qualification collector now covers all eighteen required checks; an allocation gate that requires a passing report is the next required step. Real Docker evidence comes from opt-in tests on a trusted Linux controller and is UNVERIFIED on Windows. There is still no web application, browser terminal, production authentication, or deployment.
+When that runtime starts, it collects a qualification report covering all eighteen required checks and allocates a sandbox only while that report passes for the live runtime. It does not refresh the report yet, so allocation stops once the report expires; refreshing it is the next required step. It is a local proof of concept for the operator on their own host, not a learner-facing service. Real Docker evidence comes from opt-in tests on a trusted Linux controller and is UNVERIFIED on Windows. There is still no web application, browser terminal, production authentication, or deployment.
 
 ## Roadmap
 

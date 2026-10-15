@@ -4,7 +4,10 @@ One collection at a time holds the private workspace next to the operator
 database, and it first removes whatever a crashed collection left behind. The
 collector creates a sentinel, a probe and a short-lived lifetime sandbox
 through the verified diagnostic lifecycle with the exact strict profile and
-image, and enters one Room sandbox for the restart scenario. It runs the fixed
+image, and enters one Room sandbox for the restart scenario. Only the sentinel
+differs: its lifetime bound is the report validity instead of the attempt TTL,
+because its container ID and start time are the daemon epoch the report is
+bound to, and a caller may ask to keep it running after the collection. It runs the fixed
 probe in the probe sandbox and judges the twelve container checks, runs the
 terminal scenarios against the same sandbox, checks that PID 1 ends the
 lifetime sandbox by its deadline, and judges how a restarted control plane
@@ -16,7 +19,7 @@ import re
 import shutil
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
@@ -56,23 +59,24 @@ from .qualification_scenarios import (
     TERMINAL_PREFIX,
     TerminalScenarios,
 )
-from .qualification_workspace import CollectionWorkspace, WorkspaceError
+from .qualification_workspace import (
+    WORKSPACE_FAILURES,
+    CollectionWorkspace,
+    WorkspaceError,
+    workspace_id,
+)
 from .terminal import TerminalRuntime
 
 Clock = Callable[[], datetime]
 
-# Every collector-owned sandbox uses this attempt label; Room attempts use
-# UUIDs, so the label never names a learner attempt.
-QUALIFICATION_ATTEMPT = "qualification"
+# Every collector sandbox's attempt label is this prefix and its workspace's
+# ID, so a collection only ever sweeps sandboxes of the workspace it holds.
+# Room attempts use UUIDs, so the label never names a learner attempt.
+QUALIFICATION_ATTEMPT_PREFIX = "qualification-"
 _PROBE_SECONDS = 60
 _LIFETIME_SECONDS = 5
 _LIFETIME_GRACE_SECONDS = 10
 _START_MARGIN_SECONDS = 10
-_WORKSPACE_CODES = {
-    "COLLECTION_IN_PROGRESS": "COLLECTION_IN_PROGRESS",
-    "WORKSPACE_UNSAFE": "INVALID_CONFIGURATION",
-    "WORKSPACE_UNAVAILABLE": "RUNTIME_UNAVAILABLE",
-}
 _STARTED_AT = re.compile(
     r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\.[0-9]{1,9})?Z"
 )
@@ -128,11 +132,21 @@ class QualificationLifecycle(Protocol):
 
 
 @dataclass(frozen=True)
+class RetainedSentinel:
+    """A sentinel kept running after its collection, owned by the caller."""
+
+    binding: DockerBinding
+    operation_id: str
+    container_id: str
+
+
+@dataclass(frozen=True)
 class QualificationCollection:
     """One report and the fixed reason code behind each non-passing result."""
 
     report: QualificationReport
     reasons: Mapping[Check, str]
+    sentinel: RetainedSentinel | None = None
 
 
 @dataclass(frozen=True)
@@ -159,6 +173,49 @@ def _docker_time(value: object) -> datetime | None:
     return datetime.fromisoformat(match.group(1) + fraction + "+00:00")
 
 
+def qualification_attempt(workspace: str) -> str:
+    """The attempt label of every collector sandbox of one workspace."""
+    return QUALIFICATION_ATTEMPT_PREFIX + workspace
+
+
+def sentinel_epoch(container_id: str, data: object) -> str:
+    """The daemon epoch of a running sentinel: its container ID and start time."""
+    if type(data) is not dict:
+        raise QualificationError("RUNTIME_UNAVAILABLE")
+    state = _object(data.get("State"))
+    started_at = state.get("StartedAt")
+    if (
+        state.get("Running") is not True
+        or type(started_at) is not str
+        or _docker_time(started_at) is None
+    ):
+        raise QualificationError("RUNTIME_UNAVAILABLE")
+    return f"{container_id}@{started_at}"
+
+
+def runtime_identity(
+    engine: EngineIdentity,
+    boot_id: str,
+    daemon_epoch: str,
+    io_device: str | None,
+    profile: StrictDockerProfile,
+) -> RuntimeIdentity:
+    """Bind the engine, boot, daemon epoch and runtime configuration together."""
+    return RuntimeIdentity(
+        engine.engine_id,
+        boot_id,
+        daemon_epoch,
+        configuration_digest(
+            {
+                "schema": "failroom.qualification-runtime.v1",
+                "engine": dict(engine.configuration),
+                "seccomp_digest": profile.seccomp_digest,
+                "io_device": io_device,
+            }
+        ),
+    )
+
+
 def _evidence(context: QualificationContext, judgement: Judgement) -> str:
     runtime = context.runtime
     return configuration_digest(
@@ -181,7 +238,11 @@ def _evidence(context: QualificationContext, judgement: Judgement) -> str:
 
 
 class QualificationCollector:
-    """Collect one report; every sandbox it creates is destroyed before return."""
+    """Collect one report; every sandbox it creates is destroyed before return.
+
+    The one exception is a sentinel the caller asks to retain after a complete
+    collection; the caller then owns it and must destroy it.
+    """
 
     def __init__(
         self,
@@ -244,19 +305,20 @@ class QualificationCollector:
             sleep=sleep,
         )
 
-    def collect(self) -> QualificationCollection:
+    def collect(self, *, retain_sentinel: bool = False) -> QualificationCollection:
         try:
             with self._workspace.hold() as scratch:
-                self._prepare(scratch)
-                return self._collect(scratch)
+                attempt = qualification_attempt(workspace_id(scratch))
+                self._prepare(scratch, attempt)
+                return self._collect(scratch, attempt, retain_sentinel=retain_sentinel)
         except QualificationError:
             raise
         except WorkspaceError as error:
-            raise QualificationError(_WORKSPACE_CODES[error.code]) from None
+            raise QualificationError(WORKSPACE_FAILURES[error.code]) from None
         except Exception:
             raise QualificationError("RUNTIME_UNAVAILABLE") from None
 
-    def _prepare(self, scratch: Path) -> None:
+    def _prepare(self, scratch: Path, attempt: str) -> None:
         """Remove what a collection that is gone left behind.
 
         Holding the workspace lock proves that no other collection is running,
@@ -274,26 +336,29 @@ class QualificationCollector:
             self._restart.recover(scratch)
         except (OSError, RestartCleanupError):
             raise QualificationError("CLEANUP_INCOMPLETE") from None
-        self._sweep()
+        self._sweep(attempt)
 
-    def _collect(self, scratch: Path) -> QualificationCollection:
+    def _collect(
+        self, scratch: Path, attempt: str, *, retain_sentinel: bool
+    ) -> QualificationCollection:
         engine = self._docker.engine_identity()
         max_lifetime = self._profile.absolute_ttl_seconds - _START_MARGIN_SECONDS
         scenarios: dict[Check, Judgement] = {}
         scenario_times: dict[Check, datetime] = {}
-        sentinel = self._start(
-            "sentinel", min(int(self._max_age.total_seconds()), max_lifetime)
-        )
+        sentinel = self._start_sentinel(attempt)
+        retained = False
         try:
-            epoch = self._daemon_epoch(sentinel)
+            epoch = sentinel_epoch(sentinel.container_id, self._inspect(sentinel))
             # Started first so their deadlines run out while the probe works.
             lifetime_sandbox = self._start(
-                "lifetime", min(_LIFETIME_SECONDS, max_lifetime)
+                attempt, "lifetime", min(_LIFETIME_SECONDS, max_lifetime)
             )
             try:
                 restart = self._begin_restart(scratch)
                 try:
-                    probe = self._start("probe", min(_PROBE_SECONDS, max_lifetime))
+                    probe = self._start(
+                        attempt, "probe", min(_PROBE_SECONDS, max_lifetime)
+                    )
                     try:
                         raw = self._docker.run_qualification_probe(probe.container_id)
                         observed_at = self._utc_now()
@@ -316,8 +381,32 @@ class QualificationCollector:
                     scenario_times[Check.RESTART_CLEANUP] = self._utc_now()
             finally:
                 self._destroy(lifetime_sandbox)
+            collection = self._assemble(
+                engine, epoch, raw, data, observed_at, scenarios, scenario_times
+            )
+            if retain_sentinel:
+                collection = replace(
+                    collection,
+                    sentinel=RetainedSentinel(
+                        sentinel.binding, sentinel.operation_id, sentinel.container_id
+                    ),
+                )
+                retained = True
+            return collection
         finally:
-            self._destroy(sentinel)
+            if not retained:
+                self._destroy(sentinel)
+
+    def _assemble(
+        self,
+        engine: EngineIdentity,
+        epoch: str,
+        raw: bytes,
+        data: dict[str, object],
+        observed_at: datetime,
+        scenarios: dict[Check, Judgement],
+        scenario_times: dict[Check, datetime],
+    ) -> QualificationCollection:
         try:
             observation = parse_probe_output(raw)
         except ProbeOutputError:
@@ -331,18 +420,8 @@ class QualificationCollector:
         ):
             raise QualificationError("RUNTIME_UNAVAILABLE")
         context = QualificationContext(
-            RuntimeIdentity(
-                engine.engine_id,
-                boot_id,
-                epoch,
-                configuration_digest(
-                    {
-                        "schema": "failroom.qualification-runtime.v1",
-                        "engine": dict(engine.configuration),
-                        "seccomp_digest": self._profile.seccomp_digest,
-                        "io_device": observation.io_device,
-                    }
-                ),
+            runtime_identity(
+                engine, boot_id, epoch, observation.io_device, self._profile
             ),
             image_digest,
             profile_fingerprint(self._profile),
@@ -388,12 +467,28 @@ class QualificationCollector:
             raise QualificationError("RUNTIME_UNAVAILABLE")
         return current.astimezone(UTC)
 
-    def _start(self, role: str, seconds: int) -> _Started:
-        binding = DockerBinding(QUALIFICATION_ATTEMPT, f"{role}-{uuid4().hex}", 1)
+    def _start_sentinel(self, attempt: str) -> _Started:
+        # Only the sentinel lives as long as the report is valid; it keeps every
+        # other strict-profile limit and never serves a learner.
+        seconds = int(self._max_age.total_seconds())
+        profile = replace(
+            self._profile, absolute_ttl_seconds=seconds + _START_MARGIN_SECONDS
+        )
+        return self._start(attempt, "sentinel", seconds, profile=profile)
+
+    def _start(
+        self,
+        attempt: str,
+        role: str,
+        seconds: int,
+        *,
+        profile: StrictDockerProfile | None = None,
+    ) -> _Started:
+        binding = DockerBinding(attempt, f"{role}-{uuid4().hex}", 1)
         operation_id = uuid4().hex
         deadline = self._utc_now() + timedelta(seconds=seconds + _START_MARGIN_SECONDS)
         observation = self._lifecycle.create_diagnostic(
-            self._profile,
+            profile or self._profile,
             binding,
             operation_id,
             lifetime=ContainerLifetime(deadline, self._now),
@@ -470,13 +565,6 @@ class QualificationCollector:
             raise QualificationError("RUNTIME_UNAVAILABLE")
         return data
 
-    def _daemon_epoch(self, sentinel: _Started) -> str:
-        state = _object(self._inspect(sentinel).get("State"))
-        started_at = state.get("StartedAt")
-        if state.get("Running") is not True or _docker_time(started_at) is None:
-            raise QualificationError("RUNTIME_UNAVAILABLE")
-        return f"{sentinel.container_id}@{started_at}"
-
     def _destroy(self, started: _Started) -> None:
         try:
             self._lifecycle.destroy(
@@ -485,16 +573,17 @@ class QualificationCollector:
         except DockerError:
             raise QualificationError("CLEANUP_INCOMPLETE") from None
 
-    def _sweep(self) -> None:
-        """Remove every collector sandbox a crashed collection left behind.
+    def _sweep(self, attempt: str) -> None:
+        """Remove every sandbox a crashed collection of this workspace left.
 
-        Only collections create sandboxes with the qualification attempt label,
-        and the caller holds the workspace lock, so none of them is in use.
+        Only collections holding this workspace's lock create sandboxes with its
+        attempt label, and the caller holds that lock, so none of them is in
+        use. Sandboxes of other workspaces are never touched.
         """
         for container_id in self._docker.list_containers(
             (
                 "label=failroom.kind=diagnostic",
-                "label=failroom.attempt_id=" + QUALIFICATION_ATTEMPT,
+                "label=failroom.attempt_id=" + attempt,
             )
         ):
             data = self._docker.inspect_container(container_id)
@@ -512,9 +601,7 @@ class QualificationCollector:
                     or type(operation_id) is not str
                 ):
                     raise ProfileConfigurationError("INVALID_DOCKER_BINDING")
-                binding = DockerBinding(
-                    QUALIFICATION_ATTEMPT, sandbox_id, int(generation)
-                )
+                binding = DockerBinding(attempt, sandbox_id, int(generation))
                 self._lifecycle.destroy(
                     binding, container_id, operation_id=operation_id
                 )
@@ -556,14 +643,15 @@ def format_collection(
         )
         reason = collection.reasons.get(result.check)
         lines.append(line + (f" reason={reason}" if reason else ""))
-    if decision.allowed:
-        lines.append("QUALIFICATION_PASSED")
-    else:
-        lines.append(
-            "QUALIFICATION_DENIED "
-            + " ".join(
-                denial.code.value + ":" + (denial.check.value if denial.check else "-")
-                for denial in decision.denials
-            )
-        )
+    lines.append(format_decision(decision))
     return tuple(lines)
+
+
+def format_decision(decision: QualificationDecision) -> str:
+    """Render a decision as one fixed operator line."""
+    if decision.allowed:
+        return "QUALIFICATION_PASSED"
+    return "QUALIFICATION_DENIED " + " ".join(
+        denial.code.value + ":" + (denial.check.value if denial.check else "-")
+        for denial in decision.denials
+    )

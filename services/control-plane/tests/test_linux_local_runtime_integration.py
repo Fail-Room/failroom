@@ -12,12 +12,24 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
+from failroom_sandbox.docker_lifecycle import DockerDiagnosticLifecycle
+from failroom_sandbox.docker_profile import DockerBinding
+from failroom_sandbox.models import DenialCode
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from failroom_control_plane import cli as control_plane_cli
 from failroom_control_plane.local_runtime import (
     LocalRuntimeConfig,
     build_runtime,
+)
+from failroom_control_plane.qualification_collector import (
+    QualificationError,
+    qualification_attempt,
+)
+from failroom_control_plane.qualification_workspace import (
+    WORKSPACE_NAME,
+    workspace_id,
 )
 
 
@@ -135,6 +147,75 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
                         },
                     )
                     self.assertEqual(left.status_code, 202)
+
+    def test_room_allocation_needs_the_live_sentinel_of_a_passing_report(
+        self,
+    ) -> None:
+        environment = dict(os.environ)
+        environment["FAILROOM_DATABASE_PATH"] = str(
+            Path(self.database_temp.name) / "state.sqlite3"
+        )
+        config = LocalRuntimeConfig.from_environment(environment)
+        runtime = build_runtime(config, now=lambda: datetime.now(UTC))
+        headers = {"authorization": "Bearer " + self.token}
+        docker = config.controller.docker_cli()
+
+        with TestClient(runtime.app) as client:
+            self.assertTrue(runtime.qualification.decide().allowed)
+            # serve-local holds the workspace, so a report-only collection
+            # against the same database is refused before any Docker call.
+            with self.assertRaises(QualificationError) as raised:
+                control_plane_cli._qualify_local(environment)
+            self.assertEqual(raised.exception.code, "COLLECTION_IN_PROGRESS")
+            attempt = qualification_attempt(
+                workspace_id(Path(self.database_temp.name) / WORKSPACE_NAME)
+            )
+            (sentinel,) = docker.list_containers(
+                (
+                    "label=failroom.kind=diagnostic",
+                    "label=failroom.attempt_id=" + attempt,
+                )
+            )
+            data = docker.inspect_container(sentinel)
+            labels = data["Config"]["Labels"]
+            # The sentinel lives as long as the report is valid, not the TTL.
+            validity = config.qualification_max_age.total_seconds()
+            self.assertGreater(validity, config.controller.profile.absolute_ttl_seconds)
+            self.assertGreaterEqual(int(data["Config"]["Cmd"][0]), validity - 5)
+            DockerDiagnosticLifecycle(
+                docker, config.controller.seccomp_policy_store()
+            ).destroy(
+                DockerBinding(attempt, labels["failroom.sandbox_id"], 1),
+                sentinel,
+                operation_id=labels["failroom.operation_id"],
+            )
+            before = set(docker.list_containers(("label=failroom.kind=diagnostic",)))
+
+            refused = client.post(
+                "/v1/rooms/disk-full/attempts",
+                headers={**headers, "idempotency-key": "enter-" + uuid4().hex},
+            )
+            try:
+                self.assertEqual(
+                    (refused.status_code, refused.json()),
+                    (503, {"code": "ENTRY_FAILED"}),
+                )
+                self.assertEqual(
+                    set(docker.list_containers(("label=failroom.kind=diagnostic",))),
+                    before,
+                )
+                self.assertEqual(
+                    {denial.code for denial in runtime.qualification.decide().denials},
+                    {DenialCode.CONTEXT_INVALID},
+                )
+            finally:
+                if refused.status_code == 201:
+                    # A wrongly admitted Room is left so shutdown maintenance
+                    # removes it even when this test fails.
+                    client.post(
+                        "/v1/attempts/" + refused.json()["attempt_id"] + "/leave",
+                        headers={**headers, "idempotency-key": "leave-" + uuid4().hex},
+                    )
 
     def test_enter_rejects_unreviewed_and_unauthorized_rooms_without_state(
         self,

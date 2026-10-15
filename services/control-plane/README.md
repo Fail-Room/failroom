@@ -87,13 +87,12 @@ as fatal: it closes the connection and the PTY session.
 
 ## Local runtime (operator-only proof of concept)
 
-> **Limitation:** the local runtime provisions Disk Full Room sandboxes through
-> the diagnostic Docker lifecycle without checking a qualification report
-> before allocation. It therefore does not meet the qualification requirement
-> in [SECURITY.md](../../docs/SECURITY.md). Use it only as the local operator on
+> **Limitation:** the local runtime checks a qualification report it collects
+> when it starts before every Room allocation, but it does not refresh that
+> report yet: once the report expires or its sentinel stops, Enter Room and
+> reset provisioning fail until the runtime restarts. See
+> [SECURITY.md](../../docs/SECURITY.md). Use it only as the local operator on
 > your own host, and do not offer it to learners or other users.
-> `qualify-local` collects a report but does not gate allocation; the
-> allocation gate remains planned.
 
 `failroom-control-plane serve-local` composes the state store, the Docker
 lifecycle and PTY adapters, the capability authority, and the HTTP/WebSocket
@@ -106,8 +105,25 @@ routes into one process:
 3. It opens or initializes the SQLite database and runs one maintenance pass:
    expiry, cleanup, finalization, and resumption of interrupted resets. If that
    pass fails, the listener does not start.
-4. It serves the routes with access logging disabled, repeats maintenance on a
-   fixed interval, and runs one final pass on shutdown.
+4. It holds the qualification workspace described under `qualify-local`,
+   collects one report, keeps that collection's sentinel sandbox running,
+   and prints `QUALIFICATION_PASSED`, `QUALIFICATION_DENIED <code:check>...`
+   or `QUALIFICATION_UNAVAILABLE <code>`. The listener starts in every case;
+   only Room allocation depends on the report. This takes about as long as
+   one `qualify-local` collection.
+5. It serves the routes with access logging disabled, repeats maintenance on a
+   fixed interval, and runs one final pass on shutdown before it removes the
+   sentinel and releases the workspace.
+
+Before Enter Room and before resuming a reset's provisioning, the runtime
+rebuilds the current context: the engine ID and configuration from
+`docker info`, the sentinel's container ID and start time as the daemon
+epoch, the boot ID and I/O device read inside the sentinel, the image ID and
+the profile fingerprint. It allocates only when the report matches that
+context, passes every check, and is younger than
+`FAILROOM_QUALIFICATION_MAX_AGE_SECONDS`. Otherwise it makes no Docker call
+for that Room: Enter Room fails with `ENTRY_FAILED` (HTTP 503), a reset
+fails, and the attempt is cleaned up as usual.
 
 `failroom-control-plane verify-local` performs only steps 1 and 2 and prints
 `LOCAL_RUNTIME_VERIFIED`. `serve-local` prints `LOCAL_RUNTIME_STOPPED` after a
@@ -116,17 +132,22 @@ credentials; a failure prints one fixed code to standard error and exits with
 status 2.
 
 `failroom-control-plane qualify-local` performs steps 1 and 2, then collects
-one qualification report and prints it. It needs every setting below and
-`FAILROOM_QUALIFICATION_MAX_AGE_SECONDS`. It keeps its scratch state in a
+one qualification report and prints it. It needs every setting below. It
+keeps its scratch state in a
 `failroom-qualification` directory next to `FAILROOM_DATABASE_PATH`, which
 must be owned by its user with mode 0700 and is created that way when
 missing, and it holds an exclusive lock on the `collector.lock` file there
-for the whole collection. A second collection exits with status 2 and
+for the whole collection. A second collection, including `qualify-local`
+while `serve-local` holds the same directory, exits with status 2 and
 `COLLECTION_IN_PROGRESS`; the kernel releases the lock when a collection
-ends, even by a crash. The collection first removes what a crashed one left:
-scratch directories, its Room sandbox through the restart path described
-below, and every collector sandbox. It then creates a sentinel, a probe and a
-short-lived lifetime sandbox with the strict profile, and enters the Disk Full
+ends, even by a crash. Its sandboxes carry the attempt label
+`qualification-<ID>`, where the ID is a random value the directory keeps in
+`workspace.id`, so a collection only ever removes its own directory's
+sandboxes. The collection first removes what a crashed one left: scratch
+directories, its Room sandbox through the restart path described below, and
+every collector sandbox of this directory. It then creates a sentinel, a
+probe and a short-lived lifetime sandbox with the strict profile, except that
+the sentinel lives as long as the report is valid, and enters the Disk Full
 Room with a 20-second deadline into a scratch SQLite database in that
 directory. It runs the fixed probe and judges the twelve container checks. It
 drives the terminal service and Docker PTY runtime against the probe sandbox
@@ -137,20 +158,23 @@ maintenance service from the scratch files alone, as a restarted control
 plane would, and checks that their maintenance removes the Room sandbox and
 records it destroyed; a sandbox they leave is removed directly and fails the
 check. It removes every sandbox and scratch file before printing; only the
-lock file stays. The output is one
+lock and ID files stay. The output is one
 `QUALIFICATION_CONTEXT` line with the engine ID, boot ID, daemon epoch and
 digests; one `CHECK <check> <outcome> <observed_at> <evidence digest>` line per
 check, with a fixed `reason=` code when it does not pass; and
 `QUALIFICATION_PASSED` or `QUALIFICATION_DENIED <code:check>...`. It exits with
 status 0 when the report passes, 3 when it does not, and 2 with one fixed code
-on a configuration, runtime or cleanup failure. It stores no report, and
-`serve-local` still allocates without a report. One collection took about 28
-seconds on Docker Desktop 29.4.2.
+on a configuration, runtime or cleanup failure. It stores no report and does
+not affect a running `serve-local`, which uses only its own startup report.
+One collection took about 28 seconds on Docker Desktop 29.4.2.
 
 After `CLEANUP_INCOMPLETE`, leave `failroom-qualification/restart` in place:
 the next collection uses it to find and remove the Room sandbox. If it is
 deleted anyway, remove the container labelled with the `attempt_id` that its
 `binding.json` named by hand, for example with `docker container rm --force`.
+Deleting a whole `failroom-qualification` directory forgets its ID: remove by
+hand the stopped containers whose `failroom.attempt_id` label starts with
+`qualification-` and names no remaining directory.
 
 The runtime binds only to `127.0.0.1` or `::1` and accepts exactly one bearer
 token, which it keeps only as a SHA-256 digest. The token authenticates one
@@ -218,7 +242,7 @@ by `StrictDockerProfile` as described in the
 | `FAILROOM_TERMINAL_OUTPUT_BYTES` | Cumulative terminal output limit, at most 1048576 because the WebSocket relay uses the same limit. |
 | `FAILROOM_CONNECTION_LIMIT`, `FAILROOM_SESSION_LIMIT` | Concurrent authorized terminal connections and open PTY sessions allowed per sandbox generation; a connection beyond either is closed with `4429`. |
 | `FAILROOM_ABSOLUTE_TTL_SECONDS` | Absolute attempt lifetime. The container's PID 1 exits no later than the attempt deadline. |
-| `FAILROOM_QUALIFICATION_MAX_AGE_SECONDS` | Required only by `qualify-local`: report validity, 60–86400 seconds. The collector's sentinel sandbox lives this long, capped by the absolute lifetime. |
+| `FAILROOM_QUALIFICATION_MAX_AGE_SECONDS` | Report validity, 60–86400 seconds. The runtime refuses Room allocation once its report is this old. The collector's sentinel sandbox lives this long, even beyond `FAILROOM_ABSOLUTE_TTL_SECONDS`. |
 | `FAILROOM_TERMINAL_INPUT_BYTES` | Largest input frame, 1–1048576 and not larger than the frame limit. |
 | `FAILROOM_TERMINAL_SESSION_SECONDS` | Wall-clock PTY session limit, 1–3600. |
 | `FAILROOM_TERMINAL_ROWS`, `FAILROOM_TERMINAL_COLUMNS` | Largest accepted resize, 1–500 rows and 1–1000 columns. |
@@ -390,8 +414,8 @@ export FAILROOM_MAINTENANCE_LIMIT=10
 | `test_linux_docker_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Provisioning through the orchestrator, container hardening, Docker's init as PID 1 from a read-only mount, Leave and Reset cleanup with every generation absent afterwards, and a PID 1 that outlives 60 seconds and stops by the attempt deadline |
 | `test_linux_disk_full_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | The Disk Full filler reduces workspace capacity and recovery restores it; the test builds the Disk Full image itself |
 | `test_linux_terminal_integration.py` | `FAILROOM_TERMINAL_INTEGRATION=1` | Input and output, ANSI bytes, resize, Ctrl+C interruption, one-time capability replay denial, termination and reaping of the shell's session and background jobs after disconnect, and refusal with `4429` of a terminal beyond the profile's connection or session limit until one closes, through a real PTY |
-| `test_linux_qualification_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Report-only qualification: all eighteen checks pass on the strict profile and the restart scenario's Room sandbox is removed, stopped and running sandboxes and a Room sandbox a crashed collection left are removed, a second collection is refused while one holds the workspace, a container outside the profile fails the checks it violates, and no sandbox or scratch state remains |
-| `test_linux_local_runtime_integration.py` | `FAILROOM_LOCAL_RUNTIME_INTEGRATION=1` | Enter Room, capability, terminal, recovery verification, Reset Room, and Leave Room through the local app; denial of unreviewed and unauthorized Rooms, of a reused capability, and of a capability issued before a reset; reset maintenance; and a terminal that stays responsive for 70 seconds |
+| `test_linux_qualification_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Report-only qualification: all eighteen checks pass on the strict profile and the restart scenario's Room sandbox is removed, stopped and running sandboxes and a Room sandbox a crashed collection left are removed, a second collection is refused while one holds the workspace, another workspace's sandbox is left alone, a container outside the profile fails the checks it violates, and no sandbox or scratch state remains |
+| `test_linux_local_runtime_integration.py` | `FAILROOM_LOCAL_RUNTIME_INTEGRATION=1` | Enter Room, capability, terminal, recovery verification, Reset Room, and Leave Room through the local app; denial of unreviewed and unauthorized Rooms, of a reused capability, and of a capability issued before a reset; reset maintenance; a terminal that stays responsive for 70 seconds; and Room allocation that needs the live sentinel of the startup report, with a sentinel that outlives the attempt TTL, `qualify-local` refused while the runtime runs, and `ENTRY_FAILED` without any Docker call once the sentinel is gone |
 
 Run one module, or every module whose flags are set:
 
