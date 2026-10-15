@@ -1,5 +1,6 @@
 """Opt-in proof of report-only qualification collection on a trusted Linux host."""
 
+import json
 import os
 import subprocess
 import sys
@@ -15,7 +16,7 @@ from failroom_sandbox.docker_lifecycle import (
     DockerDiagnosticLifecycle,
 )
 from failroom_sandbox.docker_profile import DockerBinding
-from failroom_sandbox.models import Check, DenialCode, Outcome
+from failroom_sandbox.models import Check, Outcome
 from failroom_sandbox.pty import DockerPtyRuntime
 from failroom_sandbox.qualification import evaluate_qualification
 from failroom_sandbox.qualification_probe import (
@@ -33,9 +34,21 @@ from test_linux_terminal_integration import _terminal_limits
 from failroom_control_plane.qualification_collector import (
     QUALIFICATION_ATTEMPT,
     QualificationCollector,
+    QualificationError,
 )
-
-_UNCOLLECTED = (Check.RESTART_CLEANUP,)
+from failroom_control_plane.qualification_restart import (
+    RESTART_DIRECTORY,
+    RestartScenario,
+)
+from failroom_control_plane.qualification_workspace import (
+    LOCK_NAME,
+    WORKSPACE_NAME,
+    LockedWorkspace,
+)
+from failroom_control_plane.runtime_docker import (
+    DockerCleanupRuntime,
+    DockerProvisioningRuntime,
+)
 
 
 def _now() -> datetime:
@@ -80,42 +93,41 @@ class LinuxQualificationIntegrationTests(unittest.TestCase):
             max_age=self.max_age,
             now=_now,
             terminal=DockerPtyRuntime(context=self.context, limits=self.pty_limits),
-            scratch=self.scratch,
+            provisioning=DockerProvisioningRuntime(self.lifecycle, self.profile),
+            cleanup=DockerCleanupRuntime(self.lifecycle),
+            workspace=LockedWorkspace(self.scratch),
             busy_timeout_ms=int(_required("FAILROOM_DATABASE_BUSY_TIMEOUT_MS")),
         )
 
-    def scratch_directories(self) -> list[Path]:
-        return list(self.scratch.glob("failroom-qualification-*"))
+    def workspace_entries(self) -> list[str]:
+        return sorted(entry.name for entry in (self.scratch / WORKSPACE_NAME).iterdir())
+
+    def sandboxes(self, *labels: str) -> tuple[str, ...]:
+        return self.cli.list_containers(("label=failroom.kind=diagnostic", *labels))
 
     def collector_sandboxes(self) -> tuple[str, ...]:
-        return self.cli.list_containers(
-            (
-                "label=failroom.kind=diagnostic",
-                "label=failroom.attempt_id=" + QUALIFICATION_ATTEMPT,
-            )
-        )
+        return self.sandboxes("label=failroom.attempt_id=" + QUALIFICATION_ATTEMPT)
 
-    def test_every_collected_check_passes_on_the_strict_profile(self) -> None:
-        before = self.scratch_directories()
-        collection = self.collector().collect()
+    def assert_every_check_passes(self, collection) -> None:
         report = collection.report
-
         for result in report.results:
             with self.subTest(check=result.check):
-                if result.check in _UNCOLLECTED:
-                    self.assertIs(result.outcome, Outcome.UNVERIFIED)
-                    self.assertEqual(collection.reasons[result.check], "NOT_COLLECTED")
-                else:
-                    self.assertIs(result.outcome, Outcome.PASS)
-                    self.assertNotIn(result.check, collection.reasons)
+                self.assertIs(result.outcome, Outcome.PASS)
+        self.assertEqual(dict(collection.reasons), {})
         decision = evaluate_qualification(
             report.context, report, now=_now(), max_age=self.max_age
         )
-        self.assertEqual(
-            {(denial.code, denial.check) for denial in decision.denials},
-            {(DenialCode.CHECK_UNVERIFIED, check) for check in _UNCOLLECTED},
-        )
-        self.assertEqual(self.scratch_directories(), before)
+        self.assertTrue(decision.allowed)
+
+    def test_every_check_passes_on_the_strict_profile(self) -> None:
+        before = set(self.sandboxes())
+        collection = self.collector().collect()
+        report = collection.report
+
+        self.assert_every_check_passes(collection)
+        # Neither the Room sandbox nor any scratch state outlives the collection.
+        self.assertEqual(set(self.sandboxes()), before)
+        self.assertEqual(self.workspace_entries(), [LOCK_NAME])
         self.assertEqual(
             report.context.image_digest,
             self.cli.inspect_image(self.profile.image)["Id"],
@@ -129,35 +141,84 @@ class LinuxQualificationIntegrationTests(unittest.TestCase):
             self.assertEqual(report.context.runtime.host_boot_id, boot_id)
         self.assertEqual(self.collector_sandboxes(), ())
 
-    def test_stopped_leftover_from_a_crashed_collection_is_removed(self) -> None:
-        binding = DockerBinding(
-            QUALIFICATION_ATTEMPT, "probe-leftover-" + uuid4().hex[:12], 1
-        )
-        operation = uuid4().hex
-        # A two-second lifetime: PID 1 exits on its own, as after a crash.
-        created = self.lifecycle.create_diagnostic(
-            self.profile,
-            binding,
-            operation,
-            lifetime=ContainerLifetime(_now() + timedelta(seconds=13), _now),
-        )
+    def test_sandboxes_left_by_a_crashed_collection_are_removed(self) -> None:
+        leftovers = []
+        # PID 1 of the first exits on its own after two seconds, as after a
+        # crash; the second still runs when the next collection starts.
+        for name, seconds in (("probe-stopped-", 13), ("sentinel-running-", 120)):
+            binding = DockerBinding(QUALIFICATION_ATTEMPT, name + uuid4().hex[:12], 1)
+            operation = uuid4().hex
+            created = self.lifecycle.create_diagnostic(
+                self.profile,
+                binding,
+                operation,
+                lifetime=ContainerLifetime(_now() + timedelta(seconds=seconds), _now),
+            )
+            leftovers.append((binding, created.container_id, operation))
         try:
+            stopped = leftovers[0][1]
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
-                data = self.cli.inspect_container(created.container_id)
+                data = self.cli.inspect_container(stopped)
                 if data is not None and data["State"]["Running"] is False:
                     break
                 time.sleep(0.5)
             self.assertIs(data["State"]["Running"], False)
+            running = self.cli.inspect_container(leftovers[1][1])
+            self.assertIs(running["State"]["Running"], True)
 
             self.collector().collect()
 
-            self.assertIsNone(self.cli.inspect_container(created.container_id))
+            for _, container_id, _ in leftovers:
+                self.assertIsNone(self.cli.inspect_container(container_id))
         finally:
-            self.lifecycle.destroy(
-                binding, created.container_id, operation_id=operation
-            )
+            for binding, container_id, operation in leftovers:
+                self.lifecycle.destroy(binding, container_id, operation_id=operation)
         self.assertEqual(self.collector_sandboxes(), ())
+
+    def test_room_sandbox_left_by_a_crashed_collection_is_recovered(self) -> None:
+        restart = RestartScenario(
+            self.cli,
+            self.lifecycle,
+            DockerProvisioningRuntime(self.lifecycle, self.profile),
+            DockerCleanupRuntime(self.lifecycle),
+            busy_timeout_ms=int(_required("FAILROOM_DATABASE_BUSY_TIMEOUT_MS")),
+            now=_now,
+        )
+        with LockedWorkspace(self.scratch).hold() as workspace:
+            self.assertIsNone(restart.begin(workspace))
+            binding = json.loads(
+                (workspace / RESTART_DIRECTORY / "binding.json").read_bytes()
+            )
+        # Releasing the lock is what the kernel does when the collector dies.
+        labels = (
+            "label=failroom.attempt_id=" + binding["attempt_id"],
+            "label=failroom.sandbox_id=" + binding["sandbox_id"],
+        )
+        self.assertEqual(len(self.sandboxes(*labels)), 1)
+        try:
+            collection = self.collector().collect()
+
+            self.assertEqual(self.sandboxes(*labels), ())
+            self.assertEqual(self.workspace_entries(), [LOCK_NAME])
+            self.assert_every_check_passes(collection)
+        finally:
+            for container_id in self.sandboxes(*labels):
+                self.lifecycle.destroy(
+                    DockerBinding(binding["attempt_id"], binding["sandbox_id"], 1),
+                    container_id,
+                )
+
+    def test_a_second_collection_is_refused_while_one_holds_the_workspace(
+        self,
+    ) -> None:
+        before = set(self.sandboxes())
+        with LockedWorkspace(self.scratch).hold():
+            with self.assertRaises(QualificationError) as raised:
+                self.collector().collect()
+
+        self.assertEqual(raised.exception.code, "COLLECTION_IN_PROGRESS")
+        self.assertEqual(set(self.sandboxes()), before)
 
     def test_container_outside_the_profile_fails_the_checks_it_violates(self) -> None:
         """A writable, networked container with default capabilities."""

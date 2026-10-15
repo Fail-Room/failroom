@@ -308,9 +308,14 @@ class MigrationCliTests(unittest.TestCase):
     def test_qualify_local_prints_the_report_and_exits_by_decision(self) -> None:
         collection = self.collection()
         report = collection.report
+        # The same report, judged after it has gone stale.
         denied = evaluate_qualification(
-            report.context, report, now=qualification.NOW, max_age=timedelta(hours=1)
+            report.context,
+            report,
+            now=qualification.NOW + timedelta(days=1),
+            max_age=timedelta(hours=1),
         )
+        self.assertFalse(denied.allowed)
         for decision, code in ((denied, 3), (QualificationDecision(()), 0)):
             with self.subTest(code=code):
                 qualifier = Mock(return_value=(collection, decision))
@@ -328,6 +333,7 @@ class MigrationCliTests(unittest.TestCase):
     def test_qualify_local_reduces_collection_failures(self) -> None:
         for error, code in (
             (QualificationError("CLEANUP_INCOMPLETE"), "CLEANUP_INCOMPLETE"),
+            (QualificationError("COLLECTION_IN_PROGRESS"), "COLLECTION_IN_PROGRESS"),
             (LocalRuntimeError("RUNTIME_UNAVAILABLE"), "RUNTIME_UNAVAILABLE"),
             (LocalRuntimeError(), "INVALID_CONFIGURATION"),
         ):
@@ -384,6 +390,17 @@ class MigrationCliTests(unittest.TestCase):
             patch(
                 "failroom_control_plane.cli.DockerPtyRuntime", return_value="terminal"
             ) as terminal,
+            patch(
+                "failroom_control_plane.cli.DockerProvisioningRuntime",
+                return_value="rooms",
+            ) as rooms,
+            patch(
+                "failroom_control_plane.cli.DockerCleanupRuntime",
+                return_value="cleanup",
+            ) as cleanup,
+            patch(
+                "failroom_control_plane.cli.LockedWorkspace", return_value="workspace"
+            ) as workspace,
             patch("failroom_control_plane.cli.QualificationCollector") as collector,
         ):
             collector.return_value.collect.side_effect = lambda: (
@@ -394,6 +411,9 @@ class MigrationCliTests(unittest.TestCase):
         self.assertEqual(calls, [("preflight", config), ("collect", None)])
         lifecycle.assert_called_once_with("docker", "policies")
         terminal.assert_called_once_with(context="desktop-linux", limits="pty-limits")
+        rooms.assert_called_once_with("lifecycle", "profile")
+        cleanup.assert_called_once_with("lifecycle")
+        workspace.assert_called_once_with(database.parent)
         collector.assert_called_once_with(
             "docker",
             "lifecycle",
@@ -401,7 +421,9 @@ class MigrationCliTests(unittest.TestCase):
             max_age=timedelta(hours=1),
             now=ANY,
             terminal="terminal",
-            scratch=database.parent,
+            provisioning="rooms",
+            cleanup="cleanup",
+            workspace="workspace",
             busy_timeout_ms=5000,
         )
         now = collector.call_args.kwargs["now"]

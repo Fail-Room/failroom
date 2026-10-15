@@ -1,11 +1,12 @@
 """Terminal scenario evidence for four qualification checks.
 
 The scenarios drive the real terminal service with the Docker PTY runtime
-against the collector's probe sandbox. A scratch SQLite database in a private
-temporary directory binds one READY resource to that sandbox, and the
-scenarios issue attachment leases for it directly: they prove the terminal
-service's own limits and cleanup, while the gateway's capability path is
-covered by its own tests. Nothing in the scratch database outlives a run.
+against the collector's probe sandbox. A scratch SQLite database in a
+temporary directory inside the collector's workspace binds one READY resource
+to that sandbox, and the scenarios issue attachment leases for it directly:
+they prove the terminal service's own limits and cleanup, while the gateway's
+capability path is covered by its own tests. Nothing in the scratch database
+outlives a run.
 """
 
 import hashlib
@@ -54,6 +55,8 @@ from .websocket import TerminalAttachmentProtocol
 Clock = Callable[[], datetime]
 ServiceFactory = Callable[[ControlPlaneStore], TerminalAttachmentProtocol]
 
+# Scratch directories in the collector's workspace start with this prefix.
+TERMINAL_PREFIX = "terminal-"
 TERMINAL_CHECKS = (
     Check.TERMINAL_OUTPUT_LIMIT,
     Check.CONNECTION_LIMIT,
@@ -115,7 +118,6 @@ class TerminalScenarios:
         terminal: TerminalRuntime,
         profile: StrictDockerProfile,
         *,
-        scratch: Path,
         busy_timeout_ms: int,
         now: Clock,
         monotonic: Callable[[], float] = time.monotonic,
@@ -125,16 +127,15 @@ class TerminalScenarios:
         self._processes = processes
         self._terminal = terminal
         self._profile = profile
-        self._scratch = scratch
         self._busy_timeout_ms = busy_timeout_ms
         self._now = now
         self._monotonic = monotonic
         self._sleep = sleep
         self._service_factory = service_factory or self._service
 
-    def run(self, container_id: str) -> dict[Check, Judgement]:
+    def run(self, container_id: str, scratch: Path) -> dict[Check, Judgement]:
         with tempfile.TemporaryDirectory(
-            prefix="failroom-qualification-", dir=self._scratch
+            prefix=TERMINAL_PREFIX, dir=scratch
         ) as directory:
             database = Database(
                 Path(directory) / "terminal.sqlite3",

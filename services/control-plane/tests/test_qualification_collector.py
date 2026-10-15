@@ -3,22 +3,28 @@ import math
 import re
 import tempfile
 import unittest
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType
+from unittest import mock
 
 from failroom_sandbox.docker_cli import DockerError, EngineIdentity
-from failroom_sandbox.docker_lifecycle import ContainerObservation
-from failroom_sandbox.docker_profile import StrictDockerProfile, profile_fingerprint
+from failroom_sandbox.docker_lifecycle import ContainerObservation, CreatedContainer
+from failroom_sandbox.docker_profile import (
+    DockerBinding,
+    StrictDockerProfile,
+    profile_fingerprint,
+)
 from failroom_sandbox.models import (
     Check,
-    DenialCode,
     Outcome,
     QualificationDecision,
 )
 from failroom_sandbox.pty import PtyError
 from failroom_sandbox.qualification import evaluate_qualification
+from failroom_state import RuntimeCleanupError
 
 from failroom_control_plane.qualification_collector import (
     QUALIFICATION_ATTEMPT,
@@ -26,13 +32,21 @@ from failroom_control_plane.qualification_collector import (
     QualificationError,
     format_collection,
 )
-from failroom_control_plane.qualification_scenarios import TERMINAL_CHECKS
+from failroom_control_plane.qualification_restart import (
+    RESTART_DIRECTORY,
+    RestartScenario,
+)
+from failroom_control_plane.qualification_scenarios import (
+    TERMINAL_CHECKS,
+    TerminalScenarios,
+)
+from failroom_control_plane.qualification_workspace import WorkspaceError
 
 NOW = datetime(2026, 10, 8, 10, 14, tzinfo=UTC)
 STARTED_AT = "2026-10-08T10:14:00.951523267Z"
 BOOT_ID = "39838d7c-98d9-4c41-9181-b3baadabb0c6"
 IMAGE_ID = "sha256:" + "d" * 64
-UNCOLLECTED = (Check.RESTART_CLEANUP,)
+CONTAINER_CHECKS = tuple(Check)[:12]
 
 
 def profile(**changes) -> StrictDockerProfile:
@@ -155,14 +169,26 @@ def container(binding, operation_id, lifetime, *, status="running", created=None
     }
 
 
+def binding_labels(binding: DockerBinding) -> dict[str, str]:
+    return {
+        "failroom.kind": "diagnostic",
+        "failroom.attempt_id": binding.attempt_id,
+        "failroom.sandbox_id": binding.sandbox_id,
+        "failroom.generation": str(binding.generation),
+    }
+
+
 class Clock:
-    """Monotonic time that moves only when the code under test sleeps."""
+    """Time that moves only when the code under test sleeps."""
 
     def __init__(self) -> None:
         self.value = 0.0
 
     def monotonic(self) -> float:
         return self.value
+
+    def now(self) -> datetime:
+        return NOW + timedelta(seconds=self.value)
 
     def sleep(self, seconds: float) -> None:
         self.value += seconds
@@ -256,15 +282,30 @@ class FakeTerminalRuntime:
 class FakeDocker:
     def __init__(self, processes: ProcessTable) -> None:
         self.containers: dict[str, dict] = {}
-        self.listed: tuple[str, ...] = ()
+        self.next_id = 1
         self.probe_output = probe_output(60)
         self.probe_error: Exception | None = None
+        self.list_error: Exception | None = None
         self.processes = processes
         self.engine = EngineIdentity(
             "engine-1",
             MappingProxyType({"ServerVersion": "29.4.2", "Runtimes": ["runc"]}),
         )
         self.filters: list[tuple[str, ...]] = []
+
+    def allocate(self) -> str:
+        self.next_id += 1
+        return f"{self.next_id:064x}"
+
+    def matching(self, labels: dict[str, str]) -> tuple[str, ...]:
+        return tuple(
+            cid
+            for cid, data in self.containers.items()
+            if all(
+                data["Config"]["Labels"].get(key) == value
+                for key, value in labels.items()
+            )
+        )
 
     def engine_identity(self) -> EngineIdentity:
         return self.engine
@@ -282,7 +323,11 @@ class FakeDocker:
 
     def list_containers(self, filters):
         self.filters.append(filters)
-        return self.listed
+        if self.list_error is not None:
+            raise self.list_error
+        return self.matching(
+            dict(item.removeprefix("label=").split("=", 1) for item in filters)
+        )
 
 
 class FakeLifecycle:
@@ -291,6 +336,8 @@ class FakeLifecycle:
         self.created: list = []
         self.destroyed: list = []
         self.destroy_error: Exception | None = None
+        # Refuse to destroy Room sandboxes, as when Docker cannot remove them.
+        self.refuse_rooms = False
         self.sentinel_status = "running"
         # How the short-lived lifetime sandbox ends: (running, exit code, seconds).
         self.lifetime_end: tuple[bool, int, float] = (False, 0, 4.2)
@@ -298,7 +345,7 @@ class FakeLifecycle:
     def create_diagnostic(self, profile, binding, operation_id, *, lifetime):
         remaining = (lifetime.deadline - lifetime.now()).total_seconds()
         seconds = min(math.floor(remaining) - 10, profile.absolute_ttl_seconds - 10)
-        container_id = f"{len(self.docker.containers) + 1:064x}"
+        container_id = self.docker.allocate()
         data = container(binding, operation_id, seconds)
         if binding.sandbox_id.startswith("sentinel-"):
             data["State"]["Status"] = self.sentinel_status
@@ -318,13 +365,94 @@ class FakeLifecycle:
     def destroy(self, binding, container_id, *, operation_id=None):
         if self.destroy_error is not None:
             raise self.destroy_error
+        if self.refuse_rooms and binding.attempt_id != QUALIFICATION_ATTEMPT:
+            raise DockerError("CLEANUP_INCOMPLETE")
         self.destroyed.append((binding, container_id, operation_id))
-        self.docker.containers.pop(container_id, None)
+        for cid in (
+            (container_id,)
+            if container_id
+            else self.docker.matching(binding_labels(binding))
+        ):
+            self.docker.containers.pop(cid, None)
         return "sha256:" + "f" * 64
 
 
+class FakeRoomSession:
+    def __init__(self, rooms: "FakeRooms", binding, operation_id, lifetime) -> None:
+        self.rooms = rooms
+        self.binding = binding
+        self.operation_id = operation_id
+        self.lifetime = lifetime
+
+    def create_verified(self) -> CreatedContainer:
+        if self.rooms.create_error is not None:
+            raise self.rooms.create_error
+        remaining = (self.lifetime.deadline - self.lifetime.now()).total_seconds()
+        container_id = self.rooms.docker.allocate()
+        self.rooms.docker.containers[container_id] = container(
+            self.binding, self.operation_id, math.floor(remaining) - 10
+        )
+        return CreatedContainer(container_id, False)
+
+    def start_verified(self, created: CreatedContainer) -> ContainerObservation:
+        if self.rooms.start_error is not None:
+            raise self.rooms.start_error
+        return ContainerObservation(created.container_id, True, "sha256:" + "c" * 64)
+
+
+class FakeRooms:
+    """Provision Room sandboxes into the fake Docker inventory."""
+
+    def __init__(self, docker: FakeDocker) -> None:
+        self.docker = docker
+        self.opened: list = []
+        self.create_error: Exception | None = None
+        self.start_error: Exception | None = None
+
+    @contextmanager
+    def open(self, binding, runtime_operation_id, room_id, *, lifetime):
+        self.opened.append((binding, runtime_operation_id, room_id, lifetime))
+        yield FakeRoomSession(self, binding, runtime_operation_id, lifetime)
+
+
+class FakeCleanup:
+    """Remove Room sandboxes as the Docker cleanup runtime does, or not."""
+
+    def __init__(self, docker: FakeDocker) -> None:
+        self.docker = docker
+        self.targets: list = []
+        self.remove = True
+        self.error: Exception | None = None
+
+    def destroy_and_verify_absent(self, target) -> str:
+        self.targets.append(target)
+        if self.remove:
+            binding = DockerBinding(
+                target.ref.attempt_id, target.ref.sandbox_id, target.ref.generation
+            )
+            for cid in self.docker.matching(binding_labels(binding)):
+                del self.docker.containers[cid]
+        if self.error is not None:
+            raise self.error
+        return "sha256:" + "9" * 64
+
+
+class FakeWorkspace:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.error: Exception | None = None
+        self.holds = 0
+
+    @contextmanager
+    def hold(self):
+        if self.error is not None:
+            raise self.error
+        self.holds += 1
+        yield self.path
+
+
 class Harness:
-    """One collector with fakes, a scratch directory and a manual clock."""
+    """One collector with fakes, a scratch workspace and a manual clock."""
 
     def __init__(self, test: unittest.TestCase) -> None:
         scratch = tempfile.TemporaryDirectory()
@@ -337,18 +465,35 @@ class Harness:
         )
         self.docker = FakeDocker(self.processes)
         self.lifecycle = FakeLifecycle(self.docker)
+        self.rooms = FakeRooms(self.docker)
+        self.cleanup = FakeCleanup(self.docker)
+        self.workspace = FakeWorkspace(self.scratch)
         self.clock = Clock()
 
-    def collector(self, *, max_age=timedelta(hours=1), scratch=None):
+    def collector(self, *, max_age=timedelta(hours=1)):
         return QualificationCollector(
             self.docker,
             self.lifecycle,
             self.profile,
             max_age=max_age,
-            now=lambda: NOW,
+            now=self.clock.now,
             terminal=self.terminal,
-            scratch=scratch or self.scratch,
+            provisioning=self.rooms,
+            cleanup=self.cleanup,
+            workspace=self.workspace,
             busy_timeout_ms=5000,
+            monotonic=self.clock.monotonic,
+            sleep=self.clock.sleep,
+        )
+
+    def restart(self) -> RestartScenario:
+        return RestartScenario(
+            self.docker,
+            self.lifecycle,
+            self.rooms,
+            self.cleanup,
+            busy_timeout_ms=5000,
+            now=self.clock.now,
             monotonic=self.clock.monotonic,
             sleep=self.clock.sleep,
         )
@@ -364,29 +509,31 @@ class QualificationCollectorTests(unittest.TestCase):
     def collector(self, **kwargs) -> QualificationCollector:
         return self.harness.collector(**kwargs)
 
-    def test_collects_everything_but_restart_cleanup(self) -> None:
+    def result(self, collection, check):
+        return collection.report.results[tuple(Check).index(check)]
+
+    def test_collects_every_check(self) -> None:
         collection = self.collector().collect()
         report = collection.report
 
         self.assertEqual(tuple(result.check for result in report.results), tuple(Check))
         for result in report.results:
             with self.subTest(check=result.check):
-                expected = (
-                    Outcome.UNVERIFIED if result.check in UNCOLLECTED else Outcome.PASS
-                )
-                self.assertIs(result.outcome, expected)
-                self.assertEqual(result.observed_at, NOW)
+                self.assertIs(result.outcome, Outcome.PASS)
                 self.assertRegex(result.evidence_digest, r"^sha256:[0-9a-f]{64}$")
-        self.assertEqual(
-            dict(collection.reasons), {check: "NOT_COLLECTED" for check in UNCOLLECTED}
-        )
+                if result.check in CONTAINER_CHECKS:
+                    self.assertEqual(result.observed_at, NOW)
+                else:
+                    self.assertGreaterEqual(result.observed_at, NOW)
+        self.assertEqual(dict(collection.reasons), {})
         decision = evaluate_qualification(
-            report.context, report, now=NOW, max_age=timedelta(hours=1)
+            report.context,
+            report,
+            now=self.harness.clock.now(),
+            max_age=timedelta(hours=1),
         )
-        self.assertEqual(
-            {(denial.code, denial.check) for denial in decision.denials},
-            {(DenialCode.CHECK_UNVERIFIED, check) for check in UNCOLLECTED},
-        )
+        self.assertTrue(decision.allowed)
+        self.assertEqual(self.harness.workspace.holds, 1)
         self.assertEqual(list(self.harness.scratch.iterdir()), [])
 
     def test_report_is_bound_to_runtime_image_and_profile(self) -> None:
@@ -446,6 +593,25 @@ class QualificationCollectorTests(unittest.TestCase):
             )
         )
 
+    def test_restart_scenario_enters_a_room_that_the_restart_removes(self) -> None:
+        collection = self.collector().collect()
+
+        ((binding, operation, room, lifetime),) = self.harness.rooms.opened
+        self.assertEqual(room, "disk-full")
+        self.assertNotEqual(binding.attempt_id, QUALIFICATION_ATTEMPT)
+        self.assertEqual(lifetime.deadline - NOW, timedelta(seconds=20))
+        (target,) = self.harness.cleanup.targets
+        self.assertEqual(
+            (target.ref.attempt_id, target.ref.sandbox_id, target.runtime_operation_id),
+            (binding.attempt_id, binding.sandbox_id, operation),
+        )
+        # The restart waited for the attempt deadline before cleaning up.
+        self.assertGreaterEqual(self.harness.clock.value, 20)
+        self.assertEqual(self.docker.containers, {})
+        self.assertIs(
+            self.result(collection, Check.RESTART_CLEANUP).outcome, Outcome.PASS
+        )
+
     def test_sentinel_lifetime_is_the_report_validity_within_the_profile(self) -> None:
         self.collector(max_age=timedelta(seconds=120)).collect()
 
@@ -465,21 +631,21 @@ class QualificationCollectorTests(unittest.TestCase):
                 self.setUp()
                 self.lifecycle.lifetime_end = end
                 collection = self.collector().collect()
-                result = collection.report.results[
-                    tuple(Check).index(Check.ABSOLUTE_TTL)
-                ]
+                result = self.result(collection, Check.ABSOLUTE_TTL)
                 self.assertIs(result.outcome, outcome)
                 self.assertEqual(collection.reasons.get(Check.ABSOLUTE_TTL, ""), reason)
 
     def test_terminal_scenario_failure_is_unverified_not_fatal(self) -> None:
-        missing = self.harness.scratch / "missing"
-
-        collection = self.collector(scratch=missing).collect()
+        with mock.patch.object(
+            TerminalScenarios, "run", side_effect=RuntimeError("provider detail")
+        ):
+            collection = self.collector().collect()
 
         for check in TERMINAL_CHECKS:
             with self.subTest(check=check):
-                result = collection.report.results[tuple(Check).index(check)]
-                self.assertIs(result.outcome, Outcome.UNVERIFIED)
+                self.assertIs(
+                    self.result(collection, check).outcome, Outcome.UNVERIFIED
+                )
                 self.assertEqual(collection.reasons[check], "SCENARIO_UNAVAILABLE")
         self.assertEqual(len(self.lifecycle.destroyed), 3)
 
@@ -498,6 +664,7 @@ class QualificationCollectorTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, "RUNTIME_UNAVAILABLE")
                 self.assertEqual(len(self.lifecycle.destroyed), 3)
                 self.assertEqual(self.docker.containers, {})
+                self.assertEqual(list(self.harness.scratch.iterdir()), [])
 
     def test_stopped_sentinel_has_no_daemon_epoch(self) -> None:
         self.lifecycle.sentinel_status = "exited"
@@ -508,6 +675,7 @@ class QualificationCollectorTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "RUNTIME_UNAVAILABLE")
         self.assertEqual(len(self.lifecycle.created), 1)
         self.assertEqual(len(self.lifecycle.destroyed), 1)
+        self.assertEqual(self.harness.rooms.opened, [])
 
     def test_cleanup_failure_is_reported_as_incomplete(self) -> None:
         self.lifecycle.destroy_error = DockerError("CLEANUP_INCOMPLETE")
@@ -517,37 +685,83 @@ class QualificationCollectorTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "CLEANUP_INCOMPLETE")
 
-    def test_sweep_removes_stopped_leftovers_and_keeps_running_ones(self) -> None:
-        from failroom_sandbox.docker_profile import DockerBinding
+    def test_restart_sandbox_that_cannot_be_removed_fails_the_collection(self) -> None:
+        self.harness.cleanup.remove = False
+        self.harness.cleanup.error = RuntimeCleanupError("CLEANUP_INCOMPLETE")
+        self.lifecycle.refuse_rooms = True
 
+        with self.assertRaises(QualificationError) as raised:
+            self.collector().collect()
+
+        self.assertEqual(raised.exception.code, "CLEANUP_INCOMPLETE")
+        # The state stays for the next collection to recover.
+        self.assertTrue((self.harness.scratch / RESTART_DIRECTORY).is_dir())
+        self.assertEqual(len(self.docker.containers), 1)
+        # Every collector sandbox is still destroyed.
+        self.assertEqual(len(self.lifecycle.destroyed), 3)
+
+    def test_workspace_failures_stop_before_any_docker_call(self) -> None:
+        cases = {
+            "COLLECTION_IN_PROGRESS": "COLLECTION_IN_PROGRESS",
+            "WORKSPACE_UNSAFE": "INVALID_CONFIGURATION",
+            "WORKSPACE_UNAVAILABLE": "RUNTIME_UNAVAILABLE",
+        }
+        for workspace_code, code in cases.items():
+            with self.subTest(code=workspace_code):
+                self.setUp()
+                self.harness.workspace.error = WorkspaceError(workspace_code)
+                with self.assertRaises(QualificationError) as raised:
+                    self.collector().collect()
+                self.assertEqual(raised.exception.code, code)
+                self.assertEqual(self.docker.filters, [])
+                self.assertEqual(self.lifecycle.created, [])
+
+    def test_what_a_crashed_collection_left_is_removed_first(self) -> None:
+        scratch = self.harness.scratch
+        (scratch / "terminal-stale").mkdir()
+        (scratch / "terminal-stale" / "terminal.sqlite3").write_bytes(b"stale")
+        (scratch / "collector.lock").write_bytes(b"")
+        self.assertIsNone(self.harness.restart().begin(scratch))
+        (leftover,) = self.docker.containers
+
+        collection = self.collector().collect()
+
+        self.assertNotIn(leftover, self.docker.containers)
+        # The leftover is cleaned up first, before this collection's own Room.
+        self.assertEqual(
+            self.harness.cleanup.targets[0].ref.attempt_id,
+            self.harness.rooms.opened[0][0].attempt_id,
+        )
+        self.assertEqual(len(self.harness.rooms.opened), 2)
+        self.assertEqual(
+            [entry.name for entry in scratch.iterdir()], ["collector.lock"]
+        )
+        self.assertTrue(
+            all(result.outcome is Outcome.PASS for result in collection.report.results)
+        )
+
+    def test_sweep_removes_every_leftover_collector_sandbox(self) -> None:
         def leftover(name, status, created=None):
             binding = DockerBinding(QUALIFICATION_ATTEMPT, name, 1)
-            cid = f"{len(self.docker.containers) + 100:064x}"
+            cid = self.docker.allocate()
             self.docker.containers[cid] = container(
                 binding, "op-" + name, 5, status=status, created=created
             )
             return cid, binding
 
-        exited = leftover("probe-exited", "exited")
-        dead = leftover("probe-dead", "dead")
-        running = leftover("probe-running", "running")
-        fresh = leftover("probe-fresh", "created", "2026-10-08T10:10:00Z")
-        stale = leftover("probe-stale", "created", "2026-10-08T10:00:00.5Z")
-        self.docker.listed = tuple(
-            cid for cid, _ in (exited, dead, running, fresh, stale)
+        leftovers = (
+            leftover("probe-exited", "exited"),
+            leftover("probe-dead", "dead"),
+            leftover("probe-running", "running"),
+            leftover("probe-created", "created", "2026-10-08T10:13:59Z"),
         )
 
         self.collector().collect()
 
         self.assertEqual(
-            self.lifecycle.destroyed[:3],
-            [
-                (binding, cid, "op-" + binding.sandbox_id)
-                for cid, binding in (exited, dead, stale)
-            ],
+            self.lifecycle.destroyed[: len(leftovers)],
+            [(binding, cid, "op-" + binding.sandbox_id) for cid, binding in leftovers],
         )
-        self.assertIn(running[0], self.docker.containers)
-        self.assertIn(fresh[0], self.docker.containers)
         self.assertEqual(
             self.docker.filters[0],
             (
@@ -555,15 +769,13 @@ class QualificationCollectorTests(unittest.TestCase):
                 "label=failroom.attempt_id=" + QUALIFICATION_ATTEMPT,
             ),
         )
+        self.assertEqual(self.docker.containers, {})
 
     def test_sweep_refuses_leftovers_without_exact_labels(self) -> None:
-        from failroom_sandbox.docker_profile import DockerBinding
-
         binding = DockerBinding(QUALIFICATION_ATTEMPT, "probe-broken", 1)
         data = container(binding, "op", 5, status="exited")
         data["Config"]["Labels"]["failroom.generation"] = "one"
         self.docker.containers["a" * 64] = data
-        self.docker.listed = ("a" * 64,)
 
         with self.assertRaises(QualificationError) as raised:
             self.collector().collect()
@@ -575,9 +787,11 @@ class QualificationCollectorTests(unittest.TestCase):
         harness = self.harness
         valid = {
             "max_age": timedelta(hours=1),
-            "now": lambda: NOW,
+            "now": harness.clock.now,
             "terminal": harness.terminal,
-            "scratch": harness.scratch,
+            "provisioning": harness.rooms,
+            "cleanup": harness.cleanup,
+            "workspace": harness.workspace,
             "busy_timeout_ms": 5000,
         }
         cases = (
@@ -591,11 +805,9 @@ class QualificationCollectorTests(unittest.TestCase):
             ((self.docker, self.lifecycle, self.profile), {"max_age": 3600}),
             ((self.docker, self.lifecycle, self.profile), {"now": None}),
             ((self.docker, self.lifecycle, self.profile), {"terminal": object()}),
-            (
-                (self.docker, self.lifecycle, self.profile),
-                {"scratch": Path("relative")},
-            ),
-            ((self.docker, self.lifecycle, self.profile), {"scratch": "/tmp"}),
+            ((self.docker, self.lifecycle, self.profile), {"provisioning": object()}),
+            ((self.docker, self.lifecycle, self.profile), {"cleanup": object()}),
+            ((self.docker, self.lifecycle, self.profile), {"workspace": object()}),
             ((self.docker, self.lifecycle, self.profile), {"busy_timeout_ms": 0}),
             ((self.docker, self.lifecycle, self.profile), {"sleep": None}),
         )
@@ -608,10 +820,14 @@ class QualificationCollectorTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, "INVALID_CONFIGURATION")
 
     def test_operator_lines_carry_digests_and_reasons_only(self) -> None:
+        self.lifecycle.lifetime_end = (False, 0, 15.5)
         collection = self.collector().collect()
         report = collection.report
         denied = evaluate_qualification(
-            report.context, report, now=NOW, max_age=timedelta(hours=1)
+            report.context,
+            report,
+            now=self.harness.clock.now(),
+            max_age=timedelta(hours=1),
         )
 
         lines = format_collection(collection, denied)
@@ -629,11 +845,12 @@ class QualificationCollectorTests(unittest.TestCase):
             "CHECK unprivileged_identity PASS 2026-10-08T10:14:00+00:00 "
             + report.results[0].evidence_digest,
         )
-        self.assertTrue(lines[18].startswith("CHECK restart_cleanup UNVERIFIED "))
-        self.assertTrue(lines[18].endswith(" reason=NOT_COLLECTED"))
-        self.assertEqual(
-            lines[-1], "QUALIFICATION_DENIED CHECK_UNVERIFIED:restart_cleanup"
+        self.assertTrue(lines[16].startswith("CHECK absolute_ttl FAIL "))
+        self.assertTrue(lines[16].endswith(" reason=DEADLINE_EXCEEDED"))
+        self.assertRegex(
+            lines[18], r"^CHECK restart_cleanup PASS \S+ sha256:[0-9a-f]{64}$"
         )
+        self.assertEqual(lines[-1], "QUALIFICATION_DENIED CHECK_FAILED:absolute_ttl")
         self.assertEqual(passed[-1], "QUALIFICATION_PASSED")
         self.assertIsNone(re.search(r"[\x00-\x1f]", "".join(lines)))
 

@@ -124,13 +124,12 @@ class TerminalScenarioTests(unittest.TestCase):
             self.processes,
             self.runtime,
             self.profile,
-            scratch=self.scratch,
             busy_timeout_ms=5000,
             now=lambda: NOW,
             monotonic=self.clock.monotonic,
             sleep=self.clock.sleep,
             service_factory=service_factory,
-        ).run("c" * 64)
+        ).run("c" * 64, self.scratch)
 
     def assert_result(self, results, check, outcome, reason):
         self.assertEqual(
