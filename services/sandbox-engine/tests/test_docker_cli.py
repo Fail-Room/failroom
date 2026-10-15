@@ -9,7 +9,7 @@ from failroom_sandbox.docker_cli import (
     ProcessResult,
     _run_process,
 )
-from failroom_sandbox.qualification_probe import PROBE_SCRIPT
+from failroom_sandbox.qualification_probe import PROBE_SCRIPT, PROCESS_SCRIPT
 
 
 class DockerCliTests(unittest.TestCase):
@@ -370,6 +370,37 @@ class QualificationCommandTests(unittest.TestCase):
             ],
         )
         self.assertNotIn("--user", calls[0])
+
+    def test_lists_sandbox_processes_with_a_fixed_script(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append(argv)
+            return ProcessResult(0, b"process=1 S 1\nend=1\n", b"")
+
+        cli = self.cli(runner)
+        with self.assertRaisesRegex(DockerError, "^INVALID_DOCKER_REQUEST$"):
+            cli.list_sandbox_processes("../etc")
+        output = cli.list_sandbox_processes("a" * 64)
+
+        self.assertEqual(output, b"process=1 S 1\nend=1\n")
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "docker",
+                    "--context",
+                    "desktop-linux",
+                    "container",
+                    "exec",
+                    "a" * 64,
+                    "/bin/sh",
+                    "-c",
+                    PROCESS_SCRIPT,
+                    "failroom-process-list",
+                )
+            ],
+        )
 
     def test_probe_rejects_invalid_targets_and_any_stderr(self):
         calls = []

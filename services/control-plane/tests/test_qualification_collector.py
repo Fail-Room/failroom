@@ -1,9 +1,11 @@
 import copy
 import math
 import re
+import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from types import MappingProxyType
 
 from failroom_sandbox.docker_cli import DockerError, EngineIdentity
@@ -15,8 +17,8 @@ from failroom_sandbox.models import (
     Outcome,
     QualificationDecision,
 )
+from failroom_sandbox.pty import PtyError
 from failroom_sandbox.qualification import evaluate_qualification
-from failroom_sandbox.qualification_probe import CONTAINER_CHECKS
 
 from failroom_control_plane.qualification_collector import (
     QUALIFICATION_ATTEMPT,
@@ -24,12 +26,13 @@ from failroom_control_plane.qualification_collector import (
     QualificationError,
     format_collection,
 )
+from failroom_control_plane.qualification_scenarios import TERMINAL_CHECKS
 
 NOW = datetime(2026, 10, 8, 10, 14, tzinfo=UTC)
 STARTED_AT = "2026-10-08T10:14:00.951523267Z"
 BOOT_ID = "39838d7c-98d9-4c41-9181-b3baadabb0c6"
 IMAGE_ID = "sha256:" + "d" * 64
-SCENARIO_CHECKS = tuple(check for check in Check if check not in CONTAINER_CHECKS)
+UNCOLLECTED = (Check.RESTART_CLEANUP,)
 
 
 def profile(**changes) -> StrictDockerProfile:
@@ -51,9 +54,9 @@ def profile(**changes) -> StrictDockerProfile:
         "io_device_path": "/dev/loop0",
         "io_read_bps": 1_048_576,
         "io_write_bps": 1_048_576,
-        "terminal_output_limit_bytes": 1_048_576,
-        "connection_limit": 1,
-        "session_limit": 1,
+        "terminal_output_limit_bytes": 4096,
+        "connection_limit": 2,
+        "session_limit": 2,
         "absolute_ttl_seconds": 300,
     }
     values.update(changes)
@@ -108,6 +111,10 @@ def probe_output(lifetime: int, *, boot_id=BOOT_ID, io_device="7:0") -> bytes:
     return ("\n".join(lines) + "\n").encode("ascii")
 
 
+def docker_time(moment: datetime) -> str:
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
 def container(binding, operation_id, lifetime, *, status="running", created=None):
     return {
         "Image": IMAGE_ID,
@@ -116,6 +123,8 @@ def container(binding, operation_id, lifetime, *, status="running", created=None
             "Status": status,
             "Running": status == "running",
             "StartedAt": STARTED_AT,
+            "FinishedAt": "0001-01-01T00:00:00Z",
+            "ExitCode": 0,
         },
         "Config": {
             "User": "10001:10001",
@@ -146,12 +155,111 @@ def container(binding, operation_id, lifetime, *, status="running", created=None
     }
 
 
-class FakeDocker:
+class Clock:
+    """Monotonic time that moves only when the code under test sleeps."""
+
     def __init__(self) -> None:
+        self.value = 0.0
+
+    def monotonic(self) -> float:
+        return self.value
+
+    def sleep(self, seconds: float) -> None:
+        self.value += seconds
+
+
+class ProcessTable:
+    """The process list of one fake sandbox, keyed by shell session."""
+
+    def __init__(self) -> None:
+        self.sessions: dict[int, list[tuple[int, str]]] = {}
+        self.keep_after_close = False
+        self.malformed = False
+
+    def list_sandbox_processes(self, container_id: str) -> bytes:
+        if self.malformed:
+            return b"process=one\nend=1\n"
+        lines = ["process=1 S 1", "process=7 S 1"]
+        for shell, members in self.sessions.items():
+            lines += [f"process={pid} {state} {shell}" for pid, state in members]
+        return ("\n".join(lines) + "\nend=1\n").encode("ascii")
+
+
+class FakeSession:
+    """Mimic the Docker PTY session's cumulative output accounting."""
+
+    def __init__(self, runtime: "FakeTerminalRuntime") -> None:
+        self.runtime = runtime
+        self.pending = b""
+        self.output = 0
+        self.shell: int | None = None
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        size = re.search(rb"head -c ([0-9]+)", data)
+        if size and self.runtime.produce_output:
+            self.pending += b"x" * int(size.group(1))
+        if b"FAILROOM_SHELL" in data:
+            self.shell = self.runtime.next_shell
+            self.runtime.next_shell += 10
+            if self.runtime.report_shell:
+                self.pending += b"\x1b[32mFAILROOM_SHELL=%d\x1b[0m\r\n" % self.shell
+            members = [(self.shell + index, "S") for index in range(3)]
+            self.runtime.processes.sessions[self.shell] = members[
+                : self.runtime.members
+            ]
+
+    def read(self, maximum: int) -> bytes:
+        limit = self.runtime.limit
+        if self.runtime.enforce_output and self.output >= limit:
+            self.close()
+            raise PtyError("OUTPUT_LIMIT")
+        allowed = limit - self.output if self.runtime.enforce_output else maximum
+        data = self.pending[: min(maximum, allowed)]
+        self.pending = self.pending[len(data) :]
+        self.output += len(data)
+        return data
+
+    def resize(self, rows: int, columns: int) -> None:
+        return None
+
+    def signal(self, value: int) -> None:
+        return None
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self.shell is not None and not self.runtime.processes.keep_after_close:
+            self.runtime.processes.sessions.pop(self.shell, None)
+
+
+class FakeTerminalRuntime:
+    def __init__(self, processes: ProcessTable, limit: int) -> None:
+        self.processes = processes
+        self.limit = limit
+        self.produce_output = True
+        self.enforce_output = True
+        self.report_shell = True
+        self.members = 3
+        self.next_shell = 42
+        self.open_error: Exception | None = None
+        self.opened: list[tuple[str, tuple[str, ...]]] = []
+
+    def open(self, container_id: str, *, command: tuple[str, ...]) -> FakeSession:
+        if self.open_error is not None:
+            raise self.open_error
+        self.opened.append((container_id, command))
+        return FakeSession(self)
+
+
+class FakeDocker:
+    def __init__(self, processes: ProcessTable) -> None:
         self.containers: dict[str, dict] = {}
         self.listed: tuple[str, ...] = ()
         self.probe_output = probe_output(60)
         self.probe_error: Exception | None = None
+        self.processes = processes
         self.engine = EngineIdentity(
             "engine-1",
             MappingProxyType({"ServerVersion": "29.4.2", "Runtimes": ["runc"]}),
@@ -165,6 +273,9 @@ class FakeDocker:
         if self.probe_error is not None:
             raise self.probe_error
         return self.probe_output
+
+    def list_sandbox_processes(self, container_id: str) -> bytes:
+        return self.processes.list_sandbox_processes(container_id)
 
     def inspect_container(self, selector: str):
         return copy.deepcopy(self.containers.get(selector))
@@ -181,19 +292,26 @@ class FakeLifecycle:
         self.destroyed: list = []
         self.destroy_error: Exception | None = None
         self.sentinel_status = "running"
+        # How the short-lived lifetime sandbox ends: (running, exit code, seconds).
+        self.lifetime_end: tuple[bool, int, float] = (False, 0, 4.2)
 
     def create_diagnostic(self, profile, binding, operation_id, *, lifetime):
         remaining = (lifetime.deadline - lifetime.now()).total_seconds()
         seconds = min(math.floor(remaining) - 10, profile.absolute_ttl_seconds - 10)
         container_id = f"{len(self.docker.containers) + 1:064x}"
-        status = (
-            self.sentinel_status
-            if binding.sandbox_id.startswith("sentinel-")
-            else "running"
-        )
-        self.docker.containers[container_id] = container(
-            binding, operation_id, seconds, status=status
-        )
+        data = container(binding, operation_id, seconds)
+        if binding.sandbox_id.startswith("sentinel-"):
+            data["State"]["Status"] = self.sentinel_status
+            data["State"]["Running"] = self.sentinel_status == "running"
+        if binding.sandbox_id.startswith("lifetime-"):
+            running, exit_code, ended = self.lifetime_end
+            data["State"].update(
+                Status="running" if running else "exited",
+                Running=running,
+                ExitCode=exit_code,
+                FinishedAt=docker_time(NOW + timedelta(seconds=ended)),
+            )
+        self.docker.containers[container_id] = data
         self.created.append((binding, operation_id, lifetime, container_id))
         return ContainerObservation(container_id, True, "sha256:" + "e" * 64)
 
@@ -205,18 +323,48 @@ class FakeLifecycle:
         return "sha256:" + "f" * 64
 
 
-class QualificationCollectorTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.docker = FakeDocker()
-        self.lifecycle = FakeLifecycle(self.docker)
-        self.profile = profile()
+class Harness:
+    """One collector with fakes, a scratch directory and a manual clock."""
 
-    def collector(self, *, max_age=timedelta(hours=1)) -> QualificationCollector:
+    def __init__(self, test: unittest.TestCase) -> None:
+        scratch = tempfile.TemporaryDirectory()
+        test.addCleanup(scratch.cleanup)
+        self.scratch = Path(scratch.name)
+        self.profile = profile()
+        self.processes = ProcessTable()
+        self.terminal = FakeTerminalRuntime(
+            self.processes, self.profile.terminal_output_limit_bytes
+        )
+        self.docker = FakeDocker(self.processes)
+        self.lifecycle = FakeLifecycle(self.docker)
+        self.clock = Clock()
+
+    def collector(self, *, max_age=timedelta(hours=1), scratch=None):
         return QualificationCollector(
-            self.docker, self.lifecycle, self.profile, max_age=max_age, now=lambda: NOW
+            self.docker,
+            self.lifecycle,
+            self.profile,
+            max_age=max_age,
+            now=lambda: NOW,
+            terminal=self.terminal,
+            scratch=scratch or self.scratch,
+            busy_timeout_ms=5000,
+            monotonic=self.clock.monotonic,
+            sleep=self.clock.sleep,
         )
 
-    def test_collects_container_checks_and_reports_scenarios_unverified(self) -> None:
+
+class QualificationCollectorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.harness = Harness(self)
+        self.docker = self.harness.docker
+        self.lifecycle = self.harness.lifecycle
+        self.profile = self.harness.profile
+
+    def collector(self, **kwargs) -> QualificationCollector:
+        return self.harness.collector(**kwargs)
+
+    def test_collects_everything_but_restart_cleanup(self) -> None:
         collection = self.collector().collect()
         report = collection.report
 
@@ -224,24 +372,22 @@ class QualificationCollectorTests(unittest.TestCase):
         for result in report.results:
             with self.subTest(check=result.check):
                 expected = (
-                    Outcome.PASS
-                    if result.check in CONTAINER_CHECKS
-                    else Outcome.UNVERIFIED
+                    Outcome.UNVERIFIED if result.check in UNCOLLECTED else Outcome.PASS
                 )
                 self.assertIs(result.outcome, expected)
                 self.assertEqual(result.observed_at, NOW)
                 self.assertRegex(result.evidence_digest, r"^sha256:[0-9a-f]{64}$")
         self.assertEqual(
-            dict(collection.reasons),
-            {check: "NOT_COLLECTED" for check in SCENARIO_CHECKS},
+            dict(collection.reasons), {check: "NOT_COLLECTED" for check in UNCOLLECTED}
         )
         decision = evaluate_qualification(
             report.context, report, now=NOW, max_age=timedelta(hours=1)
         )
         self.assertEqual(
             {(denial.code, denial.check) for denial in decision.denials},
-            {(DenialCode.CHECK_UNVERIFIED, check) for check in SCENARIO_CHECKS},
+            {(DenialCode.CHECK_UNVERIFIED, check) for check in UNCOLLECTED},
         )
+        self.assertEqual(list(self.harness.scratch.iterdir()), [])
 
     def test_report_is_bound_to_runtime_image_and_profile(self) -> None:
         context = self.collector().collect().report.context
@@ -273,21 +419,32 @@ class QualificationCollectorTests(unittest.TestCase):
     def test_creates_and_destroys_only_collector_owned_sandboxes(self) -> None:
         self.collector().collect()
 
-        (sentinel, sentinel_op, sentinel_life, sentinel_id), probe = (
-            self.lifecycle.created
-        )
-        probe_binding, probe_op, probe_life, probe_id = probe
-        for binding, role in ((sentinel, "sentinel"), (probe_binding, "probe")):
+        created = self.lifecycle.created
+        roles = ("sentinel", "lifetime", "probe")
+        for (binding, _, _, _), role in zip(created, roles, strict=True):
             self.assertEqual(binding.attempt_id, QUALIFICATION_ATTEMPT)
             self.assertRegex(binding.sandbox_id, rf"^{role}-[0-9a-f]{{32}}$")
             self.assertEqual(binding.generation, 1)
-        self.assertEqual(sentinel_life.deadline - NOW, timedelta(seconds=300))
-        self.assertEqual(probe_life.deadline - NOW, timedelta(seconds=70))
+        self.assertEqual(
+            [life.deadline - NOW for _, _, life, _ in created],
+            [timedelta(seconds=300), timedelta(seconds=15), timedelta(seconds=70)],
+        )
         self.assertEqual(
             self.lifecycle.destroyed,
-            [(probe_binding, probe_id, probe_op), (sentinel, sentinel_id, sentinel_op)],
+            [
+                (binding, container_id, operation)
+                for binding, operation, _, container_id in reversed(created)
+            ],
         )
         self.assertEqual(self.docker.containers, {})
+        probe_id = created[2][3]
+        self.assertTrue(self.harness.terminal.opened)
+        self.assertTrue(
+            all(
+                opened == (probe_id, ("/bin/bash",))
+                for opened in self.harness.terminal.opened
+            )
+        )
 
     def test_sentinel_lifetime_is_the_report_validity_within_the_profile(self) -> None:
         self.collector(max_age=timedelta(seconds=120)).collect()
@@ -295,6 +452,36 @@ class QualificationCollectorTests(unittest.TestCase):
         self.assertEqual(
             self.lifecycle.created[0][2].deadline - NOW, timedelta(seconds=130)
         )
+
+    def test_lifetime_scenario_requires_pid1_to_end_by_the_deadline(self) -> None:
+        cases = (
+            ((True, 0, 0.0), Outcome.FAIL, "LIFETIME_NOT_ENFORCED"),
+            ((False, 137, 4.2), Outcome.UNVERIFIED, "UNEXPECTED_EXIT"),
+            ((False, 0, 15.5), Outcome.FAIL, "DEADLINE_EXCEEDED"),
+            ((False, 0, 14.9), Outcome.PASS, ""),
+        )
+        for end, outcome, reason in cases:
+            with self.subTest(end=end):
+                self.setUp()
+                self.lifecycle.lifetime_end = end
+                collection = self.collector().collect()
+                result = collection.report.results[
+                    tuple(Check).index(Check.ABSOLUTE_TTL)
+                ]
+                self.assertIs(result.outcome, outcome)
+                self.assertEqual(collection.reasons.get(Check.ABSOLUTE_TTL, ""), reason)
+
+    def test_terminal_scenario_failure_is_unverified_not_fatal(self) -> None:
+        missing = self.harness.scratch / "missing"
+
+        collection = self.collector(scratch=missing).collect()
+
+        for check in TERMINAL_CHECKS:
+            with self.subTest(check=check):
+                result = collection.report.results[tuple(Check).index(check)]
+                self.assertIs(result.outcome, Outcome.UNVERIFIED)
+                self.assertEqual(collection.reasons[check], "SCENARIO_UNAVAILABLE")
+        self.assertEqual(len(self.lifecycle.destroyed), 3)
 
     def test_failed_or_unreadable_probe_is_no_report_and_cleans_up(self) -> None:
         cases = {
@@ -309,7 +496,7 @@ class QualificationCollectorTests(unittest.TestCase):
                 with self.assertRaises(QualificationError) as raised:
                     self.collector().collect()
                 self.assertEqual(raised.exception.code, "RUNTIME_UNAVAILABLE")
-                self.assertEqual(len(self.lifecycle.destroyed), 2)
+                self.assertEqual(len(self.lifecycle.destroyed), 3)
                 self.assertEqual(self.docker.containers, {})
 
     def test_stopped_sentinel_has_no_daemon_epoch(self) -> None:
@@ -352,9 +539,8 @@ class QualificationCollectorTests(unittest.TestCase):
 
         self.collector().collect()
 
-        swept = [entry for entry in self.lifecycle.destroyed[:3]]
         self.assertEqual(
-            swept,
+            self.lifecycle.destroyed[:3],
             [
                 (binding, cid, "op-" + binding.sandbox_id)
                 for cid, binding in (exited, dead, stale)
@@ -386,28 +572,39 @@ class QualificationCollectorTests(unittest.TestCase):
         self.assertEqual(self.lifecycle.created, [])
 
     def test_invalid_configuration_is_rejected(self) -> None:
+        harness = self.harness
+        valid = {
+            "max_age": timedelta(hours=1),
+            "now": lambda: NOW,
+            "terminal": harness.terminal,
+            "scratch": harness.scratch,
+            "busy_timeout_ms": 5000,
+        }
         cases = (
-            (object(), self.lifecycle, self.profile, timedelta(hours=1), lambda: NOW),
-            (self.docker, object(), self.profile, timedelta(hours=1), lambda: NOW),
-            (self.docker, self.lifecycle, object(), timedelta(hours=1), lambda: NOW),
+            ((object(), self.lifecycle, self.profile), {}),
+            ((self.docker, object(), self.profile), {}),
+            ((self.docker, self.lifecycle, object()), {}),
             (
-                self.docker,
-                self.lifecycle,
-                self.profile,
-                timedelta(seconds=59),
-                lambda: NOW,
+                (self.docker, self.lifecycle, self.profile),
+                {"max_age": timedelta(seconds=59)},
             ),
-            (self.docker, self.lifecycle, self.profile, 3600, lambda: NOW),
-            (self.docker, self.lifecycle, self.profile, timedelta(hours=1), None),
+            ((self.docker, self.lifecycle, self.profile), {"max_age": 3600}),
+            ((self.docker, self.lifecycle, self.profile), {"now": None}),
+            ((self.docker, self.lifecycle, self.profile), {"terminal": object()}),
+            (
+                (self.docker, self.lifecycle, self.profile),
+                {"scratch": Path("relative")},
+            ),
+            ((self.docker, self.lifecycle, self.profile), {"scratch": "/tmp"}),
+            ((self.docker, self.lifecycle, self.profile), {"busy_timeout_ms": 0}),
+            ((self.docker, self.lifecycle, self.profile), {"sleep": None}),
         )
-        for docker, lifecycle, chosen, max_age, now in cases:
+        for arguments, changes in cases:
             with (
-                self.subTest(max_age=max_age),
+                self.subTest(changes=changes),
                 self.assertRaises(QualificationError) as raised,
             ):
-                QualificationCollector(
-                    docker, lifecycle, chosen, max_age=max_age, now=now
-                )
+                QualificationCollector(*arguments, **{**valid, **changes})
             self.assertEqual(raised.exception.code, "INVALID_CONFIGURATION")
 
     def test_operator_lines_carry_digests_and_reasons_only(self) -> None:
@@ -432,11 +629,10 @@ class QualificationCollectorTests(unittest.TestCase):
             "CHECK unprivileged_identity PASS 2026-10-08T10:14:00+00:00 "
             + report.results[0].evidence_digest,
         )
-        self.assertTrue(lines[13].endswith(" reason=NOT_COLLECTED"))
+        self.assertTrue(lines[18].startswith("CHECK restart_cleanup UNVERIFIED "))
+        self.assertTrue(lines[18].endswith(" reason=NOT_COLLECTED"))
         self.assertEqual(
-            lines[-1],
-            "QUALIFICATION_DENIED "
-            + " ".join(f"CHECK_UNVERIFIED:{check.value}" for check in SCENARIO_CHECKS),
+            lines[-1], "QUALIFICATION_DENIED CHECK_UNVERIFIED:restart_cleanup"
         )
         self.assertEqual(passed[-1], "QUALIFICATION_PASSED")
         self.assertIsNone(re.search(r"[\x00-\x1f]", "".join(lines)))

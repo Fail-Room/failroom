@@ -1,16 +1,20 @@
 """Report-only qualification collection on the trusted local controller.
 
-The collector creates a sentinel and a probe sandbox through the verified
-diagnostic lifecycle with the exact strict profile and image, runs the fixed
-probe in the probe sandbox, and judges the twelve container checks. The six
-scenario checks are reported UNVERIFIED until they are collected. It stores
-nothing and gates nothing; callers decide what to do with the report.
+The collector creates a sentinel, a probe and a short-lived lifetime sandbox
+through the verified diagnostic lifecycle with the exact strict profile and
+image. It runs the fixed probe in the probe sandbox and judges the twelve
+container checks, runs the terminal scenarios against the same sandbox, and
+checks that PID 1 ends the lifetime sandbox by its deadline. Restart cleanup
+is reported UNVERIFIED until it is collected. It stores nothing and gates
+nothing; callers decide what to do with the report.
 """
 
 import re
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
@@ -34,12 +38,14 @@ from failroom_sandbox.models import (
     RuntimeIdentity,
 )
 from failroom_sandbox.qualification_probe import (
-    CONTAINER_CHECKS,
     Judgement,
     ProbeOutputError,
     judge_container_checks,
     parse_probe_output,
 )
+
+from .qualification_scenarios import TERMINAL_CHECKS, TerminalScenarios
+from .terminal import TerminalRuntime
 
 Clock = Callable[[], datetime]
 
@@ -47,6 +53,8 @@ Clock = Callable[[], datetime]
 # UUIDs, so the label never names a learner attempt.
 QUALIFICATION_ATTEMPT = "qualification"
 _PROBE_SECONDS = 60
+_LIFETIME_SECONDS = 5
+_LIFETIME_GRACE_SECONDS = 10
 _START_MARGIN_SECONDS = 10
 _STALE_CREATED = timedelta(minutes=10)
 _STARTED_AT = re.compile(
@@ -74,6 +82,8 @@ class QualificationDocker(Protocol):
     def engine_identity(self) -> EngineIdentity: ...
 
     def run_qualification_probe(self, container_id: str) -> bytes: ...
+
+    def list_sandbox_processes(self, container_id: str) -> bytes: ...
 
     def inspect_container(self, selector: str) -> dict[str, object] | None: ...
 
@@ -113,6 +123,7 @@ class _Started:
     binding: DockerBinding
     operation_id: str
     container_id: str
+    deadline: datetime
 
 
 def _object(value: object) -> dict[str, object]:
@@ -163,6 +174,11 @@ class QualificationCollector:
         *,
         max_age: timedelta,
         now: Clock,
+        terminal: TerminalRuntime,
+        scratch: Path,
+        busy_timeout_ms: int,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if (
             not isinstance(docker, QualificationDocker)
@@ -171,6 +187,13 @@ class QualificationCollector:
             or type(max_age) is not timedelta
             or max_age < timedelta(seconds=60)
             or not callable(now)
+            or not isinstance(terminal, TerminalRuntime)
+            or not isinstance(scratch, Path)
+            or not scratch.is_absolute()
+            or type(busy_timeout_ms) is not int
+            or not 1 <= busy_timeout_ms <= 30_000
+            or not callable(monotonic)
+            or not callable(sleep)
         ):
             raise QualificationError("INVALID_CONFIGURATION")
         self._docker = docker
@@ -178,6 +201,18 @@ class QualificationCollector:
         self._profile = profile
         self._max_age = max_age
         self._now = now
+        self._monotonic = monotonic
+        self._sleep = sleep
+        self._scenarios = TerminalScenarios(
+            docker,
+            terminal,
+            profile,
+            scratch=scratch,
+            busy_timeout_ms=busy_timeout_ms,
+            now=now,
+            monotonic=monotonic,
+            sleep=sleep,
+        )
 
     def collect(self) -> QualificationCollection:
         try:
@@ -191,18 +226,31 @@ class QualificationCollector:
         self._sweep()
         engine = self._docker.engine_identity()
         max_lifetime = self._profile.absolute_ttl_seconds - _START_MARGIN_SECONDS
+        scenarios: dict[Check, Judgement] = {}
+        scenario_times: dict[Check, datetime] = {}
         sentinel = self._start(
             "sentinel", min(int(self._max_age.total_seconds()), max_lifetime)
         )
         try:
             epoch = self._daemon_epoch(sentinel)
-            probe = self._start("probe", min(_PROBE_SECONDS, max_lifetime))
+            # Started first so its short lifetime runs out while the probe works.
+            lifetime_sandbox = self._start(
+                "lifetime", min(_LIFETIME_SECONDS, max_lifetime)
+            )
             try:
-                raw = self._docker.run_qualification_probe(probe.container_id)
-                observed_at = self._utc_now()
-                data = self._inspect(probe)
+                probe = self._start("probe", min(_PROBE_SECONDS, max_lifetime))
+                try:
+                    raw = self._docker.run_qualification_probe(probe.container_id)
+                    observed_at = self._utc_now()
+                    data = self._inspect(probe)
+                    scenarios.update(self._terminal_scenarios(probe.container_id))
+                    scenario_times.update(dict.fromkeys(scenarios, self._utc_now()))
+                finally:
+                    self._destroy(probe)
+                scenarios[Check.ABSOLUTE_TTL] = self._lifetime_check(lifetime_sandbox)
+                scenario_times[Check.ABSOLUTE_TTL] = self._utc_now()
             finally:
-                self._destroy(probe)
+                self._destroy(lifetime_sandbox)
         finally:
             self._destroy(sentinel)
         try:
@@ -243,8 +291,9 @@ class QualificationCollector:
                 lifetime_seconds=_lifetime(data),
             )
         }
+        judgements.update(scenarios)
         for check in Check:
-            if check not in CONTAINER_CHECKS:
+            if check not in judgements:
                 judgements[check] = Judgement(
                     check, Outcome.UNVERIFIED, "NOT_COLLECTED", MappingProxyType({})
                 )
@@ -252,7 +301,7 @@ class QualificationCollector:
             CheckResult(
                 check,
                 judgements[check].outcome,
-                observed_at,
+                scenario_times.get(check, observed_at),
                 _evidence(context, judgements[check]),
             )
             for check in Check
@@ -284,7 +333,52 @@ class QualificationCollector:
             operation_id,
             lifetime=ContainerLifetime(deadline, self._now),
         )
-        return _Started(binding, operation_id, observation.container_id)
+        return _Started(binding, operation_id, observation.container_id, deadline)
+
+    def _terminal_scenarios(self, container_id: str) -> dict[Check, Judgement]:
+        try:
+            return self._scenarios.run(container_id)
+        except Exception:
+            return {
+                check: Judgement(
+                    check,
+                    Outcome.UNVERIFIED,
+                    "SCENARIO_UNAVAILABLE",
+                    MappingProxyType({}),
+                )
+                for check in TERMINAL_CHECKS
+            }
+
+    def _lifetime_check(self, started: _Started) -> Judgement:
+        """PID 1 must stop the sandbox on its own no later than its deadline."""
+        check = Check.ABSOLUTE_TTL
+        try:
+            data = self._inspect(started)
+            lifetime = _lifetime(data)
+            give_up = self._monotonic() + lifetime + _LIFETIME_GRACE_SECONDS
+            state = _object(data.get("State"))
+            while state.get("Running") is True and self._monotonic() < give_up:
+                self._sleep(0.25)
+                state = _object(self._inspect(started).get("State"))
+        except QualificationError:
+            return Judgement(
+                check, Outcome.UNVERIFIED, "LIFETIME_UNREADABLE", MappingProxyType({})
+            )
+        exit_code = state.get("ExitCode")
+        finished = _docker_time(state.get("FinishedAt"))
+        facts: dict[str, object] = {
+            "lifetime_seconds": lifetime,
+            "exit_code": exit_code if type(exit_code) is int else None,
+        }
+        if state.get("Running") is not False:
+            outcome, reason = Outcome.FAIL, "LIFETIME_NOT_ENFORCED"
+        elif exit_code != 0 or finished is None:
+            outcome, reason, facts = Outcome.UNVERIFIED, "UNEXPECTED_EXIT", {}
+        elif finished > started.deadline:
+            outcome, reason = Outcome.FAIL, "DEADLINE_EXCEEDED"
+        else:
+            outcome, reason = Outcome.PASS, ""
+        return Judgement(check, outcome, reason, MappingProxyType(facts))
 
     def _inspect(self, started: _Started) -> dict[str, object]:
         data = self._docker.inspect_container(started.container_id)
@@ -311,7 +405,9 @@ class QualificationCollector:
         """Remove stopped sandboxes a crashed collection left behind.
 
         Running ones may belong to a concurrent collection; their PID 1 lifetime
-        bounds them and a later collection removes them once they stop.
+        bounds them and a later collection removes them once they stop. A
+        concurrent collection's lifetime sandbox stops before that collection
+        reads it, so removing it leaves that absolute TTL check UNVERIFIED.
         """
         for container_id in self._docker.list_containers(
             (

@@ -303,14 +303,7 @@ class MigrationCliTests(unittest.TestCase):
         build_runtime.assert_not_called()
 
     def collection(self):
-        docker = qualification.FakeDocker()
-        return qualification.QualificationCollector(
-            docker,
-            qualification.FakeLifecycle(docker),
-            qualification.profile(),
-            max_age=timedelta(hours=1),
-            now=lambda: qualification.NOW,
-        ).collect()
+        return qualification.Harness(self).collector().collect()
 
     def test_qualify_local_prints_the_report_and_exits_by_decision(self) -> None:
         collection = self.collection()
@@ -359,12 +352,19 @@ class MigrationCliTests(unittest.TestCase):
 
     def test_default_qualifier_collects_after_preflight_and_evaluates(self) -> None:
         collection = self.collection()
+        database = Path(self.temp.name) / "state" / "failroom.sqlite3"
         controller = SimpleNamespace(
             docker_cli=Mock(return_value="docker"),
             seccomp_policy_store=Mock(return_value="policies"),
             profile="profile",
+            docker_context="desktop-linux",
+            database_path=database,
         )
-        config = SimpleNamespace(controller=controller)
+        config = SimpleNamespace(
+            controller=controller,
+            pty_limits="pty-limits",
+            database_busy_timeout_ms=5000,
+        )
         environment = {"FAILROOM_QUALIFICATION_MAX_AGE_SECONDS": "3600"}
         calls = []
 
@@ -381,6 +381,9 @@ class MigrationCliTests(unittest.TestCase):
                 "failroom_control_plane.cli.DockerDiagnosticLifecycle",
                 return_value="lifecycle",
             ) as lifecycle,
+            patch(
+                "failroom_control_plane.cli.DockerPtyRuntime", return_value="terminal"
+            ) as terminal,
             patch("failroom_control_plane.cli.QualificationCollector") as collector,
         ):
             collector.return_value.collect.side_effect = lambda: (
@@ -390,12 +393,16 @@ class MigrationCliTests(unittest.TestCase):
 
         self.assertEqual(calls, [("preflight", config), ("collect", None)])
         lifecycle.assert_called_once_with("docker", "policies")
+        terminal.assert_called_once_with(context="desktop-linux", limits="pty-limits")
         collector.assert_called_once_with(
             "docker",
             "lifecycle",
             "profile",
             max_age=timedelta(hours=1),
             now=ANY,
+            terminal="terminal",
+            scratch=database.parent,
+            busy_timeout_ms=5000,
         )
         now = collector.call_args.kwargs["now"]
         self.assertIsInstance(now(), datetime)
