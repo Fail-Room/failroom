@@ -2,8 +2,12 @@
 # Run the opt-in Linux Docker integration tests on a disposable CI runner, with
 # the inputs the control-plane README documents. The runner is the trusted
 # controller for this one run; it never prints the secrets the README blocks
-# generate.
+# generate. Failures are also reported as annotations, which anyone can read
+# without the run's logs.
 set -euo pipefail
+
+stage="setup"
+trap 'echo "::error title=linux-docker::failed during ${stage}"' ERR
 
 # The reviewed seccomp policy: Docker's default profile at a pinned commit.
 POLICY_URL="https://raw.githubusercontent.com/moby/profiles/61eaf32614c7c71b60bd8927d3e6a4ffc8ff1f31/seccomp/default.json"
@@ -11,25 +15,29 @@ POLICY_SHA256="536529b665dd0972c37bfb569f5d4ac8a53592e7b00752bc39ff063ca9864c74"
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 control_plane="$root/services/control-plane"
-blocks="$(mktemp -d)"
-trap 'rm -rf "$blocks"' EXIT
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
 
+stage="seccomp policy"
 policies="$HOME/.local/share/failroom/policies"
 install -d -m 0700 "$policies"
 curl -fsSL --retry 3 "$POLICY_URL" -o "$policies/reviewed-default.json"
 echo "$POLICY_SHA256  $policies/reviewed-default.json" | sha256sum --check --quiet
 
 # The I/O limit applies to the whole disk that holds Docker's data root.
-majmin="$(findmnt -n -o MAJ:MIN --target "$(docker info --format '{{.DockerRootDir}}')")"
+stage="I/O device"
+majmin="$(findmnt -n -o MAJ:MIN --target "$(docker info --format '{{.DockerRootDir}}')" | tr -d '[:space:]')"
 disk="$(readlink -f "/sys/dev/block/$majmin")"
 if [ -e "$disk/partition" ]; then
   disk="$(dirname "$disk")"
 fi
 io_device="/dev/$(basename "$disk")"
 test -b "$io_device"
+echo "::notice title=linux-docker::I/O device $io_device for $majmin"
 
 # The README's environment blocks, with this runner's I/O device; the seccomp
 # policy is already where the README expects it.
+stage="README inputs"
 awk '/^## Linux integration evidence/ { s = 1 }
   s && /^```sh/ { b = 1; buf = ""; next }
   s && b && /^```/ {
@@ -37,22 +45,38 @@ awk '/^## Linux integration evidence/ { s = 1 }
     if (buf ~ /export /) { f = sprintf("%s/block%d.sh", dir, ++k); printf "%s", buf > f; close(f) }
     next
   }
-  s && b { buf = buf $0 "\n" }' dir="$blocks" "$control_plane/README.md"
-sed -i "s#^export FAILROOM_IO_DEVICE=.*#export FAILROOM_IO_DEVICE=$io_device#" "$blocks/block1.sh"
+  s && b { buf = buf $0 "\n" }' dir="$work" "$control_plane/README.md"
+sed -i "s#^export FAILROOM_IO_DEVICE=.*#export FAILROOM_IO_DEVICE=$io_device#" "$work/block1.sh"
 cd "$control_plane"
-for block in "$blocks"/block*.sh; do
+for block in "$work"/block*.sh; do
   # shellcheck source=/dev/null
   . "$block"
 done
 export FAILROOM_DOCKER_INTEGRATION=1 FAILROOM_TERMINAL_INTEGRATION=1 FAILROOM_LOCAL_RUNTIME_INTEGRATION=1
 
-(cd ../sandbox-engine && uv run --locked python -m unittest discover -s tests -p 'test_docker_diagnostic_integration.py' -v)
-uv run --locked python -m unittest discover -s tests -p 'test_linux_*.py' -v
+# Run one suite, keeping its output, and annotate each failing test.
+run_suite() {
+  local directory="$1" pattern="$2" log="$work/suite.log" status=0
+  (cd "$directory" && uv run --locked python -m unittest discover -s tests -p "$pattern" -v) 2>&1 \
+    | tee "$log" || status=$?
+  if [ "$status" -ne 0 ]; then
+    { grep -E '^(FAIL|ERROR): ' "$log" || true; } | head -20 | while read -r line; do
+      echo "::error title=linux-docker::$line"
+    done
+  fi
+  return "$status"
+}
+
+stage="sandbox-engine integration tests"
+run_suite ../sandbox-engine 'test_docker_diagnostic_integration.py'
+stage="control-plane integration tests"
+run_suite . 'test_linux_*.py'
 
 # Nothing the tests created may outlive them.
+stage="leftover check"
 leftovers="$(docker ps -a --quiet --filter label=failroom.kind)"
 if [ -n "$leftovers" ]; then
-  echo "LEFTOVER_CONTAINERS" >&2
-  docker ps -a --filter label=failroom.kind >&2
+  echo "::error title=linux-docker::Failroom containers outlived the tests"
+  docker ps -a --filter label=failroom.kind
   exit 1
 fi
