@@ -338,7 +338,8 @@ The opt-in tests below use real Docker containers and no Docker mocks. Run them
 only on a trusted Linux controller, from this directory, after reviewing every
 input. Without the opt-in flag, on another platform, or with a missing input,
 they skip with an `UNVERIFIED` reason. A skip is not evidence; record evidence
-only from a successful run.
+only from a successful run. CI runs them on a disposable Ubuntu runner with
+these inputs; see [DEVELOPMENT.md](../../docs/DEVELOPMENT.md).
 
 All tests share these inputs. Replace the seccomp policy path, the I/O device,
 and the IDs with values verified for the host. `FAILROOM_DATABASE_DIR` must be
