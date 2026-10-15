@@ -28,6 +28,8 @@ from .qualification_collector import (
     QualificationError,
     format_collection,
 )
+from .qualification_workspace import LockedWorkspace
+from .runtime_docker import DockerCleanupRuntime, DockerProvisioningRuntime
 
 Qualification = tuple[QualificationCollection, QualificationDecision]
 
@@ -104,17 +106,22 @@ def _qualify_local(environment: Mapping[str, str] | None = None) -> Qualificatio
     max_age = qualification_max_age(environment)
     preflight_runtime(config)
     docker = config.controller.docker_cli()
+    lifecycle = DockerDiagnosticLifecycle(
+        docker, config.controller.seccomp_policy_store()
+    )
     collector = QualificationCollector(
         docker,
-        DockerDiagnosticLifecycle(docker, config.controller.seccomp_policy_store()),
+        lifecycle,
         config.controller.profile,
         max_age=max_age,
         now=lambda: datetime.now(UTC),
         terminal=DockerPtyRuntime(
             context=config.controller.docker_context, limits=config.pty_limits
         ),
-        # The scenario database belongs in the operator's private state directory.
-        scratch=config.controller.database_path.parent,
+        provisioning=DockerProvisioningRuntime(lifecycle, config.controller.profile),
+        cleanup=DockerCleanupRuntime(lifecycle),
+        # Scenario state belongs in the operator's private state directory.
+        workspace=LockedWorkspace(config.controller.database_path.parent),
         busy_timeout_ms=config.database_busy_timeout_ms,
     )
     collection = collector.collect()

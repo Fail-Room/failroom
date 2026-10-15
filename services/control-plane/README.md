@@ -92,8 +92,8 @@ as fatal: it closes the connection and the PTY session.
 > before allocation. It therefore does not meet the qualification requirement
 > in [SECURITY.md](../../docs/SECURITY.md). Use it only as the local operator on
 > your own host, and do not offer it to learners or other users.
-> `qualify-local` collects a report but does not gate allocation; collecting
-> its restart-cleanup check and the allocation gate remain planned.
+> `qualify-local` collects a report but does not gate allocation; the
+> allocation gate remains planned.
 
 `failroom-control-plane serve-local` composes the state store, the Docker
 lifecycle and PTY adapters, the capability authority, and the HTTP/WebSocket
@@ -117,28 +117,40 @@ status 2.
 
 `failroom-control-plane qualify-local` performs steps 1 and 2, then collects
 one qualification report and prints it. It needs every setting below and
-`FAILROOM_QUALIFICATION_MAX_AGE_SECONDS`. It removes stopped sandboxes a
-crashed collection left behind and creates a sentinel, a probe and a
-short-lived lifetime sandbox with the strict profile. It runs the fixed probe
-and judges the twelve container checks. It drives the terminal service and
-Docker PTY runtime against the probe sandbox to check the output limit, the
-connection and session limits and disconnect cleanup, using a scratch SQLite
-database in a private temporary directory next to `FAILROOM_DATABASE_PATH`
-that it removes afterwards. It checks that PID 1 stops the lifetime sandbox
-by its deadline, and it removes all three sandboxes before printing. Run one
-collection at a time: another collection's sweep can remove the stopped
-lifetime sandbox before this one reads it, and `absolute_ttl` then reports
-`UNVERIFIED`. The restart-cleanup check is reported `UNVERIFIED` with
-`reason=NOT_COLLECTED` until it is collected, so the report does not pass yet.
-The output is one
+`FAILROOM_QUALIFICATION_MAX_AGE_SECONDS`. It keeps its scratch state in a
+`failroom-qualification` directory next to `FAILROOM_DATABASE_PATH`, which
+must be owned by its user with mode 0700 and is created that way when
+missing, and it holds an exclusive lock on the `collector.lock` file there
+for the whole collection. A second collection exits with status 2 and
+`COLLECTION_IN_PROGRESS`; the kernel releases the lock when a collection
+ends, even by a crash. The collection first removes what a crashed one left:
+scratch directories, its Room sandbox through the restart path described
+below, and every collector sandbox. It then creates a sentinel, a probe and a
+short-lived lifetime sandbox with the strict profile, and enters the Disk Full
+Room with a 20-second deadline into a scratch SQLite database in that
+directory. It runs the fixed probe and judges the twelve container checks. It
+drives the terminal service and Docker PTY runtime against the probe sandbox
+to check the output limit, the connection and session limits and disconnect
+cleanup, and checks that PID 1 stops the lifetime sandbox by its deadline.
+After the Room's deadline it builds a new store, cleanup worker and
+maintenance service from the scratch files alone, as a restarted control
+plane would, and checks that their maintenance removes the Room sandbox and
+records it destroyed; a sandbox they leave is removed directly and fails the
+check. It removes every sandbox and scratch file before printing; only the
+lock file stays. The output is one
 `QUALIFICATION_CONTEXT` line with the engine ID, boot ID, daemon epoch and
 digests; one `CHECK <check> <outcome> <observed_at> <evidence digest>` line per
 check, with a fixed `reason=` code when it does not pass; and
 `QUALIFICATION_PASSED` or `QUALIFICATION_DENIED <code:check>...`. It exits with
 status 0 when the report passes, 3 when it does not, and 2 with one fixed code
-on a configuration, runtime or cleanup failure. It stores nothing, and
-`serve-local` still allocates without a report. One collection took about 23
+on a configuration, runtime or cleanup failure. It stores no report, and
+`serve-local` still allocates without a report. One collection took about 28
 seconds on Docker Desktop 29.4.2.
+
+After `CLEANUP_INCOMPLETE`, leave `failroom-qualification/restart` in place:
+the next collection uses it to find and remove the Room sandbox. If it is
+deleted anyway, remove the container labelled with the `attempt_id` that its
+`binding.json` named by hand, for example with `docker container rm --force`.
 
 The runtime binds only to `127.0.0.1` or `::1` and accepts exactly one bearer
 token, which it keeps only as a SHA-256 digest. The token authenticates one
@@ -187,7 +199,7 @@ by `StrictDockerProfile` as described in the
 | `FAILROOM_LOCAL_USER_ID` | Identifier of the local user. |
 | `FAILROOM_LOCAL_ROOM_SCOPES` | Comma-separated Room IDs the user may enter, for example `disk-full`. |
 | `FAILROOM_LOCAL_TOKEN_EXPIRES_AT` | ISO 8601 time with a UTC offset, in the future at startup. Later requests fail with `AUTHENTICATION_EXPIRED`. |
-| `FAILROOM_DATABASE_PATH` | Absolute path of the SQLite database file. |
+| `FAILROOM_DATABASE_PATH` | Absolute path of the SQLite database file. `qualify-local` keeps its `failroom-qualification` workspace in the same directory. |
 | `FAILROOM_DATABASE_BUSY_TIMEOUT_MS` | SQLite busy timeout, 1–30000. |
 | `FAILROOM_DOCKER_CONTEXT` | Docker CLI context name. |
 | `FAILROOM_DOCKER_TIMEOUT_SECONDS` | Per-command Docker timeout, greater than 0 and at most 60. |
@@ -378,7 +390,7 @@ export FAILROOM_MAINTENANCE_LIMIT=10
 | `test_linux_docker_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Provisioning through the orchestrator, container hardening, Docker's init as PID 1 from a read-only mount, Leave and Reset cleanup with every generation absent afterwards, and a PID 1 that outlives 60 seconds and stops by the attempt deadline |
 | `test_linux_disk_full_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | The Disk Full filler reduces workspace capacity and recovery restores it; the test builds the Disk Full image itself |
 | `test_linux_terminal_integration.py` | `FAILROOM_TERMINAL_INTEGRATION=1` | Input and output, ANSI bytes, resize, Ctrl+C interruption, one-time capability replay denial, termination and reaping of the shell's session and background jobs after disconnect, and refusal with `4429` of a terminal beyond the profile's connection or session limit until one closes, through a real PTY |
-| `test_linux_qualification_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Report-only qualification: every check but restart cleanup passes on the strict profile, restart cleanup reports `UNVERIFIED`, a stopped leftover sandbox is removed, a container outside the profile fails the checks it violates, and no collector sandbox or scratch directory remains |
+| `test_linux_qualification_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Report-only qualification: all eighteen checks pass on the strict profile and the restart scenario's Room sandbox is removed, stopped and running sandboxes and a Room sandbox a crashed collection left are removed, a second collection is refused while one holds the workspace, a container outside the profile fails the checks it violates, and no sandbox or scratch state remains |
 | `test_linux_local_runtime_integration.py` | `FAILROOM_LOCAL_RUNTIME_INTEGRATION=1` | Enter Room, capability, terminal, recovery verification, Reset Room, and Leave Room through the local app; denial of unreviewed and unauthorized Rooms, of a reused capability, and of a capability issued before a reset; reset maintenance; and a terminal that stays responsive for 70 seconds |
 
 Run one module, or every module whose flags are set:

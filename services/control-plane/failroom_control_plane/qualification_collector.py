@@ -1,15 +1,19 @@
 """Report-only qualification collection on the trusted local controller.
 
-The collector creates a sentinel, a probe and a short-lived lifetime sandbox
+One collection at a time holds the private workspace next to the operator
+database, and it first removes whatever a crashed collection left behind. The
+collector creates a sentinel, a probe and a short-lived lifetime sandbox
 through the verified diagnostic lifecycle with the exact strict profile and
-image. It runs the fixed probe in the probe sandbox and judges the twelve
-container checks, runs the terminal scenarios against the same sandbox, and
-checks that PID 1 ends the lifetime sandbox by its deadline. Restart cleanup
-is reported UNVERIFIED until it is collected. It stores nothing and gates
-nothing; callers decide what to do with the report.
+image, and enters one Room sandbox for the restart scenario. It runs the fixed
+probe in the probe sandbox and judges the twelve container checks, runs the
+terminal scenarios against the same sandbox, checks that PID 1 ends the
+lifetime sandbox by its deadline, and judges how a restarted control plane
+cleans up the abandoned Room sandbox. It keeps no report and gates nothing;
+callers decide what to do with the report.
 """
 
 import re
+import shutil
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -43,8 +47,16 @@ from failroom_sandbox.qualification_probe import (
     judge_container_checks,
     parse_probe_output,
 )
+from failroom_state import CleanupRuntime
 
-from .qualification_scenarios import TERMINAL_CHECKS, TerminalScenarios
+from .orchestrator import ProvisioningRuntime
+from .qualification_restart import RestartCleanupError, RestartScenario
+from .qualification_scenarios import (
+    TERMINAL_CHECKS,
+    TERMINAL_PREFIX,
+    TerminalScenarios,
+)
+from .qualification_workspace import CollectionWorkspace, WorkspaceError
 from .terminal import TerminalRuntime
 
 Clock = Callable[[], datetime]
@@ -56,7 +68,11 @@ _PROBE_SECONDS = 60
 _LIFETIME_SECONDS = 5
 _LIFETIME_GRACE_SECONDS = 10
 _START_MARGIN_SECONDS = 10
-_STALE_CREATED = timedelta(minutes=10)
+_WORKSPACE_CODES = {
+    "COLLECTION_IN_PROGRESS": "COLLECTION_IN_PROGRESS",
+    "WORKSPACE_UNSAFE": "INVALID_CONFIGURATION",
+    "WORKSPACE_UNAVAILABLE": "RUNTIME_UNAVAILABLE",
+}
 _STARTED_AT = re.compile(
     r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\.[0-9]{1,9})?Z"
 )
@@ -69,6 +85,7 @@ class QualificationError(RuntimeError):
     def __init__(self, code: str) -> None:
         if code not in {
             "CLEANUP_INCOMPLETE",
+            "COLLECTION_IN_PROGRESS",
             "INVALID_CONFIGURATION",
             "RUNTIME_UNAVAILABLE",
         }:
@@ -175,7 +192,9 @@ class QualificationCollector:
         max_age: timedelta,
         now: Clock,
         terminal: TerminalRuntime,
-        scratch: Path,
+        provisioning: ProvisioningRuntime,
+        cleanup: CleanupRuntime,
+        workspace: CollectionWorkspace,
         busy_timeout_ms: int,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
@@ -188,8 +207,9 @@ class QualificationCollector:
             or max_age < timedelta(seconds=60)
             or not callable(now)
             or not isinstance(terminal, TerminalRuntime)
-            or not isinstance(scratch, Path)
-            or not scratch.is_absolute()
+            or not callable(getattr(provisioning, "open", None))
+            or not callable(getattr(cleanup, "destroy_and_verify_absent", None))
+            or not isinstance(workspace, CollectionWorkspace)
             or type(busy_timeout_ms) is not int
             or not 1 <= busy_timeout_ms <= 30_000
             or not callable(monotonic)
@@ -203,11 +223,21 @@ class QualificationCollector:
         self._now = now
         self._monotonic = monotonic
         self._sleep = sleep
+        self._workspace = workspace
         self._scenarios = TerminalScenarios(
             docker,
             terminal,
             profile,
-            scratch=scratch,
+            busy_timeout_ms=busy_timeout_ms,
+            now=now,
+            monotonic=monotonic,
+            sleep=sleep,
+        )
+        self._restart = RestartScenario(
+            docker,
+            lifecycle,
+            provisioning,
+            cleanup,
             busy_timeout_ms=busy_timeout_ms,
             now=now,
             monotonic=monotonic,
@@ -216,14 +246,37 @@ class QualificationCollector:
 
     def collect(self) -> QualificationCollection:
         try:
-            return self._collect()
+            with self._workspace.hold() as scratch:
+                self._prepare(scratch)
+                return self._collect(scratch)
         except QualificationError:
             raise
+        except WorkspaceError as error:
+            raise QualificationError(_WORKSPACE_CODES[error.code]) from None
         except Exception:
             raise QualificationError("RUNTIME_UNAVAILABLE") from None
 
-    def _collect(self) -> QualificationCollection:
+    def _prepare(self, scratch: Path) -> None:
+        """Remove what a collection that is gone left behind.
+
+        Holding the workspace lock proves that no other collection is running,
+        so every scratch directory, restart state and collector sandbox found
+        now was left by one that crashed.
+        """
+        try:
+            for entry in scratch.iterdir():
+                if (
+                    entry.name.startswith(TERMINAL_PREFIX)
+                    and not entry.is_symlink()
+                    and entry.is_dir()
+                ):
+                    shutil.rmtree(entry)
+            self._restart.recover(scratch)
+        except (OSError, RestartCleanupError):
+            raise QualificationError("CLEANUP_INCOMPLETE") from None
         self._sweep()
+
+    def _collect(self, scratch: Path) -> QualificationCollection:
         engine = self._docker.engine_identity()
         max_lifetime = self._profile.absolute_ttl_seconds - _START_MARGIN_SECONDS
         scenarios: dict[Check, Judgement] = {}
@@ -233,22 +286,34 @@ class QualificationCollector:
         )
         try:
             epoch = self._daemon_epoch(sentinel)
-            # Started first so its short lifetime runs out while the probe works.
+            # Started first so their deadlines run out while the probe works.
             lifetime_sandbox = self._start(
                 "lifetime", min(_LIFETIME_SECONDS, max_lifetime)
             )
             try:
-                probe = self._start("probe", min(_PROBE_SECONDS, max_lifetime))
+                restart = self._begin_restart(scratch)
                 try:
-                    raw = self._docker.run_qualification_probe(probe.container_id)
-                    observed_at = self._utc_now()
-                    data = self._inspect(probe)
-                    scenarios.update(self._terminal_scenarios(probe.container_id))
-                    scenario_times.update(dict.fromkeys(scenarios, self._utc_now()))
+                    probe = self._start("probe", min(_PROBE_SECONDS, max_lifetime))
+                    try:
+                        raw = self._docker.run_qualification_probe(probe.container_id)
+                        observed_at = self._utc_now()
+                        data = self._inspect(probe)
+                        scenarios.update(
+                            self._terminal_scenarios(probe.container_id, scratch)
+                        )
+                        scenario_times.update(dict.fromkeys(scenarios, self._utc_now()))
+                    finally:
+                        self._destroy(probe)
+                    scenarios[Check.ABSOLUTE_TTL] = self._lifetime_check(
+                        lifetime_sandbox
+                    )
+                    scenario_times[Check.ABSOLUTE_TTL] = self._utc_now()
                 finally:
-                    self._destroy(probe)
-                scenarios[Check.ABSOLUTE_TTL] = self._lifetime_check(lifetime_sandbox)
-                scenario_times[Check.ABSOLUTE_TTL] = self._utc_now()
+                    # Also on failure: the restart is what removes the Room sandbox.
+                    scenarios[Check.RESTART_CLEANUP] = self._finish_restart(
+                        scratch, restart
+                    )
+                    scenario_times[Check.RESTART_CLEANUP] = self._utc_now()
             finally:
                 self._destroy(lifetime_sandbox)
         finally:
@@ -335,9 +400,11 @@ class QualificationCollector:
         )
         return _Started(binding, operation_id, observation.container_id, deadline)
 
-    def _terminal_scenarios(self, container_id: str) -> dict[Check, Judgement]:
+    def _terminal_scenarios(
+        self, container_id: str, scratch: Path
+    ) -> dict[Check, Judgement]:
         try:
-            return self._scenarios.run(container_id)
+            return self._scenarios.run(container_id, scratch)
         except Exception:
             return {
                 check: Judgement(
@@ -348,6 +415,23 @@ class QualificationCollector:
                 )
                 for check in TERMINAL_CHECKS
             }
+
+    def _begin_restart(self, scratch: Path) -> Judgement | None:
+        try:
+            return self._restart.begin(scratch)
+        except Exception:
+            return Judgement(
+                Check.RESTART_CLEANUP,
+                Outcome.UNVERIFIED,
+                "SCENARIO_UNAVAILABLE",
+                MappingProxyType({}),
+            )
+
+    def _finish_restart(self, scratch: Path, started: Judgement | None) -> Judgement:
+        try:
+            return self._restart.finish(scratch, started)
+        except (OSError, RestartCleanupError):
+            raise QualificationError("CLEANUP_INCOMPLETE") from None
 
     def _lifetime_check(self, started: _Started) -> Judgement:
         """PID 1 must stop the sandbox on its own no later than its deadline."""
@@ -402,12 +486,10 @@ class QualificationCollector:
             raise QualificationError("CLEANUP_INCOMPLETE") from None
 
     def _sweep(self) -> None:
-        """Remove stopped sandboxes a crashed collection left behind.
+        """Remove every collector sandbox a crashed collection left behind.
 
-        Running ones may belong to a concurrent collection; their PID 1 lifetime
-        bounds them and a later collection removes them once they stop. A
-        concurrent collection's lifetime sandbox stops before that collection
-        reads it, so removing it leaves that absolute TTL check UNVERIFIED.
+        Only collections create sandboxes with the qualification attempt label,
+        and the caller holds the workspace lock, so none of them is in use.
         """
         for container_id in self._docker.list_containers(
             (
@@ -417,13 +499,6 @@ class QualificationCollector:
         ):
             data = self._docker.inspect_container(container_id)
             if data is None:
-                continue
-            status = _object(data.get("State")).get("Status")
-            created = _docker_time(data.get("Created"))
-            if status not in ("exited", "dead", "created") or (
-                status == "created"
-                and (created is None or self._utc_now() - created < _STALE_CREATED)
-            ):
                 continue
             labels = _object(_object(data.get("Config")).get("Labels"))
             sandbox_id = labels.get("failroom.sandbox_id")
