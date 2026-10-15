@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import os
 import sys
@@ -344,6 +345,53 @@ class LocalRuntimeLifespanTests(unittest.IsolatedAsyncioTestCase):
                     events, ["maintenance", "start", "maintenance", "close"]
                 )
                 self.assertEqual(announced, lines)
+
+    async def test_refreshes_the_report_while_serving(self) -> None:
+        events: list[str] = []
+
+        class Maintenance:
+            def run_once(self) -> None:
+                events.append("maintenance")
+
+        class Qualification:
+            def __init__(self) -> None:
+                self.due = [True]
+
+            def start(self) -> str:
+                events.append("start")
+                return "QUALIFICATION_PASSED"
+
+            def refresh_due(self) -> bool:
+                return bool(self.due) and self.due.pop()
+
+            def refresh(self) -> str:
+                events.append("refresh")
+                return "QUALIFICATION_DENIED CHECK_FAILED:restart_cleanup"
+
+            def close(self) -> None:
+                events.append("close")
+
+        announced: list[str] = []
+        async with local_lifespan(
+            Maintenance(),
+            interval=timedelta(milliseconds=10),
+            qualification=Qualification(),
+            announce=announced.append,
+        ):
+            for _ in range(200):
+                if len(announced) == 2:
+                    break
+                await asyncio.sleep(0.01)
+
+        self.assertEqual(
+            announced,
+            [
+                "QUALIFICATION_PASSED",
+                "QUALIFICATION_DENIED CHECK_FAILED:restart_cleanup",
+            ],
+        )
+        self.assertEqual(events.count("refresh"), 1)
+        self.assertEqual(events[-1], "close")
 
     async def test_refuses_listener_when_initial_maintenance_fails(self) -> None:
         class Maintenance:

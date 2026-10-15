@@ -305,11 +305,17 @@ class QualificationCollector:
             sleep=sleep,
         )
 
-    def collect(self, *, retain_sentinel: bool = False) -> QualificationCollection:
+    def collect(
+        self,
+        *,
+        retain_sentinel: bool = False,
+        keep: frozenset[str] = frozenset(),
+    ) -> QualificationCollection:
+        """Collect one report; `keep` names sentinels the caller still uses."""
         try:
             with self._workspace.hold() as scratch:
                 attempt = qualification_attempt(workspace_id(scratch))
-                self._prepare(scratch, attempt)
+                self._prepare(scratch, attempt, frozenset(keep))
                 return self._collect(scratch, attempt, retain_sentinel=retain_sentinel)
         except QualificationError:
             raise
@@ -318,12 +324,12 @@ class QualificationCollector:
         except Exception:
             raise QualificationError("RUNTIME_UNAVAILABLE") from None
 
-    def _prepare(self, scratch: Path, attempt: str) -> None:
+    def _prepare(self, scratch: Path, attempt: str, keep: frozenset[str]) -> None:
         """Remove what a collection that is gone left behind.
 
         Holding the workspace lock proves that no other collection is running,
         so every scratch directory, restart state and collector sandbox found
-        now was left by one that crashed.
+        now was left by one that crashed, except the sentinels the caller keeps.
         """
         try:
             for entry in scratch.iterdir():
@@ -336,7 +342,7 @@ class QualificationCollector:
             self._restart.recover(scratch)
         except (OSError, RestartCleanupError):
             raise QualificationError("CLEANUP_INCOMPLETE") from None
-        self._sweep(attempt)
+        self._sweep(attempt, keep)
 
     def _collect(
         self, scratch: Path, attempt: str, *, retain_sentinel: bool
@@ -573,12 +579,13 @@ class QualificationCollector:
         except DockerError:
             raise QualificationError("CLEANUP_INCOMPLETE") from None
 
-    def _sweep(self, attempt: str) -> None:
+    def _sweep(self, attempt: str, keep: frozenset[str]) -> None:
         """Remove every sandbox a crashed collection of this workspace left.
 
         Only collections holding this workspace's lock create sandboxes with its
         attempt label, and the caller holds that lock, so none of them is in
-        use. Sandboxes of other workspaces are never touched.
+        use apart from the sentinels it keeps. Sandboxes of other workspaces are
+        never touched.
         """
         for container_id in self._docker.list_containers(
             (
@@ -586,6 +593,8 @@ class QualificationCollector:
                 "label=failroom.attempt_id=" + attempt,
             )
         ):
+            if container_id in keep:
+                continue
             data = self._docker.inspect_container(container_id)
             if data is None:
                 continue

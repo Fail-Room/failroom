@@ -325,6 +325,21 @@ def _announce(line: str) -> None:
     sys.stdout.flush()
 
 
+async def _qualification_loop(
+    qualification: QualificationGate,
+    interval: timedelta,
+    announce: Callable[[str], None],
+) -> None:
+    # Separate from maintenance, so a collection never delays expiry or cleanup.
+    while True:
+        await asyncio.sleep(interval.total_seconds())
+        try:
+            if await asyncio.to_thread(qualification.refresh_due):
+                announce(await asyncio.to_thread(qualification.refresh))
+        except Exception:
+            announce("QUALIFICATION_UNAVAILABLE RUNTIME_UNAVAILABLE")
+
+
 @asynccontextmanager
 async def local_lifespan(
     maintenance: LifecycleMaintenanceService,
@@ -340,16 +355,22 @@ async def local_lifespan(
     except MaintenanceError:
         raise LocalRuntimeError("RUNTIME_UNAVAILABLE") from None
     try:
+        tasks = [asyncio.create_task(_maintenance_loop(maintenance, interval))]
         if qualification is not None:
             # Serve even without a passing report: only allocation is refused,
             # so status, Leave Room and cleanup keep working.
             announce(await asyncio.to_thread(qualification.start))
-        task = asyncio.create_task(_maintenance_loop(maintenance, interval))
+            tasks.append(
+                asyncio.create_task(
+                    _qualification_loop(qualification, interval, announce)
+                )
+            )
         try:
             yield
         finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             try:
                 await asyncio.to_thread(maintenance.run_once)
             except MaintenanceError:

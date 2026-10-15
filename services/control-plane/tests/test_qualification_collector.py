@@ -840,6 +840,20 @@ class QualificationCollectorTests(unittest.TestCase):
         )
         self.assertEqual(self.docker.containers, {})
 
+    def test_sweep_keeps_the_sentinels_the_caller_still_uses(self) -> None:
+        sandboxes = {}
+        for name in ("sentinel-kept", "sentinel-stale"):
+            cid = self.docker.allocate()
+            self.docker.containers[cid] = container(
+                DockerBinding(self.attempt(), name, 1), "op-" + name, 300
+            )
+            sandboxes[name] = cid
+
+        self.collector().collect(keep=frozenset({sandboxes["sentinel-kept"]}))
+
+        self.assertIn(sandboxes["sentinel-kept"], self.docker.containers)
+        self.assertNotIn(sandboxes["sentinel-stale"], self.docker.containers)
+
     def test_sweep_leaves_other_workspaces_sandboxes_alone(self) -> None:
         others = {}
         # Another workspace's running collection, and the label older

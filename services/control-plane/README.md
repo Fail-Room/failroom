@@ -87,10 +87,9 @@ as fatal: it closes the connection and the PTY session.
 
 ## Local runtime (operator-only proof of concept)
 
-> **Limitation:** the local runtime checks a qualification report it collects
-> when it starts before every Room allocation, but it does not refresh that
-> report yet: once the report expires or its sentinel stops, Enter Room and
-> reset provisioning fail until the runtime restarts. See
+> **Limitation:** the local runtime checks a current qualification report
+> before every Room allocation, but it authenticates one local bearer
+> credential and has no browser terminal. See
 > [SECURITY.md](../../docs/SECURITY.md). Use it only as the local operator on
 > your own host, and do not offer it to learners or other users.
 
@@ -111,9 +110,16 @@ routes into one process:
    or `QUALIFICATION_UNAVAILABLE <code>`. The listener starts in every case;
    only Room allocation depends on the report. This takes about as long as
    one `qualify-local` collection.
-5. It serves the routes with access logging disabled, repeats maintenance on a
-   fixed interval, and runs one final pass on shutdown before it removes the
-   sentinel and releases the workspace.
+5. It serves the routes with access logging disabled and repeats maintenance
+   on a fixed interval. On the same interval, once the report is half as old
+   as `FAILROOM_QUALIFICATION_MAX_AGE_SECONDS`, or while it holds no passing
+   report, it collects a new report in its workspace, keeping the current
+   sentinel out of the collector's sweep, swaps report and sentinel at once,
+   removes the old sentinel, and prints the new status line. Allocation keeps
+   using the current report while a refresh runs, and a refresh that cannot
+   complete leaves it in place until it expires.
+6. On shutdown it runs one final maintenance pass, waits for a running
+   refresh, and then removes the sentinel and releases the workspace.
 
 Before Enter Room and before resuming a reset's provisioning, the runtime
 rebuilds the current context: the engine ID and configuration from
@@ -416,7 +422,7 @@ export FAILROOM_MAINTENANCE_LIMIT=10
 | `test_linux_disk_full_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | The Disk Full filler reduces workspace capacity and recovery restores it; the test builds the Disk Full image itself |
 | `test_linux_terminal_integration.py` | `FAILROOM_TERMINAL_INTEGRATION=1` | Input and output, ANSI bytes, resize, Ctrl+C interruption, one-time capability replay denial, termination and reaping of the shell's session and background jobs after disconnect, and refusal with `4429` of a terminal beyond the profile's connection or session limit until one closes, through a real PTY |
 | `test_linux_qualification_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Report-only qualification: all eighteen checks pass on the strict profile and the restart scenario's Room sandbox is removed, stopped and running sandboxes and a Room sandbox a crashed collection left are removed, a second collection is refused while one holds the workspace, another workspace's sandbox is left alone, a container outside the profile fails the checks it violates, and no sandbox or scratch state remains |
-| `test_linux_local_runtime_integration.py` | `FAILROOM_LOCAL_RUNTIME_INTEGRATION=1` | Enter Room, capability, terminal, recovery verification, Reset Room, and Leave Room through the local app; denial of unreviewed and unauthorized Rooms, of a reused capability, and of a capability issued before a reset; reset maintenance; a terminal that stays responsive for 70 seconds; and Room allocation that needs the live sentinel of the startup report, with a sentinel that outlives the attempt TTL, `qualify-local` refused while the runtime runs, and `ENTRY_FAILED` without any Docker call once the sentinel is gone |
+| `test_linux_local_runtime_integration.py` | `FAILROOM_LOCAL_RUNTIME_INTEGRATION=1` | Enter Room, capability, terminal, recovery verification, Reset Room, and Leave Room through the local app; denial of unreviewed and unauthorized Rooms, of a reused capability, and of a capability issued before a reset; reset maintenance; a terminal that stays responsive for 70 seconds; a report refreshed before it expires, with only the new sentinel left and Enter Room still admitted; and Room allocation that needs the live sentinel of the startup report, with a sentinel that outlives the attempt TTL, `qualify-local` refused while the runtime runs, and `ENTRY_FAILED` without any Docker call once the sentinel is gone |
 
 Run one module, or every module whose flags are set:
 
