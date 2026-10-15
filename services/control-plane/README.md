@@ -171,7 +171,7 @@ check, with a fixed `reason=` code when it does not pass; and
 `QUALIFICATION_PASSED` or `QUALIFICATION_DENIED <code:check>...`. It exits with
 status 0 when the report passes, 3 when it does not, and 2 with one fixed code
 on a configuration, runtime or cleanup failure. It stores no report and does
-not affect a running `serve-local`, which uses only its own startup report.
+not affect a running `serve-local`, which collects its own reports.
 One collection took about 28 seconds on Docker Desktop 29.4.2.
 
 After `CLEANUP_INCOMPLETE`, leave `failroom-qualification/restart` in place:

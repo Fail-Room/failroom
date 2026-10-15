@@ -178,11 +178,12 @@ reports in unit tests exercise decision logic only. A partial operator diagnosti
 does not qualify a learner sandbox. In particular, configuration inspection alone
 does not prove runtime enforcement or cleanup during a service outage.
 
-The future allocation adapter must call the guard with fresh context before side
-effects. It must also validate service authentication, ownership, expected
-sandbox/generation, idempotency and lifecycle/expiry intent, and serialize these
-checks with creation. This guard cannot prevent time-of-check/time-of-use races
-on its own. A previous success must never be cached as continuing permission.
+An allocation adapter, such as the control plane's qualification gate, must call
+the guard with fresh context before side effects. It must also validate service
+authentication, ownership, expected sandbox/generation, idempotency and
+lifecycle/expiry intent, and serialize these checks with creation. This guard
+cannot prevent time-of-check/time-of-use races on its own. A previous success
+must never be cached as continuing permission.
 
 ## Qualification probe
 
