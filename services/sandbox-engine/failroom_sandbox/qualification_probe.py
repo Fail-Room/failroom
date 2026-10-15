@@ -86,6 +86,14 @@ esac
 echo "end=1"
 """
 
+# The boot ID and I/O limit line a running sandbox sees, read before allocation.
+IDENTITY_SCRIPT = r"""echo "boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
+{ cat /sys/fs/cgroup/io.max 2>/dev/null || true; } | while read -r line; do
+  echo "io_max=$line"
+done
+echo "end=1"
+"""
+
 # Every process in the sandbox's PID namespace as "pid state session".
 PROCESS_SCRIPT = r"""for stat in /proc/[0-9]*/stat; do
   read -r line 2>/dev/null <"$stat" || continue
@@ -218,6 +226,14 @@ class ProbeObservation:
 
 
 @dataclass(frozen=True)
+class RuntimeObservation:
+    """The boot ID and I/O device major:minor one running sandbox reported."""
+
+    boot_id: str
+    io_device: str
+
+
+@dataclass(frozen=True)
 class ProcessRecord:
     """One process in a sandbox: its PID, kernel state letter and session ID."""
 
@@ -234,6 +250,26 @@ class Judgement:
     outcome: Outcome
     reason: str
     facts: Mapping[str, object]
+
+
+def parse_runtime_identity(stdout: bytes) -> RuntimeObservation:
+    """Accept exactly one boot_id and one io_max line, ending with end=1."""
+    try:
+        lines = stdout.decode("ascii").split("\n")
+    except UnicodeError:
+        raise ProbeOutputError() from None
+    if len(lines) != 4 or lines[2:] != ["end=1", ""]:
+        raise ProbeOutputError()
+    boot_id = lines[0].removeprefix("boot_id=")
+    io_max = _IO_MAX.fullmatch(lines[1].removeprefix("io_max="))
+    if (
+        not lines[0].startswith("boot_id=")
+        or _BOOT_ID.fullmatch(boot_id) is None
+        or not lines[1].startswith("io_max=")
+        or io_max is None
+    ):
+        raise ProbeOutputError()
+    return RuntimeObservation(boot_id, io_max.group(1))
 
 
 def parse_process_list(stdout: bytes) -> tuple[ProcessRecord, ...]:

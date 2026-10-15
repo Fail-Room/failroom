@@ -12,9 +12,11 @@ from failroom_sandbox.qualification_probe import (
     PROCESS_SCRIPT,
     ProbeOutputError,
     ProcessRecord,
+    RuntimeObservation,
     judge_container_checks,
     parse_probe_output,
     parse_process_list,
+    parse_runtime_identity,
 )
 
 LIFETIME = 290
@@ -172,6 +174,37 @@ class ProbeParsingTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "linux", "POSIX shell required")
     def test_probe_script_is_valid_posix_shell(self):
         subprocess.run(("sh", "-n", "-c", PROBE_SCRIPT), check=True, timeout=10)
+
+
+class RuntimeIdentityTests(unittest.TestCase):
+    BOOT_ID = "39838d7c-98d9-4c41-9181-b3baadabb0c6"
+    IO_MAX = "io_max=8:48 rbps=1048576 wbps=1048576 riops=max wiops=max"
+
+    def test_parses_boot_id_and_io_device(self):
+        observation = parse_runtime_identity(
+            f"boot_id={self.BOOT_ID}\n{self.IO_MAX}\nend=1\n".encode()
+        )
+
+        self.assertEqual(observation, RuntimeObservation(self.BOOT_ID, "8:48"))
+
+    def test_rejects_output_outside_the_fixed_format(self):
+        boot = f"boot_id={self.BOOT_ID}\n"
+        line = self.IO_MAX + "\n"
+        cases = {
+            "no end": boot + line,
+            "end without newline": boot + line + "end=1",
+            "missing io_max": boot + "end=1\n",
+            "two io_max lines": boot + line + line + "end=1\n",
+            "empty boot id": "boot_id=\n" + line + "end=1\n",
+            "uppercase boot id": boot.upper() + line + "end=1\n",
+            "swapped lines": line + boot + "end=1\n",
+            "unlimited device": boot + "io_max=8:48\nend=1\n",
+            "trailing text": boot + self.IO_MAX + " x\nend=1\n",
+            "non-ascii": boot + self.IO_MAX + "é\nend=1\n",
+        }
+        for name, output in cases.items():
+            with self.subTest(case=name), self.assertRaises(ProbeOutputError):
+                parse_runtime_identity(output.encode())
 
 
 class ProcessListTests(unittest.TestCase):

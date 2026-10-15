@@ -9,7 +9,11 @@ from failroom_sandbox.docker_cli import (
     ProcessResult,
     _run_process,
 )
-from failroom_sandbox.qualification_probe import PROBE_SCRIPT, PROCESS_SCRIPT
+from failroom_sandbox.qualification_probe import (
+    IDENTITY_SCRIPT,
+    PROBE_SCRIPT,
+    PROCESS_SCRIPT,
+)
 
 
 class DockerCliTests(unittest.TestCase):
@@ -398,6 +402,38 @@ class QualificationCommandTests(unittest.TestCase):
                     "-c",
                     PROCESS_SCRIPT,
                     "failroom-process-list",
+                )
+            ],
+        )
+
+    def test_reads_runtime_identity_with_a_fixed_script(self):
+        calls = []
+        reported = b"boot_id=" + b"0" * 8 + b"\nend=1\n"
+
+        def runner(argv, **kwargs):
+            calls.append(argv)
+            return ProcessResult(0, reported, b"")
+
+        cli = self.cli(runner)
+        with self.assertRaisesRegex(DockerError, "^INVALID_DOCKER_REQUEST$"):
+            cli.read_runtime_identity("../etc")
+        output = cli.read_runtime_identity("a" * 64)
+
+        self.assertEqual(output, reported)
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "docker",
+                    "--context",
+                    "desktop-linux",
+                    "container",
+                    "exec",
+                    "a" * 64,
+                    "/bin/sh",
+                    "-c",
+                    IDENTITY_SCRIPT,
+                    "failroom-runtime-identity",
                 )
             ],
         )
