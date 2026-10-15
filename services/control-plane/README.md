@@ -93,7 +93,7 @@ as fatal: it closes the connection and the PTY session.
 > in [SECURITY.md](../../docs/SECURITY.md). Use it only as the local operator on
 > your own host, and do not offer it to learners or other users.
 > `qualify-local` collects a report but does not gate allocation; collecting
-> its scenario checks and the allocation gate remain planned.
+> its restart-cleanup check and the allocation gate remain planned.
 
 `failroom-control-plane serve-local` composes the state store, the Docker
 lifecycle and PTY adapters, the capability authority, and the HTTP/WebSocket
@@ -118,19 +118,26 @@ status 2.
 `failroom-control-plane qualify-local` performs steps 1 and 2, then collects
 one qualification report and prints it. It needs every setting below and
 `FAILROOM_QUALIFICATION_MAX_AGE_SECONDS`. It removes stopped sandboxes a
-crashed collection left behind, creates a sentinel and a probe sandbox with the
-strict profile, runs the fixed probe, judges the twelve container checks, and
-removes both sandboxes before printing. The six scenario checks (terminal
-output, connection and session limits, absolute TTL, disconnect cleanup and
-restart cleanup) are reported `UNVERIFIED` with `reason=NOT_COLLECTED` until
-they are collected, so the report does not pass yet. The output is one
+crashed collection left behind and creates a sentinel, a probe and a
+short-lived lifetime sandbox with the strict profile. It runs the fixed probe
+and judges the twelve container checks. It drives the terminal service and
+Docker PTY runtime against the probe sandbox to check the output limit, the
+connection and session limits and disconnect cleanup, using a scratch SQLite
+database in a private temporary directory next to `FAILROOM_DATABASE_PATH`
+that it removes afterwards. It checks that PID 1 stops the lifetime sandbox
+by its deadline, and it removes all three sandboxes before printing. Run one
+collection at a time: another collection's sweep can remove the stopped
+lifetime sandbox before this one reads it, and `absolute_ttl` then reports
+`UNVERIFIED`. The restart-cleanup check is reported `UNVERIFIED` with
+`reason=NOT_COLLECTED` until it is collected, so the report does not pass yet.
+The output is one
 `QUALIFICATION_CONTEXT` line with the engine ID, boot ID, daemon epoch and
 digests; one `CHECK <check> <outcome> <observed_at> <evidence digest>` line per
 check, with a fixed `reason=` code when it does not pass; and
 `QUALIFICATION_PASSED` or `QUALIFICATION_DENIED <code:check>...`. It exits with
 status 0 when the report passes, 3 when it does not, and 2 with one fixed code
 on a configuration, runtime or cleanup failure. It stores nothing, and
-`serve-local` still allocates without a report. One collection took about 8
+`serve-local` still allocates without a report. One collection took about 23
 seconds on Docker Desktop 29.4.2.
 
 The runtime binds only to `127.0.0.1` or `::1` and accepts exactly one bearer
@@ -371,7 +378,7 @@ export FAILROOM_MAINTENANCE_LIMIT=10
 | `test_linux_docker_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Provisioning through the orchestrator, container hardening, Docker's init as PID 1 from a read-only mount, Leave and Reset cleanup with every generation absent afterwards, and a PID 1 that outlives 60 seconds and stops by the attempt deadline |
 | `test_linux_disk_full_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | The Disk Full filler reduces workspace capacity and recovery restores it; the test builds the Disk Full image itself |
 | `test_linux_terminal_integration.py` | `FAILROOM_TERMINAL_INTEGRATION=1` | Input and output, ANSI bytes, resize, Ctrl+C interruption, one-time capability replay denial, termination and reaping of the shell's session and background jobs after disconnect, and refusal with `4429` of a terminal beyond the profile's connection or session limit until one closes, through a real PTY |
-| `test_linux_qualification_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Report-only qualification: the twelve container checks pass on the strict profile, the scenario checks report `UNVERIFIED`, a stopped leftover sandbox is removed, a container outside the profile fails the checks it violates, and no collector sandbox remains |
+| `test_linux_qualification_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Report-only qualification: every check but restart cleanup passes on the strict profile, restart cleanup reports `UNVERIFIED`, a stopped leftover sandbox is removed, a container outside the profile fails the checks it violates, and no collector sandbox or scratch directory remains |
 | `test_linux_local_runtime_integration.py` | `FAILROOM_LOCAL_RUNTIME_INTEGRATION=1` | Enter Room, capability, terminal, recovery verification, Reset Room, and Leave Room through the local app; denial of unreviewed and unauthorized Rooms, of a reused capability, and of a capability issued before a reset; reset maintenance; and a terminal that stays responsive for 70 seconds |
 
 Run one module, or every module whose flags are set:

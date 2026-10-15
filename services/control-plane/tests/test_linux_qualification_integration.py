@@ -16,21 +16,26 @@ from failroom_sandbox.docker_lifecycle import (
 )
 from failroom_sandbox.docker_profile import DockerBinding
 from failroom_sandbox.models import Check, DenialCode, Outcome
+from failroom_sandbox.pty import DockerPtyRuntime
 from failroom_sandbox.qualification import evaluate_qualification
 from failroom_sandbox.qualification_probe import (
-    CONTAINER_CHECKS,
     judge_container_checks,
     parse_probe_output,
 )
 from failroom_sandbox.seccomp import SeccompPolicyStore
-from test_linux_docker_integration import _profile_from_environment, _required
+from test_linux_docker_integration import (
+    _database_directory,
+    _profile_from_environment,
+    _required,
+)
+from test_linux_terminal_integration import _terminal_limits
 
 from failroom_control_plane.qualification_collector import (
     QUALIFICATION_ATTEMPT,
     QualificationCollector,
 )
 
-_SCENARIO_CHECKS = tuple(check for check in Check if check not in CONTAINER_CHECKS)
+_UNCOLLECTED = (Check.RESTART_CLEANUP,)
 
 
 def _now() -> datetime:
@@ -64,11 +69,23 @@ class LinuxQualificationIntegrationTests(unittest.TestCase):
         self.max_age = timedelta(
             seconds=int(_required("FAILROOM_QUALIFICATION_MAX_AGE_SECONDS"))
         )
+        self.scratch = _database_directory()
+        self.pty_limits, _ = _terminal_limits()
 
     def collector(self) -> QualificationCollector:
         return QualificationCollector(
-            self.cli, self.lifecycle, self.profile, max_age=self.max_age, now=_now
+            self.cli,
+            self.lifecycle,
+            self.profile,
+            max_age=self.max_age,
+            now=_now,
+            terminal=DockerPtyRuntime(context=self.context, limits=self.pty_limits),
+            scratch=self.scratch,
+            busy_timeout_ms=int(_required("FAILROOM_DATABASE_BUSY_TIMEOUT_MS")),
         )
+
+    def scratch_directories(self) -> list[Path]:
+        return list(self.scratch.glob("failroom-qualification-*"))
 
     def collector_sandboxes(self) -> tuple[str, ...]:
         return self.cli.list_containers(
@@ -78,25 +95,27 @@ class LinuxQualificationIntegrationTests(unittest.TestCase):
             )
         )
 
-    def test_container_checks_pass_and_scenarios_stay_unverified(self) -> None:
+    def test_every_collected_check_passes_on_the_strict_profile(self) -> None:
+        before = self.scratch_directories()
         collection = self.collector().collect()
         report = collection.report
 
         for result in report.results:
             with self.subTest(check=result.check):
-                if result.check in CONTAINER_CHECKS:
-                    self.assertIs(result.outcome, Outcome.PASS)
-                    self.assertNotIn(result.check, collection.reasons)
-                else:
+                if result.check in _UNCOLLECTED:
                     self.assertIs(result.outcome, Outcome.UNVERIFIED)
                     self.assertEqual(collection.reasons[result.check], "NOT_COLLECTED")
+                else:
+                    self.assertIs(result.outcome, Outcome.PASS)
+                    self.assertNotIn(result.check, collection.reasons)
         decision = evaluate_qualification(
             report.context, report, now=_now(), max_age=self.max_age
         )
         self.assertEqual(
             {(denial.code, denial.check) for denial in decision.denials},
-            {(DenialCode.CHECK_UNVERIFIED, check) for check in _SCENARIO_CHECKS},
+            {(DenialCode.CHECK_UNVERIFIED, check) for check in _UNCOLLECTED},
         )
+        self.assertEqual(self.scratch_directories(), before)
         self.assertEqual(
             report.context.image_digest,
             self.cli.inspect_image(self.profile.image)["Id"],

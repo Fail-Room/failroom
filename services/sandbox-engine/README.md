@@ -166,9 +166,9 @@ socket, host shell, or host filesystem to the learner sandbox.
 
 Only the trusted control plane may assemble contexts and reports. Do not build
 them from a browser request or treat sandbox-generated success text as evidence.
-The fixed qualification probe below gathers container-level evidence;
-collecting the scenario checks, storing evidence artifacts and gating
-allocation are not implemented.
+The fixed qualification probe below gathers container-level evidence, and
+the control plane's collector adds the scenario evidence; collecting restart
+cleanup, storing evidence artifacts and gating allocation are not implemented.
 Artifact hashes are references, not signatures: this evaluator does not establish
 artifact authenticity, inspect their contents, or prove that tests ran.
 
@@ -205,7 +205,10 @@ the network, and the CPU, memory and swap, PID, tmpfs, I/O and descriptor
 limits. A fact that contradicts the profile fails its check and a fact that
 cannot be read leaves it UNVERIFIED; each result carries a fixed reason code.
 `DockerCli.engine_identity()` reads only the fixed `docker info` fields that
-identify the daemon.
+identify the daemon. `DockerCli.list_sandbox_processes()` runs
+`PROCESS_SCRIPT`, which lists every process in the sandbox's PID namespace as
+its PID, state and session, and `parse_process_list()` accepts only that
+format.
 
 ## Error contract
 

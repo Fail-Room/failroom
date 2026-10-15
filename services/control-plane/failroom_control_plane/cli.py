@@ -10,6 +10,7 @@ from typing import NoReturn, TextIO
 import uvicorn
 from failroom_sandbox.docker_lifecycle import DockerDiagnosticLifecycle
 from failroom_sandbox.models import QualificationDecision
+from failroom_sandbox.pty import DockerPtyRuntime
 from failroom_sandbox.qualification import evaluate_qualification
 from failroom_state import Database, StoreError
 
@@ -109,6 +110,12 @@ def _qualify_local(environment: Mapping[str, str] | None = None) -> Qualificatio
         config.controller.profile,
         max_age=max_age,
         now=lambda: datetime.now(UTC),
+        terminal=DockerPtyRuntime(
+            context=config.controller.docker_context, limits=config.pty_limits
+        ),
+        # The scenario database belongs in the operator's private state directory.
+        scratch=config.controller.database_path.parent,
+        busy_timeout_ms=config.database_busy_timeout_ms,
     )
     collection = collector.collect()
     report = collection.report

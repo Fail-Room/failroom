@@ -9,9 +9,12 @@ from failroom_sandbox.models import Check, Outcome
 from failroom_sandbox.qualification_probe import (
     CONTAINER_CHECKS,
     PROBE_SCRIPT,
+    PROCESS_SCRIPT,
     ProbeOutputError,
+    ProcessRecord,
     judge_container_checks,
     parse_probe_output,
+    parse_process_list,
 )
 
 LIFETIME = 290
@@ -169,6 +172,56 @@ class ProbeParsingTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "linux", "POSIX shell required")
     def test_probe_script_is_valid_posix_shell(self):
         subprocess.run(("sh", "-n", "-c", PROBE_SCRIPT), check=True, timeout=10)
+
+
+class ProcessListTests(unittest.TestCase):
+    def test_parses_pid_state_and_session(self):
+        records = parse_process_list(
+            b"process=1 S 1\nprocess=7 S 1\nprocess=35 Z 25\nend=1\n"
+        )
+
+        self.assertEqual(
+            records,
+            (
+                ProcessRecord(1, "S", 1),
+                ProcessRecord(7, "S", 1),
+                ProcessRecord(35, "Z", 25),
+            ),
+        )
+        self.assertEqual(parse_process_list(b"end=1\n"), ())
+
+    def test_rejects_listings_outside_the_fixed_format(self):
+        cases = {
+            "no end": b"process=1 S 1\n",
+            "end without newline": b"process=1 S 1\nend=1",
+            "end joined to a line": b"process=1 S 1end=1\n",
+            "duplicate pid": b"process=1 S 1\nprocess=1 R 1\nend=1\n",
+            "two-letter state": b"process=1 SS 1\nend=1\n",
+            "missing session": b"process=1 S\nend=1\n",
+            "extra field": b"process=1 S 1 bash\nend=1\n",
+            "non-ascii": "process=1 S 1\u00e9\nend=1\n".encode(),
+            "too many lines": b"".join(
+                f"process={pid} S 1\n".encode() for pid in range(1, 514)
+            )
+            + b"end=1\n",
+        }
+        for name, data in cases.items():
+            with self.subTest(case=name), self.assertRaises(ProbeOutputError):
+                parse_process_list(data)
+
+    def test_process_script_is_fixed_ascii(self):
+        PROCESS_SCRIPT.encode("ascii")
+        self.assertNotIn("\r", PROCESS_SCRIPT)
+        self.assertTrue(PROCESS_SCRIPT.endswith('echo "end=1"\n'))
+
+    @unittest.skipUnless(sys.platform == "linux", "POSIX shell required")
+    def test_process_script_lists_this_shell(self):
+        result = subprocess.run(
+            ("sh", "-c", PROCESS_SCRIPT), capture_output=True, check=True, timeout=10
+        )
+
+        records = parse_process_list(result.stdout)
+        self.assertTrue(records)
 
 
 class ContainerJudgementTests(unittest.TestCase):

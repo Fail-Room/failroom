@@ -86,6 +86,17 @@ esac
 echo "end=1"
 """
 
+# Every process in the sandbox's PID namespace as "pid state session".
+PROCESS_SCRIPT = r"""for stat in /proc/[0-9]*/stat; do
+  read -r line 2>/dev/null <"$stat" || continue
+  pid=${line%% *}
+  rest=${line##*") "}
+  set -- $rest
+  printf 'process=%s %s %s\n' "$pid" "$1" "$4"
+done
+echo "end=1"
+"""
+
 CONTAINER_CHECKS = (
     Check.UNPRIVILEGED_IDENTITY,
     Check.SYSCALL_RESTRICTIONS,
@@ -139,6 +150,7 @@ _IO_MAX = re.compile(
     r"([0-9]{1,10}:[0-9]{1,10}) rbps=([0-9]{1,19}|max) wbps=([0-9]{1,19}|max)"
     r" riops=([0-9]{1,19}|max) wiops=([0-9]{1,19}|max)"
 )
+_PROCESS_LINE = re.compile(r"process=([0-9]{1,10}) ([A-Za-z]) ([0-9]{1,10})")
 _CAPABILITIES = ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
 _SCRATCH_MOUNTS = frozenset({"/workspace", "/tmp", "/run/failroom-target"})
 _DOCKER_FILES = frozenset({"/etc/hostname", "/etc/hosts", "/etc/resolv.conf"})
@@ -206,6 +218,15 @@ class ProbeObservation:
 
 
 @dataclass(frozen=True)
+class ProcessRecord:
+    """One process in a sandbox: its PID, kernel state letter and session ID."""
+
+    pid: int
+    state: str
+    session: int
+
+
+@dataclass(frozen=True)
 class Judgement:
     """One check outcome with a fixed reason code and JSON-ready facts."""
 
@@ -213,6 +234,31 @@ class Judgement:
     outcome: Outcome
     reason: str
     facts: Mapping[str, object]
+
+
+def parse_process_list(stdout: bytes) -> tuple[ProcessRecord, ...]:
+    """Accept only fixed process lines with unique PIDs, ending with end=1."""
+    try:
+        text = stdout.decode("ascii")
+    except UnicodeError:
+        raise ProbeOutputError() from None
+    body = text.removesuffix("end=1\n")
+    if body == text or (body and not body.endswith("\n")):
+        raise ProbeOutputError()
+    lines = body.split("\n")[:-1] if body else []
+    if len(lines) > _MAX_LINES:
+        raise ProbeOutputError()
+    records = []
+    for line in lines:
+        match = _PROCESS_LINE.fullmatch(line)
+        if match is None:
+            raise ProbeOutputError()
+        records.append(
+            ProcessRecord(int(match.group(1)), match.group(2), int(match.group(3)))
+        )
+    if len({record.pid for record in records}) != len(records):
+        raise ProbeOutputError()
+    return tuple(records)
 
 
 def parse_probe_output(stdout: bytes) -> ProbeObservation:

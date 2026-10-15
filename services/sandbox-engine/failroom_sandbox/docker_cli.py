@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import BinaryIO, Protocol, cast
 
-from .qualification_probe import PROBE_SCRIPT
+from .qualification_probe import PROBE_SCRIPT, PROCESS_SCRIPT
 from .scenario import DISK_FULL_FILLER_PATH
 
 _TARGET_SUPERVISOR_USER = "0:0"
@@ -300,6 +300,21 @@ class DockerCli:
                 "-c",
                 PROBE_SCRIPT,
                 "failroom-qualification-probe",
+            )
+        ).stdout
+
+    def list_sandbox_processes(self, container_id: str) -> bytes:
+        """List every process in a sandbox's PID namespace through a fixed script."""
+        _container_selector(container_id)
+        return self._call(
+            (
+                "container",
+                "exec",
+                container_id,
+                "/bin/sh",
+                "-c",
+                PROCESS_SCRIPT,
+                "failroom-process-list",
             )
         ).stdout
 
