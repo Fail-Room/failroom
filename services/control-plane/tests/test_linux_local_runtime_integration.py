@@ -217,6 +217,58 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
                         headers={**headers, "idempotency-key": "leave-" + uuid4().hex},
                     )
 
+    def test_report_is_refreshed_before_it_expires(self) -> None:
+        environment = dict(os.environ)
+        environment["FAILROOM_DATABASE_PATH"] = str(
+            Path(self.database_temp.name) / "state.sqlite3"
+        )
+        # A short validity and maintenance interval bring the refresh quickly.
+        environment["FAILROOM_QUALIFICATION_MAX_AGE_SECONDS"] = "150"
+        environment["FAILROOM_MAINTENANCE_INTERVAL_SECONDS"] = "5"
+        config = LocalRuntimeConfig.from_environment(environment)
+        runtime = build_runtime(config, now=lambda: datetime.now(UTC))
+        headers = {"authorization": "Bearer " + self.token}
+        docker = config.controller.docker_cli()
+
+        with TestClient(runtime.app) as client:
+            attempt = qualification_attempt(
+                workspace_id(Path(self.database_temp.name) / WORKSPACE_NAME)
+            )
+
+            def collector_sandboxes() -> tuple[str, ...]:
+                return docker.list_containers(
+                    (
+                        "label=failroom.kind=diagnostic",
+                        "label=failroom.attempt_id=" + attempt,
+                    )
+                )
+
+            (first,) = collector_sandboxes()
+            # Half the validity passes, a refresh collects, and only its
+            # sentinel stays.
+            deadline = time.monotonic() + 150
+            current = (first,)
+            while time.monotonic() < deadline:
+                current = collector_sandboxes()
+                if len(current) == 1 and current[0] != first:
+                    break
+                time.sleep(2)
+            self.assertEqual(len(current), 1)
+            self.assertNotEqual(current[0], first)
+            self.assertIsNone(docker.inspect_container(first))
+            self.assertTrue(runtime.qualification.decide().allowed)
+
+            entered = client.post(
+                "/v1/rooms/disk-full/attempts",
+                headers={**headers, "idempotency-key": "enter-" + uuid4().hex},
+            )
+            self.assertEqual(entered.status_code, 201)
+            left = client.post(
+                "/v1/attempts/" + entered.json()["attempt_id"] + "/leave",
+                headers={**headers, "idempotency-key": "leave-" + uuid4().hex},
+            )
+            self.assertEqual(left.status_code, 202)
+
     def test_enter_rejects_unreviewed_and_unauthorized_rooms_without_state(
         self,
     ) -> None:

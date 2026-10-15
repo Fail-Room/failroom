@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 from datetime import timedelta
 from pathlib import Path
@@ -206,6 +207,154 @@ class QualificationGateTests(unittest.TestCase):
                     max_age=MAX_AGE,
                     now=harness.clock.now,
                 )
+
+
+class QualificationRefreshTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.harness = Harness(self)
+        self.docker = self.harness.docker
+        self.lifecycle = self.harness.lifecycle
+        self.clock = self.harness.clock
+        self.gate = self.make_gate(
+            lambda workspace: self.harness.collector(workspace=workspace)
+        )
+
+    def make_gate(self, collector) -> QualificationGate:
+        gate = QualificationGate(
+            self.docker,
+            self.lifecycle,
+            self.harness.profile,
+            workspace=self.harness.workspace,
+            collector=collector,
+            max_age=MAX_AGE,
+            now=self.clock.now,
+        )
+        self.addCleanup(gate.close)
+        return gate
+
+    def sentinels(self) -> list[str]:
+        """Sentinel containers still in the inventory, oldest first."""
+        return [
+            cid
+            for binding, _, _, cid in self.lifecycle.created
+            if binding.sandbox_id.startswith("sentinel-")
+            and cid in self.docker.containers
+        ]
+
+    def test_refresh_swaps_in_a_new_report_and_sentinel(self) -> None:
+        self.assertEqual(self.gate.start(), "QUALIFICATION_PASSED")
+        (old,) = self.sentinels()
+        self.assertFalse(self.gate.refresh_due())
+        self.clock.sleep(MAX_AGE.total_seconds() / 2)
+        self.assertTrue(self.gate.refresh_due())
+        before = len(self.lifecycle.destroyed)
+
+        self.assertEqual(self.gate.refresh(), "QUALIFICATION_PASSED")
+
+        (new,) = self.sentinels()
+        self.assertNotEqual(new, old)
+        destroyed = [cid for _, cid, _ in self.lifecycle.destroyed[before:]]
+        # The new collection's sweep kept the sentinel in use until the swap.
+        self.assertEqual(destroyed[-1], old)
+        self.assertNotIn(old, destroyed[:-1])
+        self.gate.require()
+        self.assertFalse(self.gate.refresh_due())
+        self.assertEqual(
+            (self.harness.workspace.holds, self.harness.workspace.releases), (1, 0)
+        )
+
+    def test_a_refresh_that_fails_keeps_the_current_report_until_it_expires(
+        self,
+    ) -> None:
+        self.gate.start()
+        (old,) = self.sentinels()
+        self.clock.sleep(MAX_AGE.total_seconds() / 2)
+        self.docker.probe_output = b"probe=1\nend=1\n"
+
+        self.assertEqual(
+            self.gate.refresh(), "QUALIFICATION_UNAVAILABLE RUNTIME_UNAVAILABLE"
+        )
+
+        self.assertEqual(self.sentinels(), [old])
+        self.gate.require()
+        self.assertTrue(self.gate.refresh_due())
+        self.clock.sleep(MAX_AGE.total_seconds() / 2)
+        with self.assertRaises(DockerError):
+            self.gate.require()
+
+    def test_a_refreshed_report_that_fails_refuses_allocation(self) -> None:
+        self.gate.start()
+        self.clock.sleep(MAX_AGE.total_seconds() / 2)
+        self.harness.cleanup.remove = False
+
+        self.assertEqual(
+            self.gate.refresh(), "QUALIFICATION_DENIED CHECK_FAILED:restart_cleanup"
+        )
+
+        with self.assertRaises(DockerError):
+            self.gate.require()
+        self.assertTrue(self.gate.refresh_due())
+        self.assertEqual(len(self.sentinels()), 1)
+
+    def test_refresh_is_due_without_a_usable_report(self) -> None:
+        self.assertTrue(self.gate.refresh_due())
+        self.gate.start()
+        self.assertFalse(self.gate.refresh_due())
+
+        self.docker.containers.pop(self.sentinels()[0])
+
+        self.assertTrue(self.gate.refresh_due())
+
+    def test_a_workspace_held_elsewhere_is_tried_again(self) -> None:
+        self.harness.workspace.error = WorkspaceError("COLLECTION_IN_PROGRESS")
+        self.assertEqual(
+            self.gate.start(), "QUALIFICATION_UNAVAILABLE COLLECTION_IN_PROGRESS"
+        )
+        self.assertTrue(self.gate.refresh_due())
+
+        self.harness.workspace.error = None
+
+        self.assertEqual(self.gate.refresh(), "QUALIFICATION_PASSED")
+        self.gate.require()
+        self.assertEqual(self.harness.workspace.holds, 1)
+
+    def test_close_waits_for_a_running_refresh(self) -> None:
+        started, release = threading.Event(), threading.Event()
+        harness = self.harness
+
+        class Blocking:
+            def __init__(self, workspace) -> None:
+                self.inner = harness.collector(workspace=workspace)
+
+            def collect(self, **options):
+                if options.get("keep"):
+                    started.set()
+                    release.wait(5)
+                return self.inner.collect(**options)
+
+        gate = self.make_gate(Blocking)
+        gate.start()
+        statuses: list[str] = []
+        refresh = threading.Thread(target=lambda: statuses.append(gate.refresh()))
+        refresh.start()
+        self.assertTrue(started.wait(5))
+
+        closing = threading.Thread(target=gate.close)
+        closing.start()
+        closing.join(0.2)
+        self.assertTrue(closing.is_alive())
+        release.set()
+        refresh.join(5)
+        closing.join(5)
+
+        self.assertFalse(closing.is_alive())
+        self.assertEqual(statuses, ["QUALIFICATION_PASSED"])
+        # The refresh retired the old sentinel and closing removed the new one.
+        self.assertEqual(self.docker.containers, {})
+        self.assertEqual(harness.workspace.releases, 1)
+        self.assertEqual(
+            gate.refresh(), "QUALIFICATION_UNAVAILABLE RUNTIME_UNAVAILABLE"
+        )
 
 
 class Gate:
