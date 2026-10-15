@@ -128,7 +128,7 @@ Infrastructure expansion such as PostgreSQL, orchestration, stronger sandbox run
 - Keep commits coherent and avoid mixing unrelated refactors, generated files, or dependency updates.
 - Rebase or merge the current target branch according to repository policy before final validation.
 - Require review before merging changes that affect a trust boundary, lifecycle transition, terminal protocol, scenario schema, persistence, or infrastructure privilege.
-- GitHub Actions runs each package's documented checks above on every pull request and every push to `main` ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)). It pins each action to a commit and uv to a version and checksum, reads the repository only, and needs no secrets. The opt-in Docker integration tests do not run in CI yet; their evidence still comes from a trusted Linux controller.
+- GitHub Actions runs each package's documented checks above on every pull request and every push to `main` ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)). It pins each action to a commit and uv to a version and checksum, reads the repository only, and needs no secrets. Once those checks pass, its `linux-docker` job runs the opt-in Docker integration tests on a disposable Ubuntu runner through [`.github/scripts/linux-docker-integration.sh`](../.github/scripts/linux-docker-integration.sh): it uses the control-plane README's inputs, Docker's default seccomp profile from a pinned upstream commit checked against its SHA-256, and the runner's own data disk as the I/O device, and it fails if any Failroom container outlives the tests.
 
 Every pull request description includes:
 
