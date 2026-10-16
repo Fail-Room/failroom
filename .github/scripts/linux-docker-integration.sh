@@ -80,3 +80,30 @@ if [ -n "$leftovers" ]; then
   docker ps -a --filter label=failroom.kind
   exit 1
 fi
+
+# Sandboxes are auto-remove containers. Docker removes one it finds stopped
+# when its daemon starts again, which covers a deadline that passes while the
+# daemon is down. Restart it last, with one such container running.
+stage="daemon restart"
+if [ "$(docker info --format '{{.LiveRestoreEnabled}}')" != "false" ]; then
+  echo "::error title=linux-docker::live-restore keeps containers running across a daemon restart"
+  exit 1
+fi
+sandbox="$(docker container create --rm --restart no --init --pull never \
+  --label failroom.ci=daemon-restart --entrypoint /bin/sleep "$FAILROOM_DOCKER_IMAGE" 600)"
+docker container start "$sandbox" >/dev/null
+sudo systemctl restart docker
+for _ in $(seq 1 60); do
+  docker info >/dev/null 2>&1 && break
+  sleep 1
+done
+for _ in $(seq 1 30); do
+  docker container inspect "$sandbox" >/dev/null 2>&1 || break
+  sleep 1
+done
+if docker container inspect "$sandbox" >/dev/null 2>&1; then
+  echo "::error title=linux-docker::an auto-remove container outlived a Docker daemon restart"
+  docker container rm --force "$sandbox" >/dev/null
+  exit 1
+fi
+echo "::notice title=linux-docker::Docker removed an auto-remove container across a daemon restart"

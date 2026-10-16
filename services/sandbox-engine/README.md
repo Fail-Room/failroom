@@ -78,14 +78,17 @@ as exact Docker NanoCPUs, equal memory/swap limits, bounded PID/tmpfs/shm/FD/I/O
 values, terminal/session/TTL limits, and an absolute seccomp policy path and
 digest. It compiles fixed Docker arguments for `runc`, private PID/IPC/cgroup
 namespaces, `network=none`, read-only root, dropped capabilities,
-`no-new-privileges`, disabled health checks, no restart and disabled logging.
+`no-new-privileges`, disabled health checks, no restart, disabled logging and
+automatic removal (`--rm`).
 PID 1 is Docker's init (`--init`). Its only child is `/bin/sleep`, which ends at
 the attempt deadline, and it reaps processes orphaned to it, so killed
 processes do not remain as zombies. Docker supplies the init binary as a
 read-only bind of its own `docker-init` at `/sbin/docker-init`; Docker fixes
 both paths, no profile field sets them, and the mount is not listed in the
 inspected `Mounts`. Post-create verification requires `HostConfig.Init` to be
-`true`.
+`true`. Docker removes the container itself once PID 1 exits, so an expired
+sandbox does not wait for a Failroom process; post-create verification also
+requires `HostConfig.AutoRemove` to be `true`.
 There are no profile fields for host mounts, volumes, devices, ports, extra
 capabilities, arbitrary commands, or a learner-selected image.
 
@@ -103,7 +106,9 @@ volumes. The policy store verifies policy bytes before create; after create and
 start, the lifecycle verifies the exact private snapshot path, image, profile,
 labels and allowed tmpfs mounts. A mismatch prevents start and only an exact
 matching diagnostic resource can be stopped or removed. Post-remove inspect must
-prove absence before it returns canonical evidence. These checks do not qualify an
+prove absence before it returns canonical evidence. Docker may already be
+removing a stopped sandbox itself, so a stop or remove that fails is accepted
+only when absence is then shown within five seconds. These checks do not qualify an
 image or runtime for learner use, and `create_qualified()` remains disabled after
 the qualification guard succeeds.
 
@@ -213,7 +218,10 @@ its PID, state and session, and `parse_process_list()` accepts only that
 format. `DockerCli.read_runtime_identity()` runs `IDENTITY_SCRIPT` in a
 running sandbox, and `parse_runtime_identity()` accepts only its boot ID and
 its single I/O limit line, which the control plane compares before each
-allocation.
+allocation. `DockerCli.container_exit()` reads one container's `die` event,
+with its exit code and time, from Docker's event log, which keeps it after
+the container is removed; Docker keeps only its latest events, so a caller
+reads it soon after the exit.
 
 ## Error contract
 

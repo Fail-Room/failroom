@@ -183,10 +183,11 @@ The control plane's operator-only local runtime wires these contracts to Docker
 creation, reset and verified cleanup for the Disk Full Room. It creates those
 sandboxes without final-image qualification, which is a documented limitation
 of that proof of concept, not a qualified learner allocator. Docker
-inventory-wide orphan detection, runtime attachment lease race coverage and TTL
-enforcement while every service is down also remain open: a container's PID 1
-exits no later than the attempt deadline, but removing the container waits for
-the next maintenance pass.
+inventory-wide orphan detection and runtime attachment lease race coverage also
+remain open. The store records no expiry while every service is down: a
+container's PID 1 exits no later than the attempt deadline and Docker then
+removes the container itself, and the next maintenance pass records the expiry
+and the verified absence.
 
 ## Local checks and database placement
 

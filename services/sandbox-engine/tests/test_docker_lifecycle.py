@@ -70,6 +70,7 @@ def observation(profile, seccomp_path):
             "CgroupnsMode": "private",
             "Runtime": "runc",
             "Init": True,
+            "AutoRemove": True,
             "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
             "LogConfig": {"Type": "none", "Config": {}},
             "Memory": 134217728,
@@ -135,6 +136,21 @@ class Clock:
         return self.value
 
 
+class Ticks:
+    """Monotonic time that moves only when the code under test sleeps."""
+
+    def __init__(self):
+        self.value = 0.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.value
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.value += seconds
+
+
 class Engine:
     def __init__(self, profile, seccomp_path):
         self.calls = []
@@ -149,6 +165,11 @@ class Engine:
         self.after_create = None
         self.after_start = None
         self.keep_after_remove = False
+        # Docker removing an auto-remove sandbox on its own.
+        self.removed_on_stop = False
+        self.gone_before_stop = False
+        self.remove_refused = False
+        self.removed_after_inspects = None
 
     def __call__(self, argv, *, timeout, max_output_bytes):
         self.calls.append(argv)
@@ -163,6 +184,11 @@ class Engine:
                 self.after_create(self.resource)
             return ProcessResult(0, (CID + "\n").encode(), b"")
         if args[:2] == ("container", "inspect"):
+            if self.created and self.removed_after_inspects is not None:
+                if self.removed_after_inspects == 0:
+                    self.created = False
+                else:
+                    self.removed_after_inspects -= 1
             return (
                 ProcessResult(0, json.dumps([self.resource]).encode(), b"")
                 if self.created
@@ -178,8 +204,15 @@ class Engine:
             if args[-2:] == ("/usr/local/bin/failroom-disk-target", "initialize"):
                 return ProcessResult(1, b"", b"")
         elif args[:2] == ("container", "stop"):
+            if self.gone_before_stop:
+                self.created = False
+                return ProcessResult(1, b"", b"No such container")
             self.resource["State"] = {"Running": False, "Status": "exited"}
+            if self.removed_on_stop:
+                self.created = False
         elif args[:2] == ("container", "rm"):
+            if not self.created or self.remove_refused:
+                return ProcessResult(1, b"", b"removal already in progress")
             self.created = self.keep_after_remove
         else:
             raise AssertionError(args)
@@ -202,7 +235,13 @@ class DockerLifecycleTests(unittest.TestCase):
             max_output_bytes=65536,
             runner=self.engine,
         )
-        self.lifecycle = DockerDiagnosticLifecycle(self.cli, self.policy)
+        self.ticks = Ticks()
+        self.lifecycle = DockerDiagnosticLifecycle(
+            self.cli,
+            self.policy,
+            monotonic=self.ticks.monotonic,
+            sleep=self.ticks.sleep,
+        )
         self.clock = Clock(NOW)
         self.lifetime = ContainerLifetime(DEADLINE, self.clock)
 
@@ -222,7 +261,13 @@ class DockerLifecycleTests(unittest.TestCase):
             max_output_bytes=65536,
             runner=self.engine,
         )
-        self.lifecycle = DockerDiagnosticLifecycle(self.cli, self.policy)
+        self.ticks = Ticks()
+        self.lifecycle = DockerDiagnosticLifecycle(
+            self.cli,
+            self.policy,
+            monotonic=self.ticks.monotonic,
+            sleep=self.ticks.sleep,
+        )
 
     def docker_calls(self, *commands):
         return [call for call in self.engine.calls if call[3:5] in commands]
@@ -656,6 +701,64 @@ class DockerLifecycleTests(unittest.TestCase):
         self.assertRegex(evidence, r"^sha256:[0-9a-f]{64}$")
         self.assertEqual(evidence, self.lifecycle.destroy(BINDING, CID))
         self.assertFalse(self.engine.created)
+
+    def test_auto_remove_drift_is_cleaned_without_start(self):
+        def without_auto_remove(resource):
+            resource["HostConfig"].pop("AutoRemove")
+
+        for name, mutate in (
+            ("missing", without_auto_remove),
+            ("false", lambda r: r["HostConfig"].update(AutoRemove=False)),
+            ("null", lambda r: r["HostConfig"].update(AutoRemove=None)),
+        ):
+            with self.subTest(auto_remove=name):
+                self.reset_engine()
+                self.engine.after_create = mutate
+                with self.assertRaisesRegex(DockerError, "^PROFILE_UNVERIFIED$"):
+                    self.create()
+                self.assertFalse(self.engine.created)
+                self.assertEqual(self.docker_calls(("container", "start")), [])
+
+    def test_destroy_accepts_a_sandbox_docker_removed_when_it_stopped(self):
+        self.create()
+        self.engine.removed_on_stop = True
+
+        evidence = self.lifecycle.destroy(BINDING, CID)
+
+        self.assertRegex(evidence, r"^sha256:[0-9a-f]{64}$")
+        self.assertFalse(self.engine.created)
+        self.assertEqual(self.docker_calls(("container", "rm")), [])
+
+    def test_destroy_accepts_a_sandbox_that_ended_just_before_stop(self):
+        self.create()
+        self.engine.gone_before_stop = True
+
+        self.assertRegex(self.lifecycle.destroy(BINDING, CID), r"^sha256:")
+        self.assertFalse(self.engine.created)
+
+    def test_destroy_waits_for_a_removal_docker_already_began(self):
+        self.create()
+        self.engine.remove_refused = True
+        # Docker finishes its own removal on the fourth inspect from here.
+        self.engine.removed_after_inspects = 3
+
+        evidence = self.lifecycle.destroy(BINDING, CID)
+
+        self.assertRegex(evidence, r"^sha256:[0-9a-f]{64}$")
+        self.assertFalse(self.engine.created)
+        self.assertEqual(self.ticks.sleeps, [0.1])
+
+    def test_destroy_fails_when_a_refused_remove_leaves_the_sandbox(self):
+        self.create()
+        self.engine.remove_refused = True
+
+        with self.assertRaisesRegex(DockerError, "^RUNTIME_UNAVAILABLE$"):
+            self.lifecycle.destroy(BINDING, CID)
+
+        self.assertTrue(self.engine.created)
+        # It waited about five seconds for Docker, and no longer.
+        self.assertGreaterEqual(self.ticks.value, 5)
+        self.assertLess(self.ticks.value, 5.2)
 
     def test_remove_success_without_absence_does_not_succeed(self):
         self.create()

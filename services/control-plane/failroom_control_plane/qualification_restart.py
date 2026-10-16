@@ -4,11 +4,13 @@ The scenario enters the Disk Full Room through the real orchestrator into a
 scratch SQLite store in the collector's workspace, with a deadline a few
 seconds away. It persists the resource binding before any Docker call, checks
 that the sandbox runs, and then drops every in-memory object, as a crash would.
+Docker removes the sandbox itself once its PID 1 exits before the deadline.
 After the deadline, fresh store, cleanup-worker and maintenance instances built
 only from the persisted files run the same maintenance pass the local runtime
-runs when it starts. The check passes only when that pass removes the sandbox
-from the Docker inventory and records it destroyed. The same recovery removes
-the state a crashed collection left behind before the next collection starts.
+runs when it starts. The check passes only when the sandbox is then absent
+from the Docker inventory and that pass records it destroyed. The same
+recovery removes the state a crashed collection left behind before the next
+collection starts.
 """
 
 import json
@@ -102,7 +104,7 @@ class RestartRecovery:
 
     passes: int
     failed_passes: int
-    removed_by_restart: bool
+    absent_after_restart: bool
     attempt_state: str
     resource_state: str
 
@@ -243,7 +245,7 @@ class RestartScenario:
             "attempt": recovery.attempt_state,
             "resource": recovery.resource_state,
         }
-        if not recovery.removed_by_restart:
+        if not recovery.absent_after_restart:
             failure = "CONTAINER_REMAINS"
         elif recovery.attempt_state != "DESTROYED" or (
             recovery.resource_state != ResourceState.DESTROYED
@@ -308,11 +310,11 @@ class RestartScenario:
         except (StoreError, MaintenanceError):
             # An unreadable store cannot restart; absence is still proven below.
             pass
-        removed = not self._present(ref)
-        if not removed:
+        absent = not self._present(ref)
+        if not absent:
             self._destroy(ref)
         shutil.rmtree(directory)
-        return RestartRecovery(passes, failed, removed, attempt_state, resource_state)
+        return RestartRecovery(passes, failed, absent, attempt_state, resource_state)
 
     def _utc_now(self) -> datetime:
         return self._now().astimezone(UTC)

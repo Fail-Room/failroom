@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import re
+import time
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
@@ -29,6 +30,11 @@ from .models import QualificationContext, QualificationReport
 from .qualification import require_qualified_profile
 from .scenario import DiskFullScenario
 from .scenario_runtime import DiskFullBootstrapRuntime, ScenarioObservation
+
+# Docker removes a sandbox itself once its PID 1 exits; destroy waits this long
+# for a removal Docker has already begun before it reports a failure.
+_REMOVAL_WAIT_SECONDS = 5.0
+_REMOVAL_POLL_SECONDS = 0.1
 
 
 class PolicyStore(Protocol):
@@ -252,6 +258,7 @@ def _verify_profile(
         "CgroupnsMode": "private",
         "Runtime": "runc",
         "Init": True,
+        "AutoRemove": True,
         "PublishAllPorts": False,
         "Memory": profile.memory_limit_bytes,
         "MemorySwap": profile.memory_swap_limit_bytes,
@@ -490,9 +497,37 @@ class DockerDiagnosticLifecycle:
     binding for reconciliation because a timed-out daemon call may finish later.
     """
 
-    def __init__(self, cli: DockerCli, policies: PolicyStore) -> None:
+    def __init__(
+        self,
+        cli: DockerCli,
+        policies: PolicyStore,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
         self._cli = cli
         self._policies = policies
+        self._monotonic = monotonic
+        self._sleep = sleep
+
+    def _removed_by_docker(self, cid: str) -> bool:
+        """Wait briefly for a removal Docker began on its own to finish.
+
+        The strict profile removes a sandbox once PID 1 exits, so a stop or
+        remove that races that removal may fail. Only absence proven afterwards
+        excuses the failure.
+        """
+        give_up = self._monotonic() + _REMOVAL_WAIT_SECONDS
+        while True:
+            try:
+                if self._cli.inspect_container(cid) is None:
+                    return True
+            except DockerError:
+                # A container Docker is still removing can stay listed.
+                pass
+            if self._monotonic() >= give_up:
+                return False
+            self._sleep(_REMOVAL_POLL_SECONDS)
 
     def _inspect_exact_created(
         self, operation: PreparedDockerOperation, cid: str
@@ -592,12 +627,22 @@ class DockerDiagnosticLifecycle:
                 # Stop owned execution before surfacing unexpected mounts; never
                 # remove or adopt volumes whose origin was not proven.
                 if _object(data.get("State")).get("Running") is True:
-                    self._cli.stop(cid)
-                    data = self._cli.inspect_container(cid)
+                    try:
+                        self._cli.stop(cid)
+                        data = self._cli.inspect_container(cid)
+                    except DockerError:
+                        # PID 1 may have reached the deadline just before.
+                        if not self._removed_by_docker(cid):
+                            raise
+                        data = None
                 if data is not None:
                     _owned(data, binding, cid, operation_id)
                     _cleanable_mounts(data)
-                    self._cli.remove(cid)
+                    try:
+                        self._cli.remove(cid)
+                    except DockerError:
+                        if not self._removed_by_docker(cid):
+                            raise
                 if self._cli.inspect_container(cid) is not None:
                     raise DockerError("CLEANUP_INCOMPLETE")
         if self._cli.list_containers(filters):

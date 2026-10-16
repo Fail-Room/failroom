@@ -7,6 +7,7 @@ import subprocess
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import BinaryIO, Protocol, cast
 
@@ -59,6 +60,14 @@ class EngineIdentity:
 
     engine_id: str
     configuration: Mapping[str, object]
+
+
+@dataclass(frozen=True)
+class ContainerExit:
+    """How and when a container's PID 1 ended, as Docker's event log records it."""
+
+    exit_code: int
+    finished_at: datetime
 
 
 class Runner(Protocol):
@@ -158,6 +167,35 @@ def _json_object(data: bytes) -> dict[str, object]:
         return cast(dict[str, object], value)
     except (ValueError, UnicodeError, RecursionError):
         raise DockerError("INVALID_DOCKER_RESPONSE") from None
+
+
+def _event_object(value: object) -> dict[str, object]:
+    if type(value) is not dict:
+        raise DockerError("INVALID_DOCKER_RESPONSE")
+    return cast(dict[str, object], value)
+
+
+def _container_exit(line: bytes, container_id: str) -> ContainerExit:
+    event = _json_object(line)
+    actor = _event_object(event.get("Actor"))
+    code = _event_object(actor.get("Attributes")).get("exitCode")
+    nanoseconds = event.get("timeNano")
+    if (
+        event.get("Type") != "container"
+        or event.get("Action") != "die"
+        or actor.get("ID") != container_id
+        or type(code) is not str
+        or re.fullmatch(r"[0-9]{1,3}", code) is None
+        or type(nanoseconds) is not int
+        or not 0 < nanoseconds < 1 << 63
+    ):
+        raise DockerError("INVALID_DOCKER_RESPONSE")
+    seconds, remainder = divmod(nanoseconds, 1_000_000_000)
+    return ContainerExit(
+        int(code),
+        datetime.fromtimestamp(seconds, UTC)
+        + timedelta(microseconds=remainder // 1000),
+    )
 
 
 def _printable(value: object) -> bool:
@@ -535,3 +573,47 @@ class DockerCli:
     def remove(self, cid: str) -> None:
         _container_selector(cid)
         self._call(("container", "rm", cid))
+
+    def container_exit(
+        self, container_id: str, *, since: datetime, until: datetime
+    ) -> ContainerExit | None:
+        """Read one container's `die` event, which outlives its removal.
+
+        Docker keeps only its most recent events in memory, so a caller reads
+        the event soon after the container ends.
+        """
+        if (
+            type(container_id) is not str
+            or re.fullmatch(r"[a-f0-9]{64}", container_id) is None
+            or type(since) is not datetime
+            or since.utcoffset() is None
+            or type(until) is not datetime
+            or until.utcoffset() is None
+            or until < since
+        ):
+            raise DockerError("INVALID_DOCKER_REQUEST")
+        output = self._call(
+            (
+                "events",
+                "--since",
+                str(math.floor(since.timestamp())),
+                "--until",
+                str(math.ceil(until.timestamp())),
+                "--filter",
+                "type=container",
+                "--filter",
+                "container=" + container_id,
+                "--filter",
+                "event=die",
+                "--format",
+                "{{json .}}",
+            )
+        ).stdout
+        exits = [
+            _container_exit(line, container_id)
+            for line in output.split(b"\n")
+            if line.strip()
+        ]
+        if len(exits) > 1:
+            raise DockerError("INVALID_DOCKER_RESPONSE")
+        return exits[0] if exits else None

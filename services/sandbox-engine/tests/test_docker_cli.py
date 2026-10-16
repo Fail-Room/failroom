@@ -2,8 +2,10 @@ import json
 import subprocess
 import sys
 import unittest
+from datetime import UTC, datetime
 
 from failroom_sandbox.docker_cli import (
+    ContainerExit,
     DockerCli,
     DockerError,
     ProcessResult,
@@ -517,3 +519,139 @@ class QualificationCommandTests(unittest.TestCase):
                 cli = self.cli(lambda *a, data=data, **k: ProcessResult(0, data, b""))
                 with self.assertRaisesRegex(DockerError, "^INVALID_DOCKER_RESPONSE$"):
                     cli.engine_identity()
+
+
+_EXITED = "a" * 64
+# 2026-10-15T23:14:48.010683342Z, as Docker reports a container's death.
+_DIED_NANOSECONDS = 1_792_106_088_010_683_342
+
+
+def _die_event(**changes):
+    event = {
+        "Type": "container",
+        "Action": "die",
+        "Actor": {
+            "ID": _EXITED,
+            "Attributes": {"exitCode": "0", "failroom.kind": "diagnostic"},
+        },
+        "scope": "local",
+        "time": _DIED_NANOSECONDS // 1_000_000_000,
+        "timeNano": _DIED_NANOSECONDS,
+    }
+    event.update(changes)
+    return json.dumps(event).encode()
+
+
+class ContainerExitTests(unittest.TestCase):
+    since = datetime(2026, 10, 15, 23, 14, 40, 500000, tzinfo=UTC)
+    until = datetime(2026, 10, 15, 23, 14, 50, 200000, tzinfo=UTC)
+
+    def cli(self, runner):
+        return DockerCli(
+            context="desktop-linux", timeout=5, max_output_bytes=65536, runner=runner
+        )
+
+    def test_reads_the_die_event_with_fixed_filters(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append(argv)
+            return ProcessResult(0, _die_event() + b"\n", b"")
+
+        record = self.cli(runner).container_exit(
+            _EXITED, since=self.since, until=self.until
+        )
+
+        self.assertEqual(
+            record,
+            ContainerExit(0, datetime(2026, 10, 15, 23, 14, 48, 10683, tzinfo=UTC)),
+        )
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "docker",
+                    "--context",
+                    "desktop-linux",
+                    "events",
+                    "--since",
+                    "1792106080",
+                    "--until",
+                    "1792106091",
+                    "--filter",
+                    "type=container",
+                    "--filter",
+                    "container=" + _EXITED,
+                    "--filter",
+                    "event=die",
+                    "--format",
+                    "{{json .}}",
+                )
+            ],
+        )
+
+    def test_no_die_event_reads_as_none(self):
+        cli = self.cli(lambda *a, **k: ProcessResult(0, b"", b""))
+        self.assertIsNone(
+            cli.container_exit(_EXITED, since=self.since, until=self.until)
+        )
+
+    def test_rejects_events_that_are_not_one_die_of_that_container(self):
+        cases = {
+            "two deaths": _die_event() + b"\n" + _die_event(),
+            "other container": _die_event(Actor={"ID": "b" * 64, "Attributes": {}}),
+            "other action": _die_event(Action="start"),
+            "other type": _die_event(Type="network"),
+            "exit code not a number": _die_event(
+                Actor={"ID": _EXITED, "Attributes": {"exitCode": "zero"}}
+            ),
+            "exit code out of range": _die_event(
+                Actor={"ID": _EXITED, "Attributes": {"exitCode": "1000"}}
+            ),
+            "missing exit code": _die_event(Actor={"ID": _EXITED, "Attributes": {}}),
+            "missing attributes": _die_event(Actor={"ID": _EXITED}),
+            "time not a number": _die_event(timeNano="1792106088010683342"),
+            "time zero": _die_event(timeNano=0),
+            "time too large": _die_event(timeNano=1 << 63),
+            "duplicate key": b'{"Type": "container", "Type": "container"}',
+            "not an object": b"[]",
+            "not json": b"die",
+        }
+        for name, data in cases.items():
+            with self.subTest(case=name):
+                cli = self.cli(lambda *a, data=data, **k: ProcessResult(0, data, b""))
+                with self.assertRaisesRegex(DockerError, "^INVALID_DOCKER_RESPONSE$"):
+                    cli.container_exit(_EXITED, since=self.since, until=self.until)
+
+    def test_rejects_invalid_requests_before_any_docker_call(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append(argv)
+            return ProcessResult(0, b"", b"")
+
+        cli = self.cli(runner)
+        naive = datetime(2026, 10, 15, 23, 14, 40)
+        for container_id, since, until in (
+            ("failroom-diagnostic-" + "a" * 64, self.since, self.until),
+            ("a" * 12, self.since, self.until),
+            ("--privileged", self.since, self.until),
+            (_EXITED, naive, self.until),
+            (_EXITED, self.since, naive),
+            (_EXITED, self.until, self.since),
+        ):
+            with (
+                self.subTest(container_id=container_id, since=since, until=until),
+                self.assertRaisesRegex(DockerError, "^INVALID_DOCKER_REQUEST$"),
+            ):
+                cli.container_exit(container_id, since=since, until=until)
+        self.assertEqual(calls, [])
+
+    def test_a_failed_events_call_is_not_read_as_no_exit(self):
+        cli = self.cli(lambda *a, **k: ProcessResult(1, b"", b"daemon unavailable"))
+        with self.assertRaisesRegex(DockerError, "^RUNTIME_UNAVAILABLE$"):
+            cli.container_exit(_EXITED, since=self.since, until=self.until)
+
+
+if __name__ == "__main__":
+    unittest.main()

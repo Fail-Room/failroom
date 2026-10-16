@@ -204,7 +204,7 @@ def _validate_lifetime(profile: StrictDockerProfile, lifetime_seconds: object) -
 def _profile_configuration(profile: StrictDockerProfile) -> dict[str, object]:
     """Return every profile field and fixed Docker setting for fingerprinting."""
     return {
-        "schema": "failroom.strict-docker-profile.v3",
+        "schema": "failroom.strict-docker-profile.v4",
         "image": profile.image,
         "identity": {"uid": profile.uid, "gid": profile.gid},
         "seccomp": {"path": profile.seccomp_path, "digest": profile.seccomp_digest},
@@ -220,6 +220,7 @@ def _profile_configuration(profile: StrictDockerProfile) -> dict[str, object]:
             "ipc_namespace": "private",
             "cgroup_namespace": "private",
             "restart": "no",
+            "auto_remove": True,
             "log_driver": "none",
             "runtime": "runc",
             "init": True,
@@ -304,7 +305,8 @@ def compile_create_argv(
     derives ``lifetime_seconds`` from the attempt's immutable deadline. PID 1 is
     Docker's init, which reaps orphaned processes and exits when its only
     child, ``/bin/sleep``, ends after that long, so the container stops on its
-    own at the deadline.
+    own at the deadline. Docker then removes the container itself, so an
+    expired sandbox does not wait for a Failroom process to remove it.
     """
     _validate_profile(profile)
     _validate_binding(binding)
@@ -343,6 +345,7 @@ def compile_create_argv(
         "private",
         "--restart",
         "no",
+        "--rm",
         "--log-driver",
         "none",
         "--runtime",

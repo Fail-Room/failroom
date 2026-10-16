@@ -141,6 +141,7 @@ def _assert_hardening(
     test_case.assertEqual(config["User"], f"{profile.uid}:{profile.gid}")
     test_case.assertEqual(host["NetworkMode"], "none")
     test_case.assertIs(host["Init"], True)
+    test_case.assertIs(host["AutoRemove"], True)
     test_case.assertIsNone(host["Binds"])
     test_case.assertIsNone(host.get("Mounts"))
     test_case.assertIsNone(host["VolumesFrom"])
@@ -421,7 +422,7 @@ class LinuxControlPlaneIntegrationTests(unittest.TestCase):
                 )
                 self.cleanup.destroy_and_verify_absent(target)
 
-    def test_pid1_outlives_sixty_seconds_and_stops_by_the_attempt_deadline(
+    def test_pid1_outlives_sixty_seconds_and_docker_removes_it_by_the_deadline(
         self,
     ) -> None:
         """Hold one real sandbox past 60 seconds and until its deadline (~85 s)."""
@@ -461,10 +462,24 @@ class LinuxControlPlaneIntegrationTests(unittest.TestCase):
             running = self.inspect_cli.inspect_container(resource.container_id)
             self.assertIs(running["State"]["Running"], True)
 
+            # No cleanup pass runs: Docker removes the sandbox once PID 1 exits,
+            # and only its event log keeps how and when it ended.
             time.sleep(max(0.0, (deadline - clock()).total_seconds()) + 1)
-            stopped = self.inspect_cli.inspect_container(resource.container_id)
-            self.assertIs(stopped["State"]["Running"], False)
-            self.assertEqual(stopped["State"]["ExitCode"], 0)
+            self.assertIsNone(self.inspect_cli.inspect_container(resource.container_id))
+            binding = DockerBinding(
+                receipt.ref.attempt_id,
+                receipt.ref.sandbox_id,
+                receipt.ref.generation,
+            )
+            self.assertEqual(
+                self.inspect_cli.list_containers(_exact_label_filters(binding)), ()
+            )
+            ended = self.inspect_cli.container_exit(
+                resource.container_id, since=started, until=clock()
+            )
+            self.assertIsNotNone(ended)
+            self.assertEqual(ended.exit_code, 0)
+            self.assertLessEqual(ended.finished_at, deadline)
         finally:
             if receipt is not None:
                 resource = self.control.inspect(self.control_identity, receipt.ref)
