@@ -377,13 +377,14 @@ class DockerProfileTests(unittest.TestCase):
         self.assertEqual(docker_configuration["ipc_namespace"], "private")
         self.assertEqual(docker_configuration["cgroup_namespace"], "private")
         self.assertEqual(docker_configuration["restart"], "no")
+        self.assertIs(docker_configuration["auto_remove"], True)
         self.assertEqual(docker_configuration["log_driver"], "none")
         self.assertEqual(docker_configuration["runtime"], "runc")
         self.assertIs(docker_configuration["init"], True)
         self.assertEqual(docker_configuration["entrypoint"], "/bin/sleep")
         self.assertIs(docker_configuration["healthcheck_disabled"], True)
         self.assertEqual(docker_configuration["pull_policy"], "never")
-        self.assertEqual(configuration["schema"], "failroom.strict-docker-profile.v3")
+        self.assertEqual(configuration["schema"], "failroom.strict-docker-profile.v4")
         self.assertEqual(
             docker_configuration["command"],
             {"lifetime": "attempt-deadline", "start_margin_seconds": 10},
@@ -488,6 +489,7 @@ class DockerProfileTests(unittest.TestCase):
                 "private",
                 "--restart",
                 "no",
+                "--rm",
                 "--log-driver",
                 "none",
                 "--runtime",

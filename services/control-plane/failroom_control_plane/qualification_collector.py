@@ -8,11 +8,11 @@ image, and enters one Room sandbox for the restart scenario. Only the sentinel
 differs: its lifetime bound is the report validity instead of the attempt TTL,
 because its container ID and start time are the daemon epoch the report is
 bound to, and a caller may ask to keep it running after the collection. It runs the fixed
-probe in the probe sandbox and judges the twelve container checks, runs the
-terminal scenarios against the same sandbox, checks that PID 1 ends the
-lifetime sandbox by its deadline, and judges how a restarted control plane
-cleans up the abandoned Room sandbox. It keeps no report and gates nothing;
-callers decide what to do with the report.
+probe in the probe sandbox and judges the twelve container checks, checks that
+PID 1 ends the lifetime sandbox by its deadline and that Docker then removes
+it, runs the terminal scenarios against the probe sandbox, and judges how a
+restarted control plane cleans up the abandoned Room sandbox. It keeps no
+report and gates nothing; callers decide what to do with the report.
 """
 
 import re
@@ -26,7 +26,7 @@ from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
-from failroom_sandbox.docker_cli import DockerError, EngineIdentity
+from failroom_sandbox.docker_cli import ContainerExit, DockerError, EngineIdentity
 from failroom_sandbox.docker_lifecycle import ContainerLifetime, ContainerObservation
 from failroom_sandbox.docker_profile import (
     DockerBinding,
@@ -110,6 +110,10 @@ class QualificationDocker(Protocol):
 
     def list_containers(self, filters: tuple[str, ...]) -> tuple[str, ...]: ...
 
+    def container_exit(
+        self, container_id: str, *, since: datetime, until: datetime
+    ) -> ContainerExit | None: ...
+
 
 @runtime_checkable
 class QualificationLifecycle(Protocol):
@@ -155,6 +159,7 @@ class _Started:
     operation_id: str
     container_id: str
     deadline: datetime
+    started_at: datetime
 
 
 def _object(value: object) -> dict[str, object]:
@@ -360,6 +365,12 @@ class QualificationCollector:
                 attempt, "lifetime", min(_LIFETIME_SECONDS, max_lifetime)
             )
             try:
+                # Read now: Docker removes the sandbox, and its record, once it ends.
+                lifetime: int | None
+                try:
+                    lifetime = _lifetime(self._inspect(lifetime_sandbox))
+                except QualificationError:
+                    lifetime = None
                 restart = self._begin_restart(scratch)
                 try:
                     probe = self._start(
@@ -369,16 +380,17 @@ class QualificationCollector:
                         raw = self._docker.run_qualification_probe(probe.container_id)
                         observed_at = self._utc_now()
                         data = self._inspect(probe)
-                        scenarios.update(
-                            self._terminal_scenarios(probe.container_id, scratch)
+                        # Docker keeps only its latest events, so read the lifetime
+                        # sandbox's exit before the terminal scenarios add many.
+                        scenarios[Check.ABSOLUTE_TTL] = self._lifetime_check(
+                            lifetime_sandbox, lifetime
                         )
-                        scenario_times.update(dict.fromkeys(scenarios, self._utc_now()))
+                        scenario_times[Check.ABSOLUTE_TTL] = self._utc_now()
+                        terminal = self._terminal_scenarios(probe.container_id, scratch)
+                        scenarios.update(terminal)
+                        scenario_times.update(dict.fromkeys(terminal, self._utc_now()))
                     finally:
                         self._destroy(probe)
-                    scenarios[Check.ABSOLUTE_TTL] = self._lifetime_check(
-                        lifetime_sandbox
-                    )
-                    scenario_times[Check.ABSOLUTE_TTL] = self._utc_now()
                 finally:
                     # Also on failure: the restart is what removes the Room sandbox.
                     scenarios[Check.RESTART_CLEANUP] = self._finish_restart(
@@ -492,14 +504,17 @@ class QualificationCollector:
     ) -> _Started:
         binding = DockerBinding(attempt, f"{role}-{uuid4().hex}", 1)
         operation_id = uuid4().hex
-        deadline = self._utc_now() + timedelta(seconds=seconds + _START_MARGIN_SECONDS)
+        started_at = self._utc_now()
+        deadline = started_at + timedelta(seconds=seconds + _START_MARGIN_SECONDS)
         observation = self._lifecycle.create_diagnostic(
             profile or self._profile,
             binding,
             operation_id,
             lifetime=ContainerLifetime(deadline, self._now),
         )
-        return _Started(binding, operation_id, observation.container_id, deadline)
+        return _Started(
+            binding, operation_id, observation.container_id, deadline, started_at
+        )
 
     def _terminal_scenarios(
         self, container_id: str, scratch: Path
@@ -534,36 +549,57 @@ class QualificationCollector:
         except (OSError, RestartCleanupError):
             raise QualificationError("CLEANUP_INCOMPLETE") from None
 
-    def _lifetime_check(self, started: _Started) -> Judgement:
-        """PID 1 must stop the sandbox on its own no later than its deadline."""
+    def _lifetime_check(self, started: _Started, lifetime: int | None) -> Judgement:
+        """PID 1 must end the sandbox by its deadline, and Docker must remove it.
+
+        The removal takes the container's own record with it, so the exit code
+        and time come from Docker's event log.
+        """
         check = Check.ABSOLUTE_TTL
+        unreadable = Judgement(
+            check, Outcome.UNVERIFIED, "LIFETIME_UNREADABLE", MappingProxyType({})
+        )
+        if lifetime is None:
+            return unreadable
         try:
-            data = self._inspect(started)
-            lifetime = _lifetime(data)
-            give_up = self._monotonic() + lifetime + _LIFETIME_GRACE_SECONDS
-            state = _object(data.get("State"))
-            while state.get("Running") is True and self._monotonic() < give_up:
+            remaining = (started.deadline - self._utc_now()).total_seconds()
+            give_up = self._monotonic() + max(0.0, remaining) + _LIFETIME_GRACE_SECONDS
+            data = self._docker.inspect_container(started.container_id)
+            while data is not None and self._monotonic() < give_up:
                 self._sleep(0.25)
-                state = _object(self._inspect(started).get("State"))
-        except QualificationError:
-            return Judgement(
-                check, Outcome.UNVERIFIED, "LIFETIME_UNREADABLE", MappingProxyType({})
+                data = self._docker.inspect_container(started.container_id)
+            if data is not None:
+                running = _object(data.get("State")).get("Running")
+                ended = None
+            else:
+                running = False
+                ended = self._docker.container_exit(
+                    started.container_id,
+                    since=started.started_at,
+                    until=self._utc_now(),
+                )
+        except (DockerError, QualificationError):
+            return unreadable
+        facts: dict[str, object] = {"lifetime_seconds": lifetime}
+        if data is not None:
+            reason = (
+                "LIFETIME_NOT_ENFORCED"
+                if running is not False
+                else "SANDBOX_NOT_REMOVED"
             )
-        exit_code = state.get("ExitCode")
-        finished = _docker_time(state.get("FinishedAt"))
-        facts: dict[str, object] = {
-            "lifetime_seconds": lifetime,
-            "exit_code": exit_code if type(exit_code) is int else None,
-        }
-        if state.get("Running") is not False:
-            outcome, reason = Outcome.FAIL, "LIFETIME_NOT_ENFORCED"
-        elif exit_code != 0 or finished is None:
-            outcome, reason, facts = Outcome.UNVERIFIED, "UNEXPECTED_EXIT", {}
-        elif finished > started.deadline:
-            outcome, reason = Outcome.FAIL, "DEADLINE_EXCEEDED"
-        else:
-            outcome, reason = Outcome.PASS, ""
-        return Judgement(check, outcome, reason, MappingProxyType(facts))
+            return Judgement(check, Outcome.FAIL, reason, MappingProxyType(facts))
+        if ended is None:
+            return unreadable
+        if ended.exit_code != 0:
+            return Judgement(
+                check, Outcome.UNVERIFIED, "UNEXPECTED_EXIT", MappingProxyType({})
+            )
+        facts["exit_code"] = ended.exit_code
+        if ended.finished_at > started.deadline:
+            return Judgement(
+                check, Outcome.FAIL, "DEADLINE_EXCEEDED", MappingProxyType(facts)
+            )
+        return Judgement(check, Outcome.PASS, "", MappingProxyType(facts))
 
     def _inspect(self, started: _Started) -> dict[str, object]:
         data = self._docker.inspect_container(started.container_id)

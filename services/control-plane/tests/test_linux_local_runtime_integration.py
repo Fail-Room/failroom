@@ -269,6 +269,86 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
             )
             self.assertEqual(left.status_code, 202)
 
+    def test_an_expired_sandbox_is_removed_while_the_runtime_is_down(self) -> None:
+        """No Failroom process runs at the deadline, yet the sandbox is gone (~2 min)."""
+        environment = dict(os.environ)
+        environment["FAILROOM_DATABASE_PATH"] = str(
+            Path(self.database_temp.name) / "state.sqlite3"
+        )
+        # A short TTL brings the deadline quickly, a short interval the record.
+        environment["FAILROOM_ABSOLUTE_TTL_SECONDS"] = "60"
+        environment["FAILROOM_MAINTENANCE_INTERVAL_SECONDS"] = "5"
+        config = LocalRuntimeConfig.from_environment(environment)
+        headers = {"authorization": "Bearer " + self.token}
+        docker = config.controller.docker_cli()
+
+        with TestClient(
+            build_runtime(config, now=lambda: datetime.now(UTC)).app
+        ) as client:
+            entered = client.post(
+                "/v1/rooms/disk-full/attempts",
+                headers={**headers, "idempotency-key": "enter-" + uuid4().hex},
+            )
+            self.assertEqual(entered.status_code, 201)
+        attempt_id = entered.json()["attempt_id"]
+        expires_at = datetime.fromisoformat(entered.json()["expires_at"])
+
+        def room_sandboxes() -> tuple[str, ...]:
+            return docker.list_containers(
+                (
+                    "label=failroom.kind=diagnostic",
+                    "label=failroom.attempt_id=" + attempt_id,
+                )
+            )
+
+        try:
+            # Shutdown leaves an attempt that has not expired running.
+            (sandbox,) = room_sandboxes()
+            self.assertIs(docker.inspect_container(sandbox)["State"]["Running"], True)
+
+            # Nothing runs maintenance now; Docker removes the sandbox itself
+            # once PID 1 exits, before the deadline.
+            give_up = time.monotonic() + 90
+            while room_sandboxes() and time.monotonic() < give_up:
+                time.sleep(1)
+            self.assertEqual(room_sandboxes(), ())
+            self.assertLessEqual(datetime.now(UTC), expires_at)
+            time.sleep(max(0.0, (expires_at - datetime.now(UTC)).total_seconds()) + 1)
+
+            # Started again, the runtime records the absence it verifies.
+            with TestClient(
+                build_runtime(config, now=lambda: datetime.now(UTC)).app
+            ) as client:
+                give_up = time.monotonic() + 30
+                while True:
+                    status = client.get(
+                        "/v1/attempts/" + attempt_id + "/status", headers=headers
+                    )
+                    self.assertEqual(status.status_code, 200)
+                    if status.json()["state"] == "DESTROYED":
+                        break
+                    self.assertLess(time.monotonic(), give_up, status.json())
+                    time.sleep(1)
+        finally:
+            # Should Docker not remove it, leave nothing behind for other tests.
+            lifecycle = DockerDiagnosticLifecycle(
+                docker, config.controller.seccomp_policy_store()
+            )
+            for left in room_sandboxes():
+                data = docker.inspect_container(left)
+                if data is None:
+                    continue
+                labels = data["Config"]["Labels"]
+                lifecycle.destroy(
+                    DockerBinding(
+                        attempt_id,
+                        labels["failroom.sandbox_id"],
+                        int(labels["failroom.generation"]),
+                    ),
+                    left,
+                    operation_id=labels["failroom.operation_id"],
+                )
+
     def test_enter_rejects_unreviewed_and_unauthorized_rooms_without_state(
         self,
     ) -> None:

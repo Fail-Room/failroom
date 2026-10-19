@@ -155,15 +155,17 @@ every collector sandbox of this directory. It then creates a sentinel, a
 probe and a short-lived lifetime sandbox with the strict profile, except that
 the sentinel lives as long as the report is valid, and enters the Disk Full
 Room with a 20-second deadline into a scratch SQLite database in that
-directory. It runs the fixed probe and judges the twelve container checks. It
-drives the terminal service and Docker PTY runtime against the probe sandbox
-to check the output limit, the connection and session limits and disconnect
-cleanup, and checks that PID 1 stops the lifetime sandbox by its deadline.
-After the Room's deadline it builds a new store, cleanup worker and
-maintenance service from the scratch files alone, as a restarted control
-plane would, and checks that their maintenance removes the Room sandbox and
-records it destroyed; a sandbox they leave is removed directly and fails the
-check. It removes every sandbox and scratch file before printing; only the
+directory. It runs the fixed probe and judges the twelve container checks,
+then checks that PID 1 stops the lifetime sandbox by its deadline and that
+Docker removes it; Docker's event log keeps how and when it ended, and the
+check reads it before the terminal scenarios add more events. It drives the
+terminal service and Docker PTY runtime against the probe sandbox to check the
+output limit, the connection and session limits and disconnect cleanup.
+Docker removes the Room sandbox once its PID 1 exits. After the Room's
+deadline the collection builds a new store, cleanup worker and maintenance
+service from the scratch files alone, as a restarted control plane would, and
+checks that the Room sandbox is gone and their maintenance records it
+destroyed; a sandbox left behind is removed directly and fails the check. It removes every sandbox and scratch file before printing; only the
 lock and ID files stay. The output is one
 `QUALIFICATION_CONTEXT` line with the engine ID, boot ID, daemon epoch and
 digests; one `CHECK <check> <outcome> <observed_at> <evidence digest>` line per
@@ -247,7 +249,7 @@ by `StrictDockerProfile` as described in the
 | `FAILROOM_IO_DEVICE`, `FAILROOM_IO_READ_BPS`, `FAILROOM_IO_WRITE_BPS` | Docker host block device to throttle and its read and write limits. |
 | `FAILROOM_TERMINAL_OUTPUT_BYTES` | Cumulative terminal output limit, at most 1048576 because the WebSocket relay uses the same limit. |
 | `FAILROOM_CONNECTION_LIMIT`, `FAILROOM_SESSION_LIMIT` | Concurrent authorized terminal connections and open PTY sessions allowed per sandbox generation; a connection beyond either is closed with `4429`. |
-| `FAILROOM_ABSOLUTE_TTL_SECONDS` | Absolute attempt lifetime. The container's PID 1 exits no later than the attempt deadline. |
+| `FAILROOM_ABSOLUTE_TTL_SECONDS` | Absolute attempt lifetime. The container's PID 1 exits no later than the attempt deadline, and Docker then removes the container, also while the runtime is not running; the next maintenance pass records the absence. |
 | `FAILROOM_QUALIFICATION_MAX_AGE_SECONDS` | Report validity, 60–86400 seconds. The runtime refuses Room allocation once its report is this old. The collector's sentinel sandbox lives this long, even beyond `FAILROOM_ABSOLUTE_TTL_SECONDS`. |
 | `FAILROOM_TERMINAL_INPUT_BYTES` | Largest input frame, 1–1048576 and not larger than the frame limit. |
 | `FAILROOM_TERMINAL_SESSION_SECONDS` | Wall-clock PTY session limit, 1–3600. |
@@ -418,11 +420,11 @@ export FAILROOM_MAINTENANCE_LIMIT=10
 
 | Test module | Opt-in flag | What it proves |
 | --- | --- | --- |
-| `test_linux_docker_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Provisioning through the orchestrator, container hardening, Docker's init as PID 1 from a read-only mount, Leave and Reset cleanup with every generation absent afterwards, and a PID 1 that outlives 60 seconds and stops by the attempt deadline |
+| `test_linux_docker_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Provisioning through the orchestrator, container hardening, Docker's init as PID 1 from a read-only mount, Leave and Reset cleanup with every generation absent afterwards, and a PID 1 that outlives 60 seconds and stops by the attempt deadline, after which Docker removes the sandbox without a cleanup pass |
 | `test_linux_disk_full_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | The Disk Full filler reduces workspace capacity and recovery restores it; the test builds the Disk Full image itself |
 | `test_linux_terminal_integration.py` | `FAILROOM_TERMINAL_INTEGRATION=1` | Input and output, ANSI bytes, resize, Ctrl+C interruption, one-time capability replay denial, termination and reaping of the shell's session and background jobs after disconnect, and refusal with `4429` of a terminal beyond the profile's connection or session limit until one closes, through a real PTY |
-| `test_linux_qualification_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Report-only qualification: all eighteen checks pass on the strict profile and the restart scenario's Room sandbox is removed, stopped and running sandboxes and a Room sandbox a crashed collection left are removed, a second collection is refused while one holds the workspace, another workspace's sandbox is left alone, a container outside the profile fails the checks it violates, and no sandbox or scratch state remains |
-| `test_linux_local_runtime_integration.py` | `FAILROOM_LOCAL_RUNTIME_INTEGRATION=1` | Enter Room, capability, terminal, recovery verification, Reset Room, and Leave Room through the local app; denial of unreviewed and unauthorized Rooms, of a reused capability, and of a capability issued before a reset; reset maintenance; a terminal that stays responsive for 70 seconds; a report refreshed before it expires, with only the new sentinel left and Enter Room still admitted; and Room allocation that needs the live sentinel of the startup report, with a sentinel that outlives the attempt TTL, `qualify-local` refused while the runtime runs, and `ENTRY_FAILED` without any Docker call once the sentinel is gone |
+| `test_linux_qualification_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Report-only qualification: all eighteen checks pass on the strict profile and the restart scenario's Room sandbox is removed, a never-started and a running sandbox and a Room sandbox a crashed collection left are removed, a second collection is refused while one holds the workspace, another workspace's sandbox is left alone, a container outside the profile fails the checks it violates, and no sandbox or scratch state remains |
+| `test_linux_local_runtime_integration.py` | `FAILROOM_LOCAL_RUNTIME_INTEGRATION=1` | Enter Room, capability, terminal, recovery verification, Reset Room, and Leave Room through the local app; denial of unreviewed and unauthorized Rooms, of a reused capability, and of a capability issued before a reset; reset maintenance; a terminal that stays responsive for 70 seconds; a report refreshed before it expires, with only the new sentinel left and Enter Room still admitted; a sandbox Docker removes by its deadline while the runtime is stopped, recorded destroyed once the runtime starts again; and Room allocation that needs the live sentinel of the startup report, with a sentinel that outlives the attempt TTL, `qualify-local` refused while the runtime runs, and `ENTRY_FAILED` without any Docker call once the sentinel is gone |
 
 Run one module, or every module whose flags are set:
 

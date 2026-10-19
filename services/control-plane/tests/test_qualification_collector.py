@@ -10,7 +10,7 @@ from pathlib import Path
 from types import MappingProxyType
 from unittest import mock
 
-from failroom_sandbox.docker_cli import DockerError, EngineIdentity
+from failroom_sandbox.docker_cli import ContainerExit, DockerError, EngineIdentity
 from failroom_sandbox.docker_lifecycle import ContainerObservation, CreatedContainer
 from failroom_sandbox.docker_profile import (
     DockerBinding,
@@ -300,6 +300,51 @@ class FakeDocker:
         self.image_id = IMAGE_ID
         self.boot_id = BOOT_ID
         self.io_device = "7:0"
+        # When each sandbox's PID 1 exits: (clock seconds, exit code, removed).
+        self.clock: Clock | None = None
+        self.endings: dict[str, tuple[float, int, bool]] = {}
+        self.exits: dict[str, ContainerExit] = {}
+        self.record_exits = True
+        self.exit_error: Exception | None = None
+        self.on_exit_read = None
+
+    def end_later(
+        self, container_id: str, seconds: float, exit_code: int, *, removed: bool
+    ) -> None:
+        """PID 1 exits that long from now; Docker then removes the sandbox, or not."""
+        start = self.clock.value if self.clock is not None else 0.0
+        self.endings[container_id] = (start + seconds, exit_code, removed)
+
+    def settle(self) -> None:
+        """End every sandbox whose PID 1 is due, as Docker would."""
+        if self.clock is None:
+            return
+        for cid, (due, exit_code, removed) in list(self.endings.items()):
+            if self.clock.value < due:
+                continue
+            del self.endings[cid]
+            if cid not in self.containers:
+                continue
+            finished = NOW + timedelta(seconds=due)
+            if self.record_exits:
+                self.exits[cid] = ContainerExit(exit_code, finished)
+            if removed:
+                del self.containers[cid]
+            else:
+                self.containers[cid]["State"].update(
+                    Status="exited",
+                    Running=False,
+                    ExitCode=exit_code,
+                    FinishedAt=docker_time(finished),
+                )
+
+    def container_exit(self, container_id: str, *, since, until):
+        if self.on_exit_read is not None:
+            self.on_exit_read()
+        if self.exit_error is not None:
+            raise self.exit_error
+        self.settle()
+        return self.exits.get(container_id)
 
     def allocate(self) -> str:
         self.next_id += 1
@@ -338,6 +383,7 @@ class FakeDocker:
         return {"Id": self.image_id}
 
     def inspect_container(self, selector: str):
+        self.settle()
         return copy.deepcopy(self.containers.get(selector))
 
     def list_containers(self, filters):
@@ -361,6 +407,8 @@ class FakeLifecycle:
         self.sentinel_status = "running"
         # How the short-lived lifetime sandbox ends: (running, exit code, seconds).
         self.lifetime_end: tuple[bool, int, float] = (False, 0, 4.2)
+        # Whether Docker removes it once PID 1 exits, as the strict profile asks.
+        self.lifetime_removed = True
 
     def create_diagnostic(self, profile, binding, operation_id, *, lifetime):
         remaining = (lifetime.deadline - lifetime.now()).total_seconds()
@@ -370,15 +418,13 @@ class FakeLifecycle:
         if binding.sandbox_id.startswith("sentinel-"):
             data["State"]["Status"] = self.sentinel_status
             data["State"]["Running"] = self.sentinel_status == "running"
+        self.docker.containers[container_id] = data
         if binding.sandbox_id.startswith("lifetime-"):
             running, exit_code, ended = self.lifetime_end
-            data["State"].update(
-                Status="running" if running else "exited",
-                Running=running,
-                ExitCode=exit_code,
-                FinishedAt=docker_time(NOW + timedelta(seconds=ended)),
-            )
-        self.docker.containers[container_id] = data
+            if not running:
+                self.docker.end_later(
+                    container_id, ended, exit_code, removed=self.lifetime_removed
+                )
         self.created.append((binding, operation_id, lifetime, container_id))
         self.profiles.append(profile)
         return ContainerObservation(container_id, True, "sha256:" + "e" * 64)
@@ -496,6 +542,7 @@ class Harness:
         self.cleanup = FakeCleanup(self.docker)
         self.workspace = FakeWorkspace(self.scratch)
         self.clock = Clock()
+        self.docker.clock = self.clock
 
     def collector(self, *, max_age=timedelta(hours=1), workspace=None):
         return QualificationCollector(
@@ -705,6 +752,46 @@ class QualificationCollectorTests(unittest.TestCase):
                 result = self.result(collection, Check.ABSOLUTE_TTL)
                 self.assertIs(result.outcome, outcome)
                 self.assertEqual(collection.reasons.get(Check.ABSOLUTE_TTL, ""), reason)
+
+    def test_lifetime_scenario_requires_docker_to_remove_the_sandbox(self) -> None:
+        self.lifecycle.lifetime_removed = False
+
+        collection = self.collector().collect()
+
+        result = self.result(collection, Check.ABSOLUTE_TTL)
+        self.assertIs(result.outcome, Outcome.FAIL)
+        self.assertEqual(collection.reasons[Check.ABSOLUTE_TTL], "SANDBOX_NOT_REMOVED")
+        self.assertEqual(self.docker.containers, {})
+
+    def test_lifetime_exit_that_docker_cannot_show_is_unverified(self) -> None:
+        for name in ("no event", "events unavailable"):
+            with self.subTest(case=name):
+                self.setUp()
+                if name == "no event":
+                    self.docker.record_exits = False
+                else:
+                    self.docker.exit_error = DockerError("RUNTIME_UNAVAILABLE")
+
+                collection = self.collector().collect()
+
+                result = self.result(collection, Check.ABSOLUTE_TTL)
+                self.assertIs(result.outcome, Outcome.UNVERIFIED)
+                self.assertEqual(
+                    collection.reasons[Check.ABSOLUTE_TTL], "LIFETIME_UNREADABLE"
+                )
+
+    def test_lifetime_exit_is_read_before_the_terminal_scenarios(self) -> None:
+        # Docker keeps only its latest events, and the scenarios add many.
+        opened_when_read: list[int] = []
+        self.docker.on_exit_read = lambda: opened_when_read.append(
+            len(self.harness.terminal.opened)
+        )
+
+        collection = self.collector().collect()
+
+        self.assertEqual(opened_when_read, [0])
+        self.assertTrue(self.harness.terminal.opened)
+        self.assertIs(self.result(collection, Check.ABSOLUTE_TTL).outcome, Outcome.PASS)
 
     def test_terminal_scenario_failure_is_unverified_not_fatal(self) -> None:
         with mock.patch.object(

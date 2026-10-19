@@ -5,7 +5,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -152,27 +151,26 @@ class LinuxQualificationIntegrationTests(unittest.TestCase):
 
     def test_sandboxes_left_by_a_crashed_collection_are_removed(self) -> None:
         leftovers = []
-        # PID 1 of the first exits on its own after two seconds, as after a
-        # crash; the second still runs when the next collection starts.
-        for name, seconds in (("probe-stopped-", 13), ("sentinel-running-", 120)):
+        # The first was created but never started, as after a crash between
+        # the two: Docker removes a sandbox only once its PID 1 has run. The
+        # second still runs when the next collection starts.
+        for name, start in (("probe-created-", False), ("sentinel-running-", True)):
             binding = DockerBinding(self.attempt(), name + uuid4().hex[:12], 1)
             operation = uuid4().hex
-            created = self.lifecycle.create_diagnostic(
-                self.profile,
-                binding,
-                operation,
-                lifetime=ContainerLifetime(_now() + timedelta(seconds=seconds), _now),
-            )
-            leftovers.append((binding, created.container_id, operation))
+            lifetime = ContainerLifetime(_now() + timedelta(seconds=120), _now)
+            if start:
+                container_id = self.lifecycle.create_diagnostic(
+                    self.profile, binding, operation, lifetime=lifetime
+                ).container_id
+            else:
+                with self.lifecycle.prepare(
+                    self.profile, binding, operation, lifetime=lifetime
+                ) as prepared:
+                    container_id = prepared.create_verified().container_id
+            leftovers.append((binding, container_id, operation))
         try:
-            stopped = leftovers[0][1]
-            deadline = time.monotonic() + 30
-            while time.monotonic() < deadline:
-                data = self.cli.inspect_container(stopped)
-                if data is not None and data["State"]["Running"] is False:
-                    break
-                time.sleep(0.5)
-            self.assertIs(data["State"]["Running"], False)
+            created = self.cli.inspect_container(leftovers[0][1])
+            self.assertEqual(created["State"]["Status"], "created")
             running = self.cli.inspect_container(leftovers[1][1])
             self.assertIs(running["State"]["Running"], True)
 
