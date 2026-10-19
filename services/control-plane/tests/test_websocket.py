@@ -1,5 +1,9 @@
+import asyncio
+import json
 import queue
+import threading
 import unittest
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 from failroom_sandbox.terminal_gateway import GatewayAttachment, GatewayError
@@ -12,6 +16,7 @@ from failroom_control_plane.terminal import TerminalError
 from failroom_control_plane.websocket import (
     WebSocketLimits,
     mount_terminal_route,
+    serve_terminal,
 )
 
 
@@ -19,6 +24,7 @@ class RecordingSession:
     def __init__(self) -> None:
         self._output: queue.Queue[bytes] = queue.Queue()
         self.closed = 0
+        self.ended = threading.Event()
 
     def read(self, maximum: int) -> bytes:
         try:
@@ -38,6 +44,28 @@ class RecordingSession:
 
     def close(self) -> None:
         self.closed += 1
+        self.ended.set()
+
+
+class GatedSession(RecordingSession):
+    """A session whose first read blocks until the test opens the gate."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reading = threading.Event()
+        self.gate = threading.Event()
+        self.order: list[str] = []
+
+    def read(self, maximum: int) -> bytes:
+        if not self.reading.is_set():
+            self.reading.set()
+            self.gate.wait(5)
+            self.order.append("read")
+        return b""
+
+    def close(self) -> None:
+        self.order.append("close")
+        super().close()
 
 
 class RecordingGateway:
@@ -88,6 +116,42 @@ class RecordingTerminal:
         if self.attach_error is not None:
             raise self.attach_error
         return self.session
+
+
+class SlowAttachTerminal(RecordingTerminal):
+    """A terminal whose attach returns only when the test opens the gate."""
+
+    def __init__(self, session: RecordingSession) -> None:
+        super().__init__(session)
+        self.attaching = threading.Event()
+        self.gate = threading.Event()
+
+    def attach(self, lease: AttachmentLease) -> RecordingSession:
+        self.attaching.set()
+        self.gate.wait(5)
+        return super().attach(lease)
+
+
+class ScriptedSocket:
+    """Hands serve_terminal the frames a test queues, then waits for more."""
+
+    def __init__(self) -> None:
+        self.frames: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        self.on_frame: Callable[[dict[str, object]], None] = lambda frame: None
+
+    async def accept(self) -> None:
+        return None
+
+    async def receive(self) -> dict[str, object]:
+        frame = await self.frames.get()
+        self.on_frame(frame)
+        return {"type": "websocket.receive", "text": json.dumps(frame)}
+
+    async def send_json(self, payload: dict[str, str]) -> None:
+        return None
+
+    async def close(self, code: int = 1000) -> None:
+        return None
 
 
 class WebSocketTests(unittest.TestCase):
@@ -143,8 +207,105 @@ class WebSocketTests(unittest.TestCase):
 
         self.assertEqual(len(self.gateway.calls), 1)
         self.assertEqual(len(self.terminal.leases), 1)
+        # Leaving the block cancels the connection task, so the close may
+        # still be finishing on the connection's own thread.
+        self.assertTrue(self.session.ended.wait(5))
         self.assertEqual(self.session.closed, 1)
         self.assertEqual([a.released for a in self.terminal.admissions], [1])
+
+    def test_a_client_that_leaves_without_closing_still_closes_the_session(
+        self,
+    ) -> None:
+        with self.client.websocket_connect("/v1/terminal") as socket:
+            socket.send_json({"type": "authorize", "capability": "secret-capability"})
+            self.assertEqual(socket.receive_json(), {"type": "authorized"})
+
+        self.assertTrue(self.session.ended.wait(5))
+        self.assertEqual(self.session.closed, 1)
+        self.assertEqual([a.released for a in self.terminal.admissions], [1])
+
+    def _serve(self, socket: ScriptedSocket, terminal) -> asyncio.Task[None]:
+        return asyncio.create_task(
+            serve_terminal(
+                socket, self.gateway, terminal, self.limits, lambda: self.now
+            )
+        )
+
+    def test_a_task_cancelled_during_cleanup_still_closes_the_session(
+        self,
+    ) -> None:
+        async def scenario() -> None:
+            socket = ScriptedSocket()
+            task = self._serve(socket, self.terminal)
+
+            def cancel_once_closing(frame: dict[str, object]) -> None:
+                # Lands on the first await of the cleanup.
+                if frame["type"] == "close":
+                    asyncio.get_running_loop().call_soon(task.cancel)
+
+            socket.on_frame = cancel_once_closing
+            await socket.frames.put(
+                {"type": "authorize", "capability": "secret-capability"}
+            )
+            await socket.frames.put({"type": "close"})
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(scenario())
+        self.assertTrue(self.session.ended.wait(5))
+        self.assertEqual(self.session.closed, 1)
+        self.assertEqual([a.released for a in self.terminal.admissions], [1])
+
+    def test_a_task_cancelled_while_attaching_closes_what_it_attached(
+        self,
+    ) -> None:
+        terminal = SlowAttachTerminal(self.session)
+
+        async def scenario() -> None:
+            socket = ScriptedSocket()
+            task = self._serve(socket, terminal)
+            await socket.frames.put(
+                {"type": "authorize", "capability": "secret-capability"}
+            )
+            self.assertTrue(await asyncio.to_thread(terminal.attaching.wait, 5))
+            task.cancel()
+            # A task cancelled once still waits in its cleanup for the close,
+            # which runs after the attach returns.
+            terminal.gate.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(scenario())
+        self.assertTrue(self.session.ended.wait(5))
+        self.assertEqual(self.session.closed, 1)
+        self.assertEqual([a.released for a in terminal.admissions], [1])
+
+    def test_the_close_waits_for_a_running_read_even_when_cancelled(
+        self,
+    ) -> None:
+        session = GatedSession()
+        terminal = RecordingTerminal(session)
+
+        async def scenario() -> None:
+            socket = ScriptedSocket()
+            task = self._serve(socket, terminal)
+            await socket.frames.put(
+                {"type": "authorize", "capability": "secret-capability"}
+            )
+            self.assertTrue(await asyncio.to_thread(session.reading.wait, 5))
+            await socket.frames.put({"type": "close"})
+            # The cleanup now waits for the close, queued behind the read.
+            await asyncio.sleep(0.1)
+            self.assertEqual(session.order, [])
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            session.gate.set()
+
+        asyncio.run(scenario())
+        self.assertTrue(session.ended.wait(5))
+        self.assertEqual(session.order, ["read", "close"])
+        self.assertEqual([a.released for a in terminal.admissions], [1])
 
     def test_connection_beyond_the_limit_is_closed_before_attach(self) -> None:
         self.terminal.admit_error = TerminalError("LIMIT_REACHED")

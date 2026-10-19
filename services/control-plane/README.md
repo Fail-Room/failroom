@@ -71,7 +71,11 @@ accepts one bounded JSON authorization frame, calls the gateway once, and then
 relays only bounded `input`, `resize`, `signal`, and `close` frames. It closes
 the PTY session on every disconnect, which also stops the shell's processes
 inside the sandbox, and never returns capability or provider details in
-WebSocket errors.
+WebSocket errors. Each connection makes its PTY calls in order on a thread of
+its own and queues the close there without waiting, behind any read or write
+still running, so a connection whose task is cancelled, as when a server shuts
+down or a test client leaves its socket, still closes the PTY session and frees
+its session slot.
 
 The route is available only when `create_app()` receives the optional terminal
 dependencies (or when `mount_terminal_route()` is called directly). This is a
@@ -449,7 +453,7 @@ export FAILROOM_MAINTENANCE_LIMIT=10
 | --- | --- | --- |
 | `test_linux_docker_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Provisioning through the orchestrator, container hardening, Docker's init as PID 1 from a read-only mount, Leave and Reset cleanup with every generation absent afterwards, and a PID 1 that outlives 60 seconds and stops by the attempt deadline, after which Docker removes the sandbox without a cleanup pass |
 | `test_linux_disk_full_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | The Disk Full filler reduces workspace capacity and recovery restores it; the test builds the Disk Full image itself |
-| `test_linux_terminal_integration.py` | `FAILROOM_TERMINAL_INTEGRATION=1` | Input and output, ANSI bytes, resize, Ctrl+C interruption, one-time capability replay denial, termination and reaping of the shell's session and background jobs after disconnect, and refusal with `4429` of a terminal beyond the profile's connection or session limit until one closes, through a real PTY |
+| `test_linux_terminal_integration.py` | `FAILROOM_TERMINAL_INTEGRATION=1` | Input and output, ANSI bytes, resize, Ctrl+C interruption, one-time capability replay denial, termination and reaping of the shell's session and background jobs after disconnect, also when the client leaves without a close frame, after which the freed session slot admits a new terminal, and refusal with `4429` of a terminal beyond the profile's connection or session limit until one closes, through a real PTY |
 | `test_linux_qualification_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Report-only qualification: all eighteen checks pass on the strict profile and the restart scenario's Room sandbox is removed, a never-started and a running sandbox and a Room sandbox a crashed collection left are removed, a second collection is refused while one holds the workspace, another workspace's sandbox is left alone, a container outside the profile fails the checks it violates, and no sandbox or scratch state remains |
 | `test_linux_local_runtime_integration.py` | `FAILROOM_LOCAL_RUNTIME_INTEGRATION=1` | Enter Room, capability, terminal, recovery verification, Reset Room, and Leave Room through the local app; a browser session that signs in with the bearer token, reaches the terminal with only its cookie and the runtime's origin, and signs out; denial of unreviewed and unauthorized Rooms, of a reused capability, and of a capability issued before a reset; reset maintenance; a terminal that stays responsive for 70 seconds; a report refreshed before it expires, with only the new sentinel left and Enter Room still admitted; a sandbox Docker removes by its deadline while the runtime is stopped, recorded destroyed once the runtime starts again; and Room allocation that needs the live sentinel of the startup report, with a sentinel that outlives the attempt TTL, `qualify-local` refused while the runtime runs, and `ENTRY_FAILED` without any Docker call once the sentinel is gone |
 

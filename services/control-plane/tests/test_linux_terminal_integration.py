@@ -272,6 +272,22 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
                 return
         raise AssertionError("terminal close not observed")
 
+    def _authorize_once_a_session_frees(self, receipt) -> None:
+        """Authorize a terminal, retrying while a closing session holds the slot."""
+        deadline = time.monotonic() + 15
+        while True:
+            with TestClient(self._app()).websocket_connect("/v1/terminal") as socket:
+                socket.send_json(self._authorize(receipt))
+                try:
+                    self.assertEqual(socket.receive_json(), {"type": "authorized"})
+                except WebSocketDisconnect as refused:
+                    self.assertEqual(refused.code, 4429)
+                else:
+                    self._close_and_wait(socket)
+                    return
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.25)
+
     @staticmethod
     def _processes(container_id: str) -> list[tuple[str, str, str, str]]:
         """Return (pid, state, session, command) for processes in the sandbox."""
@@ -447,6 +463,53 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
                     break
                 time.sleep(0.25)
             self.assertEqual(leftover, [])
+        finally:
+            self._cleanup(receipt)
+
+    def test_a_client_that_leaves_without_closing_ends_the_shell_session(
+        self,
+    ) -> None:
+        receipt = self._provision()
+        try:
+            issued = self.authority.issue(
+                self.user,
+                receipt.attempt_id,
+                now=lambda: self.now,
+            )
+            resource = self.control.inspect(self.control_identity, receipt.ref)
+            container_id = resource.container_id
+            with TestClient(self._app()).websocket_connect("/v1/terminal") as socket:
+                socket.send_json({"type": "authorize", "capability": issued.token})
+                self.assertEqual(socket.receive_json(), {"type": "authorized"})
+                socket.send_json(
+                    {
+                        "type": "input",
+                        "data": (
+                            "sleep 1000 & "
+                            "printf '\\033[32mFAILROOM_SHELL=%s\\033[0m\\n' $$\n"
+                        ),
+                    }
+                )
+                output = self._receive_until(
+                    socket, "FAILROOM_SHELL=", required_fragment="\x1b[32m"
+                )
+                match = re.search(r"FAILROOM_SHELL=([0-9]+)", output)
+                self.assertIsNotNone(match)
+                shell = match.group(1)
+            # Leaving without a close frame cancels the connection task; the
+            # close still ends the shell's session and frees its session slot.
+            deadline = time.monotonic() + 15
+            while True:
+                leftover = [
+                    process
+                    for process in self._processes(container_id)
+                    if process[2] == shell
+                ]
+                if not leftover or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.25)
+            self.assertEqual(leftover, [])
+            self._authorize_once_a_session_frees(receipt)
         finally:
             self._cleanup(receipt)
 
