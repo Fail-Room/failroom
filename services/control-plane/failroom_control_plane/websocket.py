@@ -3,6 +3,7 @@
 import asyncio
 import json
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, runtime_checkable
@@ -75,6 +76,48 @@ class _FrameError(Exception):
         super().__init__(code)
 
 
+class _ConnectionCalls:
+    """Run one connection's terminal calls in order on a thread of its own.
+
+    The close is queued behind every call already queued, so it never overlaps
+    the last read or write. It is queued without awaiting, so a connection task
+    that is cancelled, by a server shutting down or a test client leaving its
+    socket, still closes the session it attached, exactly once.
+    """
+
+    def __init__(self) -> None:
+        self._thread = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="failroom-terminal"
+        )
+        self._attached: Future[TerminalSession] | None = None
+        self._closed: Future[None] | None = None
+
+    def attach(
+        self, terminal: TerminalAttachmentProtocol, lease: AttachmentLease
+    ) -> asyncio.Future[TerminalSession]:
+        self._attached = self._thread.submit(terminal.attach, lease)
+        return asyncio.wrap_future(self._attached)
+
+    def run[T](self, call: Callable[..., T], *args: object) -> asyncio.Future[T]:
+        return asyncio.wrap_future(self._thread.submit(call, *args))
+
+    def close(self) -> asyncio.Future[None]:
+        """Queue the close once; cancelling the returned future does not stop it."""
+        if self._closed is None:
+            self._closed = self._thread.submit(self._close_attached)
+            self._thread.shutdown(wait=False)
+        return asyncio.shield(asyncio.wrap_future(self._closed))
+
+    def _close_attached(self) -> None:
+        attached = self._attached
+        if attached is None or attached.cancelled() or attached.exception() is not None:
+            return
+        try:
+            attached.result().close()
+        except Exception:
+            pass
+
+
 def _object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -129,6 +172,7 @@ async def serve_terminal(
     disconnected = False
     requested_close_code: int | None = None
     admission: TerminalAdmission | None = None
+    calls: _ConnectionCalls | None = None
     session: TerminalSession | None = None
     output_task: asyncio.Task[None] | None = None
 
@@ -150,11 +194,11 @@ async def serve_terminal(
             await websocket.send_json(payload)
 
     async def relay_output() -> None:
-        if session is None:
+        if session is None or calls is None:
             return
         while True:
             try:
-                data = await asyncio.to_thread(session.read, limits.max_output_bytes)
+                data = await calls.run(session.read, limits.max_output_bytes)
             except (PtyError, TerminalError, OSError):
                 await close_once(1011)
                 return
@@ -214,7 +258,8 @@ async def serve_terminal(
         # it counts against that sandbox's connection limit from here on.
         try:
             admission = terminal.admit(attachment.lease)
-            session = await asyncio.to_thread(terminal.attach, attachment.lease)
+            calls = _ConnectionCalls()
+            session = await calls.attach(terminal, attachment.lease)
         except TerminalError as error:
             await close_once(_TERMINAL_CLOSE_CODES.get(error.code, 1011))
             return
@@ -248,7 +293,7 @@ async def serve_terminal(
                     await close_once(4409)
                     break
                 try:
-                    await asyncio.to_thread(session.write, data.encode("utf-8"))
+                    await calls.run(session.write, data.encode("utf-8"))
                 except (PtyError, TerminalError, OSError):
                     await close_once(1011)
                     break
@@ -268,7 +313,7 @@ async def serve_terminal(
                     await close_once(4400)
                     break
                 try:
-                    await asyncio.to_thread(session.resize, rows, columns)
+                    await calls.run(session.resize, rows, columns)
                 except (PtyError, TerminalError, OSError):
                     await close_once(1011)
                     break
@@ -282,7 +327,7 @@ async def serve_terminal(
                     await close_once(4400)
                     break
                 try:
-                    await asyncio.to_thread(session.signal, value)
+                    await calls.run(session.signal, value)
                 except (PtyError, TerminalError, OSError):
                     await close_once(1011)
                     break
@@ -296,12 +341,13 @@ async def serve_terminal(
         try:
             if output_task is not None:
                 output_task.cancel()
+            # Queued before any await, so a cancellation from here on cannot
+            # stop the close.
+            closed = calls.close() if calls is not None else None
+            if output_task is not None:
                 await asyncio.gather(output_task, return_exceptions=True)
-            if session is not None:
-                try:
-                    await asyncio.to_thread(session.close)
-                except Exception:
-                    pass
+            if closed is not None:
+                await closed
             if not disconnected:
                 await close_once(requested_close_code or 1000)
         finally:
