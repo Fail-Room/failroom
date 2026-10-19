@@ -114,20 +114,22 @@ class WebSocketTests(unittest.TestCase):
         self.gateway = RecordingGateway(GatewayAttachment(consumed, lease))
         self.terminal = RecordingTerminal(self.session)
         self.app = FastAPI()
+        self.limits = WebSocketLimits(
+            authorization_timeout_seconds=1,
+            max_frame_bytes=4096,
+            max_input_bytes=1024,
+            max_output_bytes=4096,
+            max_rows=100,
+            max_columns=200,
+            poll_interval_seconds=0.001,
+        )
         mount_terminal_route(
             self.app,
             gateway=self.gateway,
             terminal=self.terminal,
-            limits=WebSocketLimits(
-                authorization_timeout_seconds=1,
-                max_frame_bytes=4096,
-                max_input_bytes=1024,
-                max_output_bytes=4096,
-                max_rows=100,
-                max_columns=200,
-                poll_interval_seconds=0.001,
-            ),
+            limits=self.limits,
             now=lambda: self.now,
+            origins=frozenset({"http://testserver"}),
         )
         self.client = TestClient(self.app)
 
@@ -191,6 +193,41 @@ class WebSocketTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 4403)
         self.assertNotIn("secret-capability", str(raised.exception))
         self.assertEqual(self.terminal.admissions, [])
+
+    def test_a_handshake_from_another_origin_closes_before_authorization(
+        self,
+    ) -> None:
+        for origin in ("http://attacker.example", "null"):
+            with self.subTest(origin=origin):
+                with self.assertRaises(WebSocketDisconnect) as raised:
+                    with self.client.websocket_connect(
+                        "/v1/terminal", headers={"origin": origin}
+                    ):
+                        pass
+                self.assertEqual(raised.exception.code, 1008)
+        self.assertEqual(self.gateway.calls, [])
+
+    def test_a_handshake_from_the_runtime_origin_is_served(self) -> None:
+        with self.client.websocket_connect(
+            "/v1/terminal", headers={"origin": "http://testserver"}
+        ) as socket:
+            socket.send_json({"type": "authorize", "capability": "secret-capability"})
+            self.assertEqual(socket.receive_json(), {"type": "authorized"})
+            socket.send_json({"type": "close"})
+
+        self.assertEqual(len(self.gateway.calls), 1)
+
+    def test_terminal_origins_are_explicit(self) -> None:
+        for origins in (None, {"http://testserver"}, frozenset({""})):
+            with self.subTest(origins=origins), self.assertRaises(ValueError):
+                mount_terminal_route(
+                    FastAPI(),
+                    gateway=self.gateway,
+                    terminal=self.terminal,
+                    limits=self.limits,
+                    now=lambda: self.now,
+                    origins=origins,
+                )
 
 
 if __name__ == "__main__":

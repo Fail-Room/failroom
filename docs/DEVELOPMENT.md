@@ -6,7 +6,7 @@ Phase 0 established the product and engineering contracts. The repository now co
 
 - `services/sandbox-engine/`: profile qualification, the verified diagnostic Docker lifecycle, the bounded Docker PTY primitive, the terminal gateway authority coordinator, and the Disk Full scenario runtime.
 - `packages/state-store/`: SQLite repositories for attempt authority, resource lifecycle, capability consumption, attachment leases and reset generations, plus the injected cleanup pass.
-- `services/api/`: the bounded capability codec, the backend capability authority facade, and the bearer identity verifier.
+- `services/api/`: the bounded capability codec, the backend capability authority facade, the bearer identity verifier, and in-memory browser sessions.
 - `services/control-plane/`: the trusted composition; HTTP and WebSocket routes for Enter Room, Room Status, the terminal, Reset Room, recovery verification and Leave Room; and the operator-only local runtime (`serve-local`).
 
 The local runtime binds only to a loopback address and serves one local operator. It collects a qualification report covering all eighteen required checks when it starts and provisions Disk Full Room sandboxes only while that report passes for the live runtime, as [SECURITY.md](SECURITY.md) requires. Once that report is half as old as its validity, the runtime collects a new one in the background and keeps allocating on the current report meanwhile. It must not be offered to learners or other users. There is no web application, browser terminal UI, production authentication, deployment, or production service. Installing or testing these packages creates no persistent service database.
@@ -59,7 +59,7 @@ Commands:
 - uv run --locked ruff format --check .
 - uv run --locked mypy failroom_api
 
-This package issues and verifies bounded HMAC capability claims, delegates atomic `jti` consumption to the state store, and verifies explicitly configured bearer credentials. Existing databases must be migrated explicitly to schema v4, one version at a time, each with a new absolute backup path; the control-plane README documents the `migrate` command.
+This package issues and verifies bounded HMAC capability claims, delegates atomic `jti` consumption to the state store, verifies explicitly configured bearer credentials, and keeps the browser sessions they open. Existing databases must be migrated explicitly to schema v4, one version at a time, each with a new absolute backup path; the control-plane README documents the `migrate` command.
 
 ## Delivery Principles
 

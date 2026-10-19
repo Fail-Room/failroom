@@ -40,6 +40,17 @@ def _required(name: str) -> str:
     return value
 
 
+def _base_url(config: LocalRuntimeConfig) -> str:
+    # The runtime refuses a Host that does not name its own listener.
+    host = f"[{config.bind_host}]" if ":" in config.bind_host else config.bind_host
+    return f"http://{host}:{config.bind_port}"
+
+
+def _terminal_url(config: LocalRuntimeConfig) -> str:
+    # TestClient names its own host for a relative WebSocket path.
+    return "ws" + _base_url(config).removeprefix("http") + "/v1/terminal"
+
+
 @unittest.skipUnless(
     os.environ.get("FAILROOM_LOCAL_RUNTIME_INTEGRATION") == "1",
     "UNVERIFIED: opt-in required",
@@ -97,7 +108,7 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
         runtime = build_runtime(config, now=lambda: datetime.now(UTC))
         headers = {"authorization": "Bearer " + self.token}
 
-        with TestClient(runtime.app) as client:
+        with TestClient(runtime.app, base_url=_base_url(config)) as client:
             attempt_id: str | None = None
             try:
                 entered = client.post(
@@ -113,7 +124,7 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
                 )
                 self.assertEqual(capability.status_code, 200)
 
-                with client.websocket_connect("/v1/terminal") as socket:
+                with client.websocket_connect(_terminal_url(config)) as socket:
                     socket.send_json(
                         {
                             "type": "authorize",
@@ -148,6 +159,70 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
                     )
                     self.assertEqual(left.status_code, 202)
 
+    def test_a_browser_session_reaches_the_terminal_from_the_runtime_origin(
+        self,
+    ) -> None:
+        environment = dict(os.environ)
+        environment["FAILROOM_DATABASE_PATH"] = str(
+            Path(self.database_temp.name) / "state.sqlite3"
+        )
+        config = LocalRuntimeConfig.from_environment(environment)
+        runtime = build_runtime(config, now=lambda: datetime.now(UTC))
+        origin = {"origin": _base_url(config)}
+
+        with TestClient(runtime.app, base_url=_base_url(config)) as client:
+            signed_in = client.post(
+                "/v1/session",
+                headers={"authorization": "Bearer " + self.token, **origin},
+            )
+            self.assertEqual(signed_in.status_code, 201)
+            attempt_id: str | None = None
+            try:
+                # From here on only the cookie and the page's origin authenticate.
+                entered = client.post(
+                    "/v1/rooms/disk-full/attempts",
+                    headers={"idempotency-key": "enter-" + uuid4().hex, **origin},
+                )
+                self.assertEqual(entered.status_code, 201)
+                attempt_id = entered.json()["attempt_id"]
+                capability = client.post(
+                    "/v1/attempts/" + attempt_id + "/terminal-capability",
+                    headers=origin,
+                )
+                self.assertEqual(capability.status_code, 200)
+
+                with client.websocket_connect(
+                    _terminal_url(config), headers=origin
+                ) as socket:
+                    socket.send_json(
+                        {
+                            "type": "authorize",
+                            "capability": capability.json()["capability"],
+                        }
+                    )
+                    self.assertEqual(socket.receive_json(), {"type": "authorized"})
+                    suffix = uuid4().hex
+                    # The shell prints the marker only by running the command.
+                    socket.send_json(
+                        {
+                            "type": "input",
+                            "data": f"printf 'FAILROOM_BROWSER_%s\\n' {suffix}\n",
+                        }
+                    )
+                    self._receive_until(socket, "FAILROOM_BROWSER_" + suffix)
+                    socket.send_json({"type": "close"})
+            finally:
+                if attempt_id is not None:
+                    left = client.post(
+                        "/v1/attempts/" + attempt_id + "/leave",
+                        headers={"idempotency-key": "leave-" + uuid4().hex, **origin},
+                    )
+                    self.assertEqual(left.status_code, 202)
+            signed_out = client.delete("/v1/session", headers=origin)
+            self.assertEqual(signed_out.status_code, 204)
+            status = client.get("/v1/attempts/" + str(attempt_id) + "/status")
+            self.assertEqual(status.status_code, 401)
+
     def test_room_allocation_needs_the_live_sentinel_of_a_passing_report(
         self,
     ) -> None:
@@ -160,7 +235,7 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
         headers = {"authorization": "Bearer " + self.token}
         docker = config.controller.docker_cli()
 
-        with TestClient(runtime.app) as client:
+        with TestClient(runtime.app, base_url=_base_url(config)) as client:
             self.assertTrue(runtime.qualification.decide().allowed)
             # serve-local holds the workspace, so a report-only collection
             # against the same database is refused before any Docker call.
@@ -230,7 +305,7 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
         headers = {"authorization": "Bearer " + self.token}
         docker = config.controller.docker_cli()
 
-        with TestClient(runtime.app) as client:
+        with TestClient(runtime.app, base_url=_base_url(config)) as client:
             attempt = qualification_attempt(
                 workspace_id(Path(self.database_temp.name) / WORKSPACE_NAME)
             )
@@ -283,7 +358,8 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
         docker = config.controller.docker_cli()
 
         with TestClient(
-            build_runtime(config, now=lambda: datetime.now(UTC)).app
+            build_runtime(config, now=lambda: datetime.now(UTC)).app,
+            base_url=_base_url(config),
         ) as client:
             entered = client.post(
                 "/v1/rooms/disk-full/attempts",
@@ -317,7 +393,8 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
 
             # Started again, the runtime records the absence it verifies.
             with TestClient(
-                build_runtime(config, now=lambda: datetime.now(UTC)).app
+                build_runtime(config, now=lambda: datetime.now(UTC)).app,
+                base_url=_base_url(config),
             ) as client:
                 give_up = time.monotonic() + 30
                 while True:
@@ -361,7 +438,7 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
         runtime = build_runtime(config, now=lambda: datetime.now(UTC))
         headers = {"authorization": "Bearer " + self.token}
 
-        with TestClient(runtime.app) as client:
+        with TestClient(runtime.app, base_url=_base_url(config)) as client:
             unreviewed = client.post(
                 "/v1/rooms/scenario-less-room/attempts",
                 headers={**headers, "idempotency-key": "enter-" + uuid4().hex},
@@ -401,7 +478,7 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
         runtime = build_runtime(config, now=lambda: datetime.now(UTC))
         headers = {"authorization": "Bearer " + self.token}
 
-        with TestClient(runtime.app) as client:
+        with TestClient(runtime.app, base_url=_base_url(config)) as client:
             attempt_id: str | None = None
             try:
                 entered = client.post(
@@ -416,7 +493,7 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
                 )
                 self.assertEqual(capability.status_code, 200)
 
-                with client.websocket_connect("/v1/terminal") as socket:
+                with client.websocket_connect(_terminal_url(config)) as socket:
                     socket.send_json(
                         {
                             "type": "authorize",
@@ -460,7 +537,7 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
         runtime = build_runtime(config, now=lambda: datetime.now(UTC))
         headers = {"authorization": "Bearer " + self.token}
 
-        with TestClient(runtime.app) as client:
+        with TestClient(runtime.app, base_url=_base_url(config)) as client:
             attempt_id: str | None = None
             try:
                 entered = client.post(
@@ -491,7 +568,7 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
                 )
                 self.assertEqual(capability.status_code, 200)
 
-                with client.websocket_connect("/v1/terminal") as socket:
+                with client.websocket_connect(_terminal_url(config)) as socket:
                     socket.send_json(
                         {
                             "type": "authorize",
@@ -558,7 +635,7 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
         runtime = build_runtime(config, now=lambda: datetime.now(UTC))
         headers = {"authorization": "Bearer " + self.token}
 
-        with TestClient(runtime.app) as client:
+        with TestClient(runtime.app, base_url=_base_url(config)) as client:
             attempt_id: str | None = None
             try:
                 entered = client.post(
@@ -575,12 +652,12 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
                 self.assertEqual(capability.status_code, 200)
                 token = capability.json()["capability"]
 
-                with client.websocket_connect("/v1/terminal") as socket:
+                with client.websocket_connect(_terminal_url(config)) as socket:
                     socket.send_json({"type": "authorize", "capability": token})
                     self.assertEqual(socket.receive_json(), {"type": "authorized"})
                     socket.send_json({"type": "close"})
 
-                with client.websocket_connect("/v1/terminal") as socket:
+                with client.websocket_connect(_terminal_url(config)) as socket:
                     socket.send_json({"type": "authorize", "capability": token})
                     with self.assertRaises(WebSocketDisconnect) as raised:
                         socket.receive_json()
@@ -605,7 +682,7 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
         runtime = build_runtime(config, now=lambda: datetime.now(UTC))
         headers = {"authorization": "Bearer " + self.token}
 
-        with TestClient(runtime.app) as client:
+        with TestClient(runtime.app, base_url=_base_url(config)) as client:
             attempt_id: str | None = None
             try:
                 entered = client.post(
@@ -628,7 +705,7 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
                 self.assertEqual(reset.status_code, 202)
                 self.assertEqual(reset.json()["state"], "RESETTING")
 
-                with client.websocket_connect("/v1/terminal") as socket:
+                with client.websocket_connect(_terminal_url(config)) as socket:
                     socket.send_json(
                         {
                             "type": "authorize",
@@ -658,7 +735,7 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
         runtime = build_runtime(config, now=lambda: datetime.now(UTC))
         headers = {"authorization": "Bearer " + self.token}
 
-        with TestClient(runtime.app) as client:
+        with TestClient(runtime.app, base_url=_base_url(config)) as client:
             attempt_id: str | None = None
             try:
                 entered = client.post(

@@ -236,6 +236,7 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
             terminal=self.terminal,
             limits=self.websocket_limits,
             now=lambda: self.now,
+            origins=frozenset({"http://testserver"}),
         )
         return app
 

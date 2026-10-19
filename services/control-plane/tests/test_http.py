@@ -11,6 +11,7 @@ from failroom_api import (
     BackendCapabilityAuthority,
     BearerCredential,
     BearerIdentityVerifier,
+    BrowserSessionAuthority,
     CapabilityCodec,
 )
 from failroom_sandbox.scenario_runtime import ScenarioObservation
@@ -27,6 +28,7 @@ from failroom_state import (
 )
 from fastapi.testclient import TestClient
 
+from failroom_control_plane.browser import LoopbackOrigin
 from failroom_control_plane.entry import RoomEntryService
 from failroom_control_plane.http import create_app
 from failroom_control_plane.lifecycle import RoomLifecycleService
@@ -168,11 +170,19 @@ class CapabilityHttpTests(unittest.TestCase):
             },
             now=lambda: self.now,
         )
+        self.origin = LoopbackOrigin(
+            frozenset({"testserver"}), frozenset({"http://testserver"})
+        )
+        self.sessions = BrowserSessionAuthority(
+            lifetime=timedelta(minutes=30), max_sessions=4, now=lambda: self.now
+        )
         self.client = TestClient(
             create_app(
                 authority=self.authority,
                 verifier=self.verifier,
+                origin=self.origin,
                 now=lambda: self.now,
+                sessions=self.sessions,
                 lifecycle=self.lifecycle,
                 entry=self.entry,
                 reset=self.reset,
@@ -192,6 +202,7 @@ class CapabilityHttpTests(unittest.TestCase):
         app = create_app(
             authority=self.authority,
             verifier=self.verifier,
+            origin=self.origin,
             now=lambda: self.now,
             lifespan=lifespan,
         )
@@ -248,6 +259,220 @@ class CapabilityHttpTests(unittest.TestCase):
             now=lambda: self.now,
         )
         return receipt.attempt_id
+
+    RUNTIME = {"origin": "http://testserver"}
+
+    def _sign_in(self) -> str:
+        response = self.client.post(
+            "/v1/session",
+            headers={"Authorization": "Bearer " + self.token, **self.RUNTIME},
+        )
+        self.assertEqual(response.status_code, 201)
+        return self.client.cookies["failroom_session"]
+
+    def test_a_host_that_does_not_name_the_runtime_is_refused(self) -> None:
+        stranger = TestClient(self.client.app, base_url="http://attacker.example")
+
+        for response in (
+            stranger.get(
+                "/v1/attempts/any/status",
+                headers={"Authorization": "Bearer " + self.token},
+            ),
+            stranger.post(
+                "/v1/session",
+                headers={
+                    "Authorization": "Bearer " + self.token,
+                    "origin": "http://attacker.example",
+                },
+            ),
+        ):
+            self.assertEqual(
+                (response.status_code, response.json()),
+                (400, {"code": "HOST_NOT_ALLOWED"}),
+            )
+            self.assertNotIn("set-cookie", response.headers)
+
+    def test_signing_in_sets_a_strict_http_only_session_cookie(self) -> None:
+        response = self.client.post(
+            "/v1/session",
+            headers={"Authorization": "Bearer " + self.token, **self.RUNTIME},
+        )
+
+        self.assertEqual(response.status_code, 201)
+        # The credential expires in ten minutes, before the 30-minute lifetime.
+        self.assertEqual(
+            response.json(),
+            {"expires_at": (self.now + timedelta(minutes=10)).isoformat()},
+        )
+        cookie = response.headers["set-cookie"]
+        self.assertRegex(cookie, r"^failroom_session=[A-Za-z0-9_-]{43}; ")
+        for attribute in ("httponly", "max-age=600", "path=/v1", "samesite=strict"):
+            self.assertIn(attribute, cookie.lower())
+        self.assertNotIn(self.token, cookie)
+
+    def test_signing_in_needs_the_runtime_origin_and_a_valid_credential(
+        self,
+    ) -> None:
+        bearer = {"Authorization": "Bearer " + self.token}
+        cases = (
+            (bearer, 403, "ORIGIN_NOT_ALLOWED"),
+            (
+                {**bearer, "origin": "http://attacker.example"},
+                403,
+                "ORIGIN_NOT_ALLOWED",
+            ),
+            (
+                {"Authorization": "Bearer " + "w" * 40, **self.RUNTIME},
+                401,
+                "AUTHENTICATION_REQUIRED",
+            ),
+            (dict(self.RUNTIME), 401, "AUTHENTICATION_REQUIRED"),
+        )
+        for headers, status, code in cases:
+            with self.subTest(headers=headers):
+                response = self.client.post("/v1/session", headers=headers)
+                self.assertEqual(
+                    (response.status_code, response.json()), (status, {"code": code})
+                )
+                self.assertNotIn("set-cookie", response.headers)
+
+    def test_the_session_cookie_authenticates_room_requests(self) -> None:
+        attempt_id = self._ready()
+        self._sign_in()
+
+        status = self.client.get(f"/v1/attempts/{attempt_id}/status")
+        capability = self.client.post(
+            f"/v1/attempts/{attempt_id}/terminal-capability", headers=self.RUNTIME
+        )
+        entered = self.client.post(
+            "/v1/rooms/disk-full/attempts",
+            headers={"Idempotency-Key": "enter-with-cookie", **self.RUNTIME},
+        )
+
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()["attempt_id"], attempt_id)
+        self.assertEqual(capability.status_code, 200)
+        self.assertEqual(set(capability.json()), {"capability", "expires_at"})
+        self.assertEqual(capability.headers["cache-control"], "no-store")
+        self.assertEqual(entered.status_code, 201)
+        self.assertEqual(len(self.provisioner.keys), 1)
+
+    def test_a_cookie_request_that_changes_state_needs_the_runtime_origin(
+        self,
+    ) -> None:
+        attempt_id = self._ready()
+        self._sign_in()
+
+        for headers in ({}, {"origin": "http://attacker.example"}, {"origin": "null"}):
+            for path in (
+                f"/v1/attempts/{attempt_id}/terminal-capability",
+                f"/v1/attempts/{attempt_id}/leave",
+                f"/v1/attempts/{attempt_id}/reset",
+                "/v1/rooms/disk-full/attempts",
+            ):
+                with self.subTest(headers=headers, path=path):
+                    response = self.client.post(
+                        path, headers={"Idempotency-Key": uuid4().hex, **headers}
+                    )
+                    self.assertEqual(
+                        (response.status_code, response.json()),
+                        (403, {"code": "ORIGIN_NOT_ALLOWED"}),
+                    )
+        self.assertEqual(self.provisioner.keys, [])
+        status = self.client.get(f"/v1/attempts/{attempt_id}/status")
+        self.assertEqual(status.json()["state"], "READY")
+
+    def test_signing_out_ends_the_session_and_clears_the_cookie(self) -> None:
+        attempt_id = self._ready()
+        token = self._sign_in()
+
+        refused = self.client.delete("/v1/session")
+        response = self.client.delete("/v1/session", headers=self.RUNTIME)
+        replayed = self.client.get(
+            f"/v1/attempts/{attempt_id}/status", cookies={"failroom_session": token}
+        )
+
+        self.assertEqual(
+            (refused.status_code, refused.json()), (403, {"code": "ORIGIN_NOT_ALLOWED"})
+        )
+        self.assertEqual(response.status_code, 204)
+        self.assertIn("max-age=0", response.headers["set-cookie"].lower())
+        self.assertEqual(
+            (replayed.status_code, replayed.json()),
+            (401, {"code": "AUTHENTICATION_REQUIRED"}),
+        )
+        again = self.client.delete("/v1/session", headers=self.RUNTIME)
+        self.assertEqual(again.status_code, 204)
+
+    def test_a_bearer_header_takes_precedence_over_a_session_cookie(self) -> None:
+        attempt_id = self._ready()
+        self._sign_in()
+
+        response = self.client.get(
+            f"/v1/attempts/{attempt_id}/status",
+            headers={"Authorization": "Bearer " + self.other_token},
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_api_responses_carry_hardening_headers(self) -> None:
+        response = self.client.get(
+            "/v1/attempts/missing/status",
+            headers={"Authorization": "Bearer " + self.token},
+        )
+
+        for name, value in (
+            ("cache-control", "no-store"),
+            ("x-content-type-options", "nosniff"),
+            ("referrer-policy", "no-referrer"),
+            ("content-security-policy", "default-src 'none'; frame-ancestors 'none'"),
+            ("cross-origin-resource-policy", "same-origin"),
+        ):
+            self.assertEqual(response.headers[name], value)
+
+    def test_without_browser_sessions_there_is_no_cookie_sign_in(self) -> None:
+        client = TestClient(
+            create_app(
+                authority=self.authority,
+                verifier=self.verifier,
+                origin=self.origin,
+                now=lambda: self.now,
+                lifecycle=self.lifecycle,
+            )
+        )
+        attempt_id = self._ready()
+        token = self._sign_in()
+
+        self.assertEqual(
+            client.post(
+                "/v1/session",
+                headers={"Authorization": "Bearer " + self.token, **self.RUNTIME},
+            ).status_code,
+            404,
+        )
+        self.assertEqual(
+            client.get(
+                f"/v1/attempts/{attempt_id}/status",
+                cookies={"failroom_session": token},
+            ).status_code,
+            401,
+        )
+
+    def test_browser_sessions_need_a_credential_verifier(self) -> None:
+        class IdentityOnly:
+            def verify(self, authorization: str) -> UserIdentity:
+                raise AssertionError("not called")
+
+        for arguments in (
+            {
+                "verifier": IdentityOnly(),
+                "origin": self.origin,
+                "sessions": self.sessions,
+            },
+            {"verifier": self.verifier, "origin": {"testserver"}, "sessions": None},
+        ):
+            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                create_app(authority=self.authority, now=lambda: self.now, **arguments)
 
     def test_capability_endpoint_uses_verified_identity(self) -> None:
         attempt_id = self._ready()

@@ -316,14 +316,28 @@ def mount_terminal_route(
     terminal: TerminalAttachmentProtocol,
     limits: WebSocketLimits,
     now: Clock,
+    origins: frozenset[str],
 ) -> None:
-    """Mount the terminal transport without exposing capability details."""
+    """Mount the terminal transport without exposing capability details.
+
+    A browser always sends Origin with a WebSocket handshake, so one from a
+    page of another origin closes with 1008 before the authorization frame.
+    A client without Origin is not a browser; it still needs a capability.
+    """
 
     if not isinstance(gateway, TerminalGatewayProtocol) or not isinstance(
         terminal, TerminalAttachmentProtocol
     ):
         raise ValueError("invalid terminal dependencies")
+    if type(origins) is not frozenset or not all(
+        type(value) is str and value for value in origins
+    ):
+        raise ValueError("invalid terminal origins")
 
     @app.websocket("/v1/terminal")
     async def terminal_endpoint(websocket: WebSocket) -> None:
+        origin = websocket.headers.get("origin")
+        if origin is not None and origin not in origins:
+            await websocket.close(code=1008)
+            return
         await serve_terminal(websocket, gateway, terminal, limits, now)

@@ -8,6 +8,7 @@ from failroom_api.authentication import (
     AuthenticationError,
     BearerCredential,
     BearerIdentityVerifier,
+    CredentialVerifier,
 )
 
 
@@ -30,6 +31,17 @@ class BearerIdentityVerifierTests(unittest.TestCase):
 
     def test_verifies_bearer_token(self) -> None:
         self.assertEqual(self.verifier.verify("Bearer " + self.token), self.identity)
+
+    def test_credential_also_tells_when_it_expires(self) -> None:
+        credential = self.verifier.credential("Bearer " + self.token)
+
+        self.assertIsInstance(self.verifier, CredentialVerifier)
+        self.assertEqual(
+            credential, BearerCredential(self.identity, self.now.replace(hour=1))
+        )
+        with self.assertRaises(AuthenticationError) as raised:
+            self.verifier.credential("Bearer wrong")
+        self.assertEqual(raised.exception.code, "AUTHENTICATION_REQUIRED")
 
     def test_rejects_malformed_or_unknown_header(self) -> None:
         for header in ("", "Basic value", "Bearer", "Bearer wrong"):
