@@ -2,8 +2,8 @@
 
 Internal Phase 1 capability and identity primitives for trusted services. This
 package provides a bounded HMAC codec for the short-lived terminal capability
-contract, the backend capability authority facade, and a bearer identity
-verifier. It does not run an HTTP listener, distribute keys, open a WebSocket,
+contract, the backend capability authority facade, a bearer identity
+verifier, and in-memory browser sessions. It does not run an HTTP listener, distribute keys, open a WebSocket,
 or attach a PTY; the trusted control plane composes these primitives into its
 HTTP and WebSocket routes.
 
@@ -44,9 +44,24 @@ accepts only an `Authorization` value of the form `Bearer <token>` with 32–409
 ASCII characters, compares the token digest with each configured digest in
 constant time, and returns the matching identity. It raises the fixed
 `AUTHENTICATION_REQUIRED` code for a missing, malformed or unknown token and
-`AUTHENTICATION_EXPIRED` once the credential has expired. The local runtime
-configures exactly one credential; this verifier is not a login, account or
-token-issuing service.
+`AUTHENTICATION_EXPIRED` once the credential has expired. `credential()` does
+the same check and returns the matching `BearerCredential` with its expiry. The
+local runtime configures exactly one credential; this verifier is not a login,
+account or token-issuing service.
+
+## Browser sessions
+
+`BrowserSessionAuthority` opens a session for an identity whose bearer
+credential the verifier has already matched. `open()` returns a token of 32
+random bytes in URL-safe base64, which the caller hands to the browser once,
+and keeps only its SHA-256 digest in process memory. A session lasts until the
+earlier of the configured lifetime, 60 seconds to 12 hours, and the
+credential's expiry; at most the configured number, 1–64, exist, and opening
+another ends the one that expires first. `verify()` returns the identity or
+raises `AUTHENTICATION_REQUIRED` for an unknown or malformed token and
+`AUTHENTICATION_EXPIRED` for an expired one, and `close()` ends a session and
+may repeat. A restart ends every session. The control plane carries the token
+in an HttpOnly cookie and checks the browser's origin; this package does not.
 
 ## Backend authority facade
 

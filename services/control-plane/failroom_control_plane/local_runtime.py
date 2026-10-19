@@ -17,6 +17,7 @@ from failroom_api import (
     BackendCapabilityAuthority,
     BearerCredential,
     BearerIdentityVerifier,
+    BrowserSessionAuthority,
     CapabilityCodec,
 )
 from failroom_sandbox.docker_cli import DockerCli
@@ -39,6 +40,7 @@ from failroom_state import (
 from fastapi import FastAPI
 from starlette.types import Lifespan
 
+from .browser import loopback_origin
 from .config import ConfigurationError, ControllerConfig
 from .entry import RoomEntryService
 from .http import create_app
@@ -109,6 +111,10 @@ def _float(environment: Mapping[str, str], name: str) -> float:
     return value
 
 
+# One local operator; signing in once more ends the session that expires first.
+_BROWSER_SESSIONS = 8
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -139,6 +145,7 @@ class LocalRuntimeConfig:
     maintenance_interval: timedelta
     maintenance_limit: int
     qualification_max_age: timedelta
+    session_lifetime: timedelta
 
     @classmethod
     def from_environment(
@@ -250,6 +257,9 @@ class LocalRuntimeConfig:
             maintenance_limit = _integer(values, "FAILROOM_MAINTENANCE_LIMIT")
             if not 1 <= maintenance_limit <= 1_000:
                 raise LocalRuntimeError()
+            session_seconds = _integer(values, "FAILROOM_LOCAL_SESSION_SECONDS")
+            if not 60 <= session_seconds <= 43_200:
+                raise LocalRuntimeError()
             return cls(
                 bind_host=host,
                 bind_port=port,
@@ -270,6 +280,7 @@ class LocalRuntimeConfig:
                 ),
                 maintenance_limit=maintenance_limit,
                 qualification_max_age=qualification_max_age(values),
+                session_lifetime=timedelta(seconds=session_seconds),
             )
         except (ConfigurationError, LocalRuntimeError, ValueError, UnicodeError):
             raise LocalRuntimeError() from None
@@ -523,7 +534,13 @@ def build_runtime(config: LocalRuntimeConfig, *, now: Clock) -> LocalRuntime:
         app = create_app(
             authority=authority,
             verifier=verifier,
+            origin=loopback_origin(config.bind_host, config.bind_port),
             now=now,
+            sessions=BrowserSessionAuthority(
+                lifetime=config.session_lifetime,
+                max_sessions=_BROWSER_SESSIONS,
+                now=now,
+            ),
             gateway=gateway,
             terminal=terminal,
             terminal_limits=config.websocket_limits,

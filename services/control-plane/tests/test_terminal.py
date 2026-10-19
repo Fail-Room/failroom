@@ -376,6 +376,7 @@ class TerminalServiceTests(unittest.TestCase):
                         poll_interval_seconds=0.001,
                     ),
                     now=lambda: self.now,
+                    origins=frozenset({"http://testserver"}),
                 )
                 client = TestClient(app)
 

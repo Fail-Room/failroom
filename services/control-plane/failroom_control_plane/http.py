@@ -2,18 +2,22 @@
 
 from collections.abc import Callable
 from datetime import datetime
+from typing import cast
 
 from failroom_api import (
     AuthenticationError,
     AuthorityError,
     BackendCapabilityAuthority,
+    BrowserSessionAuthority,
+    CredentialVerifier,
     IdentityVerifier,
 )
 from failroom_state import UserIdentity
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from starlette.types import Lifespan
 
+from .browser import SESSION_COOKIE, LoopbackGuard, LoopbackOrigin
 from .entry import EntryError, RoomEntry, RoomEntryService
 from .lifecycle import LifecycleError, RoomLifecycleService, RoomStatus
 from .recovery import RecoveryError, RecoveryVerificationService
@@ -50,15 +54,24 @@ _RECOVERY_STATUS = {
 }
 
 
+_SAFE_METHODS = frozenset({"GET", "HEAD"})
+
+
 class _AuthenticationFailure(RuntimeError):
     """Carry a verifier failure without coupling it to lifecycle errors."""
 
     def __init__(self, code: str) -> None:
         self.code = (
             code
-            if code in {"AUTHENTICATION_REQUIRED", "AUTHENTICATION_EXPIRED"}
+            if code
+            in {
+                "AUTHENTICATION_REQUIRED",
+                "AUTHENTICATION_EXPIRED",
+                "ORIGIN_NOT_ALLOWED",
+            }
             else "AUTHENTICATION_REQUIRED"
         )
+        self.status = 403 if self.code == "ORIGIN_NOT_ALLOWED" else 401
         super().__init__(self.code)
 
 
@@ -67,10 +80,28 @@ def _error(code: str, status: int) -> JSONResponse:
 
 
 def _authenticated_identity(
-    verifier: IdentityVerifier, request: Request
+    verifier: IdentityVerifier,
+    sessions: BrowserSessionAuthority | None,
+    origin: LoopbackOrigin,
+    request: Request,
 ) -> UserIdentity:
+    """Authenticate a bearer header, or else a browser session cookie.
+
+    A browser sends the cookie on its own, so a request that changes state
+    with it must also come from this runtime's origin.
+    """
+    authorization = request.headers.get("authorization")
+    token = request.cookies.get(SESSION_COOKIE)
     try:
-        return verifier.verify(request.headers.get("authorization", ""))
+        if authorization is not None or sessions is None or token is None:
+            return verifier.verify(authorization or "")
+        if request.method not in _SAFE_METHODS and not origin.allows(
+            request.headers.get("origin")
+        ):
+            raise _AuthenticationFailure("ORIGIN_NOT_ALLOWED")
+        return sessions.verify(token)
+    except _AuthenticationFailure:
+        raise
     except AuthenticationError as error:
         raise _AuthenticationFailure(error.code) from None
     except Exception:
@@ -132,7 +163,9 @@ def create_app(
     *,
     authority: BackendCapabilityAuthority,
     verifier: IdentityVerifier,
+    origin: LoopbackOrigin,
     now: Callable[[], datetime],
+    sessions: BrowserSessionAuthority | None = None,
     gateway: TerminalGatewayProtocol | None = None,
     terminal: ControlPlaneTerminalService | None = None,
     terminal_limits: WebSocketLimits | None = None,
@@ -144,12 +177,74 @@ def create_app(
 ) -> FastAPI:
     """Build an API app with all trust dependencies supplied by the caller."""
 
+    if type(origin) is not LoopbackOrigin:
+        raise ValueError("invalid loopback origin")
+    if sessions is not None and (
+        type(sessions) is not BrowserSessionAuthority
+        or not isinstance(verifier, CredentialVerifier)
+    ):
+        raise ValueError("browser sessions need a credential verifier")
     app = FastAPI(
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
         lifespan=lifespan,
     )
+    app.add_middleware(LoopbackGuard, origin=origin)
+
+    def identity(request: Request) -> UserIdentity:
+        return _authenticated_identity(verifier, sessions, origin, request)
+
+    if sessions is not None:
+        # Checked above; this only narrows the type for the routes below.
+        credentials = cast(CredentialVerifier, verifier)
+
+        @app.post("/v1/session")
+        def open_session(request: Request) -> Response:
+            # Only a page of this runtime may sign the browser in.
+            if not origin.allows(request.headers.get("origin")):
+                return _error("ORIGIN_NOT_ALLOWED", 403)
+            try:
+                credential = credentials.credential(
+                    request.headers.get("authorization", "")
+                )
+                issued = sessions.open(
+                    credential.identity, credential_expires_at=credential.expires_at
+                )
+            except AuthenticationError as error:
+                code = (
+                    error.code
+                    if error.code == "AUTHENTICATION_EXPIRED"
+                    else "AUTHENTICATION_REQUIRED"
+                )
+                return _error(code, 401)
+            except Exception:
+                return _error("AUTHENTICATION_REQUIRED", 401)
+            response = JSONResponse(
+                status_code=201, content={"expires_at": issued.expires_at.isoformat()}
+            )
+            response.set_cookie(
+                SESSION_COOKIE,
+                issued.token,
+                max_age=issued.lifetime_seconds,
+                path="/v1",
+                httponly=True,
+                samesite="strict",
+            )
+            return response
+
+        @app.delete("/v1/session")
+        def close_session(request: Request) -> Response:
+            if not origin.allows(request.headers.get("origin")):
+                return _error("ORIGIN_NOT_ALLOWED", 403)
+            token = request.cookies.get(SESSION_COOKIE)
+            if token is not None:
+                sessions.close(token)
+            response = Response(status_code=204)
+            response.delete_cookie(
+                SESSION_COOKIE, path="/v1", httponly=True, samesite="strict"
+            )
+            return response
 
     if entry is not None:
 
@@ -159,13 +254,9 @@ def create_app(
             if not key:
                 return _error("INVALID_REQUEST", 400)
             try:
-                return _entry_response(
-                    entry.enter(
-                        _authenticated_identity(verifier, request), room_id, key=key
-                    )
-                )
+                return _entry_response(entry.enter(identity(request), room_id, key=key))
             except _AuthenticationFailure as error:
-                return _error(error.code, 401)
+                return _error(error.code, error.status)
             except EntryError as error:
                 return _entry_error(error)
             except Exception:
@@ -174,13 +265,11 @@ def create_app(
     @app.post("/v1/attempts/{attempt_id}/terminal-capability")
     def issue_terminal_capability(attempt_id: str, request: Request) -> JSONResponse:
         try:
-            identity = verifier.verify(request.headers.get("authorization", ""))
-        except AuthenticationError as error:
-            return _error(error.code, 401)
-        except Exception:
-            return _error("AUTHENTICATION_REQUIRED", 401)
+            caller = identity(request)
+        except _AuthenticationFailure as error:
+            return _error(error.code, error.status)
         try:
-            issued = authority.issue(identity, attempt_id, now=now)
+            issued = authority.issue(caller, attempt_id, now=now)
         except AuthorityError as error:
             status = _AUTHORITY_STATUS.get(error.code, 403)
             code = error.code if status != 403 else "AUTHORIZATION_FAILED"
@@ -200,13 +289,9 @@ def create_app(
         @app.get("/v1/attempts/{attempt_id}/status")
         def room_status(attempt_id: str, request: Request) -> JSONResponse:
             try:
-                return _status_response(
-                    lifecycle.status(
-                        _authenticated_identity(verifier, request), attempt_id
-                    )
-                )
+                return _status_response(lifecycle.status(identity(request), attempt_id))
             except _AuthenticationFailure as error:
-                return _error(error.code, 401)
+                return _error(error.code, error.status)
             except LifecycleError as error:
                 return _lifecycle_error(error)
 
@@ -217,13 +302,11 @@ def create_app(
                 return _error("INVALID_REQUEST", 400)
             try:
                 return _status_response(
-                    lifecycle.leave(
-                        _authenticated_identity(verifier, request), attempt_id, key=key
-                    ),
+                    lifecycle.leave(identity(request), attempt_id, key=key),
                     code=202,
                 )
             except _AuthenticationFailure as error:
-                return _error(error.code, 401)
+                return _error(error.code, error.status)
             except LifecycleError as error:
                 return _lifecycle_error(error)
 
@@ -236,13 +319,11 @@ def create_app(
                 return _error("INVALID_REQUEST", 400)
             try:
                 return _status_response(
-                    reset.reset(
-                        _authenticated_identity(verifier, request), attempt_id, key=key
-                    ),
+                    reset.reset(identity(request), attempt_id, key=key),
                     code=202,
                 )
             except _AuthenticationFailure as error:
-                return _error(error.code, 401)
+                return _error(error.code, error.status)
             except ResetError as error:
                 return _reset_error(error)
 
@@ -255,12 +336,10 @@ def create_app(
                 return _error("INVALID_REQUEST", 400)
             try:
                 return _status_response(
-                    recovery.verify(
-                        _authenticated_identity(verifier, request), attempt_id, key=key
-                    )
+                    recovery.verify(identity(request), attempt_id, key=key)
                 )
             except _AuthenticationFailure as error:
-                return _error(error.code, 401)
+                return _error(error.code, error.status)
             except RecoveryError as error:
                 return _recovery_error(error)
 
@@ -273,6 +352,7 @@ def create_app(
             terminal=terminal,
             limits=terminal_limits,
             now=now,
+            origins=origin.origins,
         )
 
     return app

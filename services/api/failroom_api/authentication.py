@@ -6,7 +6,7 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from failroom_state import UserIdentity
 
@@ -41,6 +41,13 @@ class BearerCredential:
 
 class IdentityVerifier(Protocol):
     def verify(self, authorization: str) -> UserIdentity: ...
+
+
+@runtime_checkable
+class CredentialVerifier(IdentityVerifier, Protocol):
+    """A verifier that also tells when the matched credential expires."""
+
+    def credential(self, authorization: str) -> BearerCredential: ...
 
 
 def _clock(now: object) -> datetime:
@@ -87,6 +94,10 @@ class BearerIdentityVerifier:
         self._now = now
 
     def verify(self, authorization: str) -> UserIdentity:
+        return self.credential(authorization).identity
+
+    def credential(self, authorization: str) -> BearerCredential:
+        """Return the unexpired configured credential the bearer token matches."""
         if type(authorization) is not str or not authorization.startswith(_PREFIX):
             raise AuthenticationError("AUTHENTICATION_REQUIRED")
         token = authorization[len(_PREFIX) :]
@@ -101,5 +112,5 @@ class BearerIdentityVerifier:
             if hmac.compare_digest(candidate, digest):
                 if credential.expires_at <= _clock(self._now):
                     raise AuthenticationError("AUTHENTICATION_EXPIRED")
-                return credential.identity
+                return credential
         raise AuthenticationError("AUTHENTICATION_REQUIRED")

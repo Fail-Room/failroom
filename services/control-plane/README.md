@@ -89,7 +89,8 @@ as fatal: it closes the connection and the PTY session.
 
 > **Limitation:** the local runtime checks a current qualification report
 > before every Room allocation, but it authenticates one local bearer
-> credential and has no browser terminal. See
+> credential, directly or through a browser session it opens, and has no
+> browser terminal yet. See
 > [SECURITY.md](../../docs/SECURITY.md). Use it only as the local operator on
 > your own host, and do not offer it to learners or other users.
 
@@ -180,14 +181,17 @@ After `CLEANUP_INCOMPLETE`, leave `failroom-qualification/restart` in place:
 the next collection uses it to find and remove the Room sandbox. If it is
 deleted anyway, remove the container labelled with the `attempt_id` that its
 `binding.json` named by hand, for example with `docker container rm --force`.
-Deleting a whole `failroom-qualification` directory forgets its ID: remove by
-hand the stopped containers whose `failroom.attempt_id` label starts with
-`qualification-` and names no remaining directory.
+Deleting a whole `failroom-qualification` directory forgets its ID. Docker
+removes its running containers at their deadlines; remove by hand any
+container that was created but never started whose `failroom.attempt_id`
+label starts with `qualification-` and names no remaining directory.
 
 The runtime binds only to `127.0.0.1` or `::1` and accepts exactly one bearer
 token, which it keeps only as a SHA-256 digest. The token authenticates one
 local user with the configured Room scopes until its expiry. Only the reviewed
-`disk-full` Room can be entered.
+`disk-full` Room can be entered. The runtime refuses any request whose `Host`
+header names something other than its own listener: `127.0.0.1:<port>` or
+`[::1]:<port>`, and `localhost:<port>`.
 
 ### Running the local runtime
 
@@ -231,6 +235,7 @@ by `StrictDockerProfile` as described in the
 | `FAILROOM_LOCAL_USER_ID` | Identifier of the local user. |
 | `FAILROOM_LOCAL_ROOM_SCOPES` | Comma-separated Room IDs the user may enter, for example `disk-full`. |
 | `FAILROOM_LOCAL_TOKEN_EXPIRES_AT` | ISO 8601 time with a UTC offset, in the future at startup. Later requests fail with `AUTHENTICATION_EXPIRED`. |
+| `FAILROOM_LOCAL_SESSION_SECONDS` | Browser session lifetime, 60–43200. A session also ends when the bearer token expires. |
 | `FAILROOM_DATABASE_PATH` | Absolute path of the SQLite database file. `qualify-local` keeps its `failroom-qualification` workspace in the same directory. |
 | `FAILROOM_DATABASE_BUSY_TIMEOUT_MS` | SQLite busy timeout, 1–30000. |
 | `FAILROOM_DOCKER_CONTEXT` | Docker CLI context name. |
@@ -277,13 +282,24 @@ docker --context default build --pull=false --quiet --tag failroom/disk-full:loc
 
 ### HTTP and WebSocket interface
 
-Every HTTP request needs `Authorization: Bearer <token>`; a missing, wrong, or
-expired token returns `401`. Enter Room, Reset Room, recovery verification, and
+Every HTTP request authenticates with `Authorization: Bearer <token>` or, from
+a browser, with the session cookie that `POST /v1/session` sets; a missing,
+wrong, or expired credential returns `401`. A request that changes state with
+the cookie must carry an `Origin` header that names the runtime, or it returns
+`403` with `ORIGIN_NOT_ALLOWED`; a bearer header takes precedence over a
+cookie. A request whose `Host` header does not name the runtime returns `400`
+with `HOST_NOT_ALLOWED`. Enter Room, Reset Room, recovery verification, and
 Leave Room also need a non-empty `Idempotency-Key` header. Errors return only
-`{"code": "<FIXED_CODE>"}`. The app serves no OpenAPI or documentation routes.
+`{"code": "<FIXED_CODE>"}`. Every response carries `Cache-Control: no-store`,
+`X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
+`Cross-Origin-Resource-Policy: same-origin` and
+`Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`. The app
+serves no OpenAPI or documentation routes.
 
 | Request | Purpose | Success response |
 | --- | --- | --- |
+| `POST /v1/session` | Sign a browser in with the bearer token; needs the runtime's `Origin` | `201` with `expires_at`, and a `failroom_session` cookie that is `HttpOnly`, `SameSite=Strict` and sent only to `/v1` |
+| `DELETE /v1/session` | Sign the browser out; needs the runtime's `Origin` | `204`, ending the session and clearing the cookie |
 | `POST /v1/rooms/{room_id}/attempts` | Enter Room | `201` with `attempt_id`, `room_id`, `state`, and `expires_at` |
 | `GET /v1/attempts/{attempt_id}/status` | Room Status | `200` with `attempt_id`, `room_id`, `state`, `expires_at`, and `destroy_intent` |
 | `POST /v1/attempts/{attempt_id}/terminal-capability` | Issue a single-use terminal capability | `200` with `capability` and `expires_at` |
@@ -291,7 +307,17 @@ Leave Room also need a non-empty `Idempotency-Key` header. Errors return only
 | `POST /v1/attempts/{attempt_id}/verify-recovery` | Check the Disk Full recovery inside the sandbox | `200` with the status fields |
 | `POST /v1/attempts/{attempt_id}/leave` | Leave Room | `202` with the status fields |
 
-The terminal route is `/v1/terminal`. The client first sends
+A session lasts until the earlier of `FAILROOM_LOCAL_SESSION_SECONDS` and the
+bearer token's expiry. Sessions live only in the runtime's memory, as SHA-256
+digests of their tokens: a restart signs every browser out, and at most eight
+exist at once, so signing in again ends the one that expires first. The cookie
+has no `Secure` attribute because the runtime serves plain HTTP on a loopback
+address.
+
+The terminal route is `/v1/terminal`. A handshake whose `Origin` header names
+another origin closes with `1008` before the authorization frame; a client
+without `Origin` is not a browser and still needs a capability. The client
+first sends
 `{"type": "authorize", "capability": "<capability>"}` within the authorization
 timeout. The server answers `{"type": "authorized"}` and then streams
 `{"type": "output", "data": "..."}` frames. The client may send `input`
@@ -413,6 +439,7 @@ export FAILROOM_LOCAL_BEARER_TOKEN="$(python3 -c 'import secrets; print(secrets.
 export FAILROOM_LOCAL_USER_ID=integration-user
 export FAILROOM_LOCAL_ROOM_SCOPES=disk-full
 export FAILROOM_LOCAL_TOKEN_EXPIRES_AT="$(date -u -d '+2 hours' +%Y-%m-%dT%H:%M:%S+00:00)"
+export FAILROOM_LOCAL_SESSION_SECONDS=3600
 export FAILROOM_CLEANUP_RETRY_SECONDS=5
 export FAILROOM_MAINTENANCE_INTERVAL_SECONDS=30
 export FAILROOM_MAINTENANCE_LIMIT=10
@@ -424,7 +451,7 @@ export FAILROOM_MAINTENANCE_LIMIT=10
 | `test_linux_disk_full_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | The Disk Full filler reduces workspace capacity and recovery restores it; the test builds the Disk Full image itself |
 | `test_linux_terminal_integration.py` | `FAILROOM_TERMINAL_INTEGRATION=1` | Input and output, ANSI bytes, resize, Ctrl+C interruption, one-time capability replay denial, termination and reaping of the shell's session and background jobs after disconnect, and refusal with `4429` of a terminal beyond the profile's connection or session limit until one closes, through a real PTY |
 | `test_linux_qualification_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Report-only qualification: all eighteen checks pass on the strict profile and the restart scenario's Room sandbox is removed, a never-started and a running sandbox and a Room sandbox a crashed collection left are removed, a second collection is refused while one holds the workspace, another workspace's sandbox is left alone, a container outside the profile fails the checks it violates, and no sandbox or scratch state remains |
-| `test_linux_local_runtime_integration.py` | `FAILROOM_LOCAL_RUNTIME_INTEGRATION=1` | Enter Room, capability, terminal, recovery verification, Reset Room, and Leave Room through the local app; denial of unreviewed and unauthorized Rooms, of a reused capability, and of a capability issued before a reset; reset maintenance; a terminal that stays responsive for 70 seconds; a report refreshed before it expires, with only the new sentinel left and Enter Room still admitted; a sandbox Docker removes by its deadline while the runtime is stopped, recorded destroyed once the runtime starts again; and Room allocation that needs the live sentinel of the startup report, with a sentinel that outlives the attempt TTL, `qualify-local` refused while the runtime runs, and `ENTRY_FAILED` without any Docker call once the sentinel is gone |
+| `test_linux_local_runtime_integration.py` | `FAILROOM_LOCAL_RUNTIME_INTEGRATION=1` | Enter Room, capability, terminal, recovery verification, Reset Room, and Leave Room through the local app; a browser session that signs in with the bearer token, reaches the terminal with only its cookie and the runtime's origin, and signs out; denial of unreviewed and unauthorized Rooms, of a reused capability, and of a capability issued before a reset; reset maintenance; a terminal that stays responsive for 70 seconds; a report refreshed before it expires, with only the new sentinel left and Enter Room still admitted; a sandbox Docker removes by its deadline while the runtime is stopped, recorded destroyed once the runtime starts again; and Room allocation that needs the live sentinel of the startup report, with a sentinel that outlives the attempt TTL, `qualify-local` refused while the runtime runs, and `ENTRY_FAILED` without any Docker call once the sentinel is gone |
 
 Run one module, or every module whose flags are set:
 

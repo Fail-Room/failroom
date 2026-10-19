@@ -88,6 +88,7 @@ class LocalRuntimeConfigTests(unittest.TestCase):
             "FAILROOM_MAINTENANCE_LIMIT": "10",
             "FAILROOM_CLEANUP_RETRY_SECONDS": "10",
             "FAILROOM_QUALIFICATION_MAX_AGE_SECONDS": "3600",
+            "FAILROOM_LOCAL_SESSION_SECONDS": "3600",
         }
 
     def test_rejects_missing_bearer_token(self) -> None:
@@ -195,6 +196,35 @@ class LocalRuntimeConfigTests(unittest.TestCase):
         with self.assertRaises(DockerError) as raised:
             provisioning.open("binding", "operation", "disk-full", lifetime=None)
         self.assertEqual(raised.exception.code, "PROFILE_UNVERIFIED")
+
+    def test_browser_session_lifetime_is_required_and_bounded(self) -> None:
+        name = "FAILROOM_LOCAL_SESSION_SECONDS"
+        for value, accepted in (
+            ("60", True),
+            ("43200", True),
+            ("59", False),
+            ("43201", False),
+            ("one", False),
+            (None, False),
+        ):
+            environment = dict(self.environment)
+            if value is None:
+                environment.pop(name)
+            else:
+                environment[name] = value
+            with self.subTest(value=value):
+                if accepted:
+                    config = LocalRuntimeConfig.from_environment(
+                        environment, now=lambda: datetime(2026, 10, 19, tzinfo=UTC)
+                    )
+                    self.assertEqual(
+                        config.session_lifetime, timedelta(seconds=int(value))
+                    )
+                else:
+                    with self.assertRaises(LocalRuntimeError):
+                        LocalRuntimeConfig.from_environment(
+                            environment, now=lambda: datetime(2026, 10, 19, tzinfo=UTC)
+                        )
 
     def test_qualification_max_age_is_required_and_bounded(self) -> None:
         name = "FAILROOM_QUALIFICATION_MAX_AGE_SECONDS"
