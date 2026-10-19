@@ -25,7 +25,7 @@ uv run --locked ruff format --check .
 uv run --locked mypy failroom_sandbox
 ```
 
-These checks cover evidence completeness, typing, duplication, context binding, age boundaries, deterministic safe errors, profile compilation, bounded Docker CLI transport, diagnostic ownership/mount checks, and seccomp snapshot handling. Default Docker lifecycle fixtures are synthetic. The opt-in Docker integration tests are skipped unless a trusted Linux controller supplies every explicit FAILROOM_* input. Qualification evidence collection from actual learner resource probes, qualification in the allocation path, and browser-to-PTY end-to-end checks remain required. See the sandbox-engine and control-plane component contracts for the implemented boundaries.
+These checks cover evidence completeness, typing, duplication, context binding, age boundaries, deterministic safe errors, profile compilation, bounded Docker CLI transport, diagnostic ownership/mount checks, and seccomp snapshot handling. Default Docker lifecycle fixtures are synthetic. The opt-in Docker integration tests are skipped unless a trusted Linux controller supplies every explicit FAILROOM_* input. The control plane's collector gathers qualification evidence from real strict-profile sandboxes, and its local runtime checks the report before every Room allocation; final-image qualification and browser-to-PTY end-to-end checks remain required. See the sandbox-engine and control-plane component contracts for the implemented boundaries.
 
 The state store also uses Python 3.12.13 with no runtime dependencies. From `packages/state-store/`, run:
 

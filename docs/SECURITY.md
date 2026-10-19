@@ -73,7 +73,7 @@ Trust is not transitive. Knowing a Room ID, sandbox ID, network address, or term
 
 ### Resources and Lifetime
 
-- Before allocation, require a complete, passing, current qualification report bound to the exact runtime/boot/daemon identity, runtime configuration, image and full profile. The implemented [qualification gate](../services/sandbox-engine/README.md) evaluates these prerequisites, a collector gathers evidence for every check, and the operator-only local runtime requires its startup report to pass against the current runtime context before every Room allocation (see [Known Implementation Limitations](#known-implementation-limitations)). A caller-supplied report, digest reference or sandbox success string must never establish evidence authenticity. Reject missing or unverifiable results and keep cleanup available when creation is denied.
+- Before allocation, require a complete, passing, current qualification report bound to the exact runtime/boot/daemon identity, runtime configuration, image and full profile. The implemented [qualification gate](../services/sandbox-engine/README.md) evaluates these prerequisites, a collector gathers evidence for every check, and the operator-only local runtime requires its current report, collected at startup and renewed in the background, to pass against the current runtime context before every Room allocation (see [Known Implementation Limitations](#known-implementation-limitations)). A caller-supplied report, digest reference or sandbox success string must never establish evidence authenticity. Reject missing or unverifiable results and keep cleanup available when creation is denied.
 
 - Enforce finite CPU, memory, PID, storage, I/O, terminal-output, network, concurrent terminal connection and session, and absolute-lifetime limits per sandbox.
 - Persist an immutable absolute-TTL deadline before allocation. Check it before and after every lifecycle side effect, including create, start, and reset work, and use bounded cleanup retries.
@@ -181,7 +181,7 @@ Phase 1 is a local proof of concept, not evidence of production-grade multi-tena
 
 ## Future Isolation Options
 
-Phase 1 targets a local Docker Linux engine with strict limits and denial when qualification is incomplete. The current local runtime does not yet deny allocation when qualification is missing; see Known Implementation Limitations. Options for later evaluation include Rootless Docker, Rootless Podman, gVisor, Kata Containers, and Firecracker microVMs. These are deferred choices, not present safeguards.
+Phase 1 targets a local Docker Linux engine with strict limits and denial when qualification is incomplete. The current local runtime refuses Room allocation unless its qualification report passes for the live runtime; see Known Implementation Limitations. Options for later evaluation include Rootless Docker, Rootless Podman, gVisor, Kata Containers, and Firecracker microVMs. These are deferred choices, not present safeguards.
 
 Evaluation must compare host support, kernel boundary strength, PTY behavior, filesystem and network policy, resource accounting, startup latency, cleanup reliability, observability, maintenance cost, and known escape surface. Stronger isolation does not replace application-level ownership checks or credential scoping.
 
