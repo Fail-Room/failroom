@@ -91,6 +91,38 @@ class LocalRuntimeConfigTests(unittest.TestCase):
             "FAILROOM_LOCAL_SESSION_SECONDS": "3600",
         }
 
+    def test_the_web_root_is_optional_and_must_be_a_built_export(self) -> None:
+        base = Path(self.temp.name)
+        export = base / "out"
+        export.mkdir()
+        (export / "index.html").write_text("<!doctype html>", encoding="utf-8")
+        empty = base / "empty"
+        empty.mkdir()
+        with patch.dict(os.environ, self.environment, clear=True):
+            self.assertIsNone(LocalRuntimeConfig.from_environment().web_root)
+        for value, expected in (("", None), (str(export), export.resolve())):
+            environment = {**self.environment, "FAILROOM_LOCAL_WEB_ROOT": value}
+            with (
+                self.subTest(value=value),
+                patch.dict(os.environ, environment, clear=True),
+            ):
+                self.assertEqual(
+                    LocalRuntimeConfig.from_environment().web_root, expected
+                )
+        for value in (
+            "out",
+            str(base / "missing"),
+            str(empty),
+            str(export / "index.html"),
+        ):
+            environment = {**self.environment, "FAILROOM_LOCAL_WEB_ROOT": value}
+            with (
+                self.subTest(value=value),
+                patch.dict(os.environ, environment, clear=True),
+                self.assertRaises(LocalRuntimeError),
+            ):
+                LocalRuntimeConfig.from_environment()
+
     def test_rejects_missing_bearer_token(self) -> None:
         environment = dict(self.environment)
         environment.pop("FAILROOM_LOCAL_BEARER_TOKEN")

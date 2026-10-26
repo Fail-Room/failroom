@@ -36,6 +36,10 @@ _SESSION_MARKER = re.compile(rb"FAILROOM_PTY_SESSION=([1-9][0-9]{0,9})\r?\n")
 _MARKER_MAX_BYTES = 64
 _MARKER_TIMEOUT_SECONDS = 10.0
 _CLEANUP_TIMEOUT_SECONDS = 10.0
+# The size a sandbox's TTY starts with, within the limits, when the caller
+# names none.
+_DEFAULT_ROWS = 24
+_DEFAULT_COLUMNS = 80
 # Kills every live process of the shell's session: members first so the shell
 # can still reap them, then the shell. Processes that left the session with
 # setsid are bounded by the sandbox's PID 1 lifetime instead.
@@ -127,6 +131,8 @@ class _Process(Protocol):
 
     def kill(self) -> None: ...
 
+    def send_signal(self, sig: int) -> None: ...
+
 
 PtyOpener = Callable[[tuple[str, ...], int], _Process]
 PtyCleanup = Callable[[tuple[str, ...]], None]
@@ -152,6 +158,18 @@ def _run_cleanup(argv: tuple[str, ...]) -> None:
         timeout=_CLEANUP_TIMEOUT_SECONDS,
         check=False,
     )
+
+
+def _size(rows: object, columns: object, limits: PtyLimits) -> tuple[int, int] | None:
+    """The terminal size, or None unless the limits allow it."""
+    if (
+        type(rows) is not int
+        or type(columns) is not int
+        or not 1 <= rows <= limits.rows
+        or not 1 <= columns <= limits.columns
+    ):
+        return None
+    return rows, columns
 
 
 def _parse_session_marker(buffer: bytes) -> tuple[int, bytes] | None:
@@ -284,12 +302,7 @@ class _SubprocessPtySession:
 
     def resize(self, rows: int, columns: int) -> None:
         self._ensure_active()
-        if (
-            type(rows) is not int
-            or type(columns) is not int
-            or not 1 <= rows <= self._limits.rows
-            or not 1 <= columns <= self._limits.columns
-        ):
+        if _size(rows, columns, self._limits) is None:
             raise PtyError("INVALID_REQUEST")
         if fcntl is None or termios is None:
             raise PtyError("PTY_UNAVAILABLE")
@@ -299,6 +312,12 @@ class _SubprocessPtySession:
                 termios.TIOCSWINSZ,
                 struct.pack("HHHH", rows, columns, 0, 0),
             )
+            # The docker exec client runs in its own session without this PTY
+            # as its controlling terminal, so the kernel does not tell it about
+            # the change; it resizes the sandbox's TTY when it is signalled.
+            # It drops a signal that arrives before it watches for one, which
+            # is why open() takes the client's starting size.
+            self._process.send_signal(signal.SIGWINCH)
         except OSError:
             self.close()
             raise PtyError("PTY_UNAVAILABLE") from None
@@ -355,13 +374,32 @@ class DockerPtyRuntime:
         self._opener = opener
         self._cleanup_runner = cleanup_runner
 
-    def open(self, container_id: str, *, command: tuple[str, ...]) -> PtySession:
+    def open(
+        self,
+        container_id: str,
+        *,
+        command: tuple[str, ...],
+        rows: int | None = None,
+        columns: int | None = None,
+    ) -> PtySession:
+        """Open the shell at the client's size, or 24x80 within the limits.
+
+        The docker exec client gives the sandbox's TTY the size it reads when
+        it starts, and only later watches for SIGWINCH, so a terminal's first
+        size has to be the size the PTY opens with.
+        """
         if (
             type(container_id) is not str
             or _CONTAINER_ID.fullmatch(container_id) is None
             or command != _COMMAND
         ):
             raise PtyError("PTY_UNAVAILABLE")
+        if rows is None and columns is None:
+            rows = min(_DEFAULT_ROWS, self._limits.rows)
+            columns = min(_DEFAULT_COLUMNS, self._limits.columns)
+        size = _size(rows, columns, self._limits)
+        if size is None:
+            raise PtyError("INVALID_REQUEST")
         if sys.platform != "linux":
             raise PtyError("PTY_UNAVAILABLE")
         if tty is None:
@@ -370,6 +408,8 @@ class DockerPtyRuntime:
         process: _Process | None = None
         try:
             tty.setraw(slave_fd)
+            # A PTY starts at 0x0; the client reads this size when it starts.
+            fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", *size, 0, 0))
             argv = (
                 "docker",
                 "--context",

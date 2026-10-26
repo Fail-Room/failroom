@@ -67,7 +67,13 @@ class TerminalGatewayProtocol(Protocol):
 class TerminalAttachmentProtocol(Protocol):
     def admit(self, lease: AttachmentLease) -> TerminalAdmission: ...
 
-    def attach(self, lease: AttachmentLease) -> TerminalSession: ...
+    def attach(
+        self,
+        lease: AttachmentLease,
+        *,
+        rows: int | None = None,
+        columns: int | None = None,
+    ) -> TerminalSession: ...
 
 
 class _FrameError(Exception):
@@ -93,9 +99,15 @@ class _ConnectionCalls:
         self._closed: Future[None] | None = None
 
     def attach(
-        self, terminal: TerminalAttachmentProtocol, lease: AttachmentLease
+        self,
+        terminal: TerminalAttachmentProtocol,
+        lease: AttachmentLease,
+        size: tuple[int, int],
     ) -> asyncio.Future[TerminalSession]:
-        self._attached = self._thread.submit(terminal.attach, lease)
+        rows, columns = size
+        self._attached = self._thread.submit(
+            terminal.attach, lease, rows=rows, columns=columns
+        )
         return asyncio.wrap_future(self._attached)
 
     def run[T](self, call: Callable[..., T], *args: object) -> asyncio.Future[T]:
@@ -155,6 +167,20 @@ async def _receive_frame(websocket: WebSocket, maximum: int) -> dict[str, object
 
 def _exact_keys(frame: dict[str, object], *keys: str) -> bool:
     return set(frame) == set(keys)
+
+
+def _size(frame: dict[str, object], limits: WebSocketLimits) -> tuple[int, int] | None:
+    """The frame's terminal size, or None unless it is within the bounds."""
+    rows = frame.get("rows")
+    columns = frame.get("columns")
+    if (
+        type(rows) is not int
+        or type(columns) is not int
+        or not 1 <= rows <= limits.max_rows
+        or not 1 <= columns <= limits.max_columns
+    ):
+        return None
+    return rows, columns
 
 
 async def serve_terminal(
@@ -231,12 +257,17 @@ async def serve_terminal(
             await close_once(error.code)
             return
 
+        # The terminal's first size is opened with the PTY, because the PTY
+        # client drops a resize that arrives before it is ready for one. The
+        # frame is checked whole before its single-use capability is spent.
         capability = frame.get("capability")
+        size = _size(frame, limits)
         if (
-            not _exact_keys(frame, "type", "capability")
+            not _exact_keys(frame, "type", "capability", "rows", "columns")
             or frame.get("type") != "authorize"
             or type(capability) is not str
             or not capability
+            or size is None
         ):
             await close_once(4400)
             return
@@ -259,7 +290,7 @@ async def serve_terminal(
         try:
             admission = terminal.admit(attachment.lease)
             calls = _ConnectionCalls()
-            session = await calls.attach(terminal, attachment.lease)
+            session = await calls.attach(terminal, attachment.lease, size)
         except TerminalError as error:
             await close_once(_TERMINAL_CLOSE_CODES.get(error.code, 1011))
             return
@@ -302,18 +333,12 @@ async def serve_terminal(
                     break
                 continue
             if frame_type == "resize" and _exact_keys(frame, "type", "rows", "columns"):
-                rows = frame.get("rows")
-                columns = frame.get("columns")
-                if (
-                    type(rows) is not int
-                    or type(columns) is not int
-                    or not 1 <= rows <= limits.max_rows
-                    or not 1 <= columns <= limits.max_columns
-                ):
+                resized = _size(frame, limits)
+                if resized is None:
                     await close_once(4400)
                     break
                 try:
-                    await calls.run(session.resize, rows, columns)
+                    await calls.run(session.resize, *resized)
                 except (PtyError, TerminalError, OSError):
                     await close_once(1011)
                     break

@@ -79,9 +79,10 @@ its session slot.
 
 The route is available only when `create_app()` receives the optional terminal
 dependencies (or when `mount_terminal_route()` is called directly). This is a
-Phase 1 vertical slice: production identity verification, browser terminal UI,
-multi-tenant deployment, and independent runtime attestation remain planned
-until trusted deployment evidence exists.
+Phase 1 vertical slice: production identity verification, multi-tenant
+deployment, and independent runtime attestation remain planned until trusted
+deployment evidence exists. The browser terminal is the
+[web interface](../../apps/web/README.md), which the local runtime serves.
 
 The Linux PTY adapter currently accepts only signal value `2` (`SIGINT`/Ctrl+C)
 and delivers it through the remote PTY line discipline. The adapter itself
@@ -93,8 +94,8 @@ as fatal: it closes the connection and the PTY session.
 
 > **Limitation:** the local runtime checks a current qualification report
 > before every Room allocation, but it authenticates one local bearer
-> credential, directly or through a browser session it opens, and has no
-> browser terminal yet. See
+> credential, directly or through a browser session it opens, and serves its
+> browser interface only to that operator. See
 > [SECURITY.md](../../docs/SECURITY.md). Use it only as the local operator on
 > your own host, and do not offer it to learners or other users.
 
@@ -115,7 +116,8 @@ routes into one process:
    or `QUALIFICATION_UNAVAILABLE <code>`. The listener starts in every case;
    only Room allocation depends on the report. This takes about as long as
    one `qualify-local` collection.
-5. It serves the routes with access logging disabled and repeats maintenance
+5. It serves the routes through uvicorn, with wsproto as its WebSocket
+   implementation and access logging disabled, and repeats maintenance
    on a fixed interval. On the same interval, once the report is half as old
    as `FAILROOM_QUALIFICATION_MAX_AGE_SECONDS`, or while it holds no passing
    report, it collects a new report in its workspace, keeping the current
@@ -227,8 +229,9 @@ capability secret are credentials.
 
 ### Settings
 
-Every setting is required; there are no defaults. Profile values are validated
-by `StrictDockerProfile` as described in the
+Every setting is required and has no default, except
+`FAILROOM_LOCAL_WEB_ROOT`. Profile values are validated by
+`StrictDockerProfile` as described in the
 [sandbox-engine README](../sandbox-engine/README.md).
 
 | Variable | Meaning and validation |
@@ -240,6 +243,7 @@ by `StrictDockerProfile` as described in the
 | `FAILROOM_LOCAL_ROOM_SCOPES` | Comma-separated Room IDs the user may enter, for example `disk-full`. |
 | `FAILROOM_LOCAL_TOKEN_EXPIRES_AT` | ISO 8601 time with a UTC offset, in the future at startup. Later requests fail with `AUTHENTICATION_EXPIRED`. |
 | `FAILROOM_LOCAL_SESSION_SECONDS` | Browser session lifetime, 60–43200. A session also ends when the bearer token expires. |
+| `FAILROOM_LOCAL_WEB_ROOT` | Optional. Absolute path of the browser interface's built export, normally `apps/web/out`: an existing directory with `index.html`. Unset or empty, the runtime serves only the API. |
 | `FAILROOM_DATABASE_PATH` | Absolute path of the SQLite database file. `qualify-local` keeps its `failroom-qualification` workspace in the same directory. |
 | `FAILROOM_DATABASE_BUSY_TIMEOUT_MS` | SQLite busy timeout, 1–30000. |
 | `FAILROOM_DOCKER_CONTEXT` | Docker CLI context name. |
@@ -295,10 +299,20 @@ cookie. A request whose `Host` header does not name the runtime returns `400`
 with `HOST_NOT_ALLOWED`. Enter Room, Reset Room, recovery verification, and
 Leave Room also need a non-empty `Idempotency-Key` header. Errors return only
 `{"code": "<FIXED_CODE>"}`. Every response carries `Cache-Control: no-store`,
-`X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
-`Cross-Origin-Resource-Policy: same-origin` and
+`X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and
+`Cross-Origin-Resource-Policy: same-origin`, and every API response
 `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`. The app
 serves no OpenAPI or documentation routes.
+
+With `FAILROOM_LOCAL_WEB_ROOT`, every path outside `/v1` serves a file from
+that export, for `GET` and `HEAD` only: a page path without its trailing slash
+redirects to it, and an unknown path gets the export's `404.html`. Only files
+inside the export are served, with fixed media types. These responses carry
+the page policy instead:
+`default-src 'none'; script-src 'self'; style-src 'self'; style-src-elem 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`.
+xterm.js writes `<style>` elements at run time, so those alone may be inline;
+inline style attributes and scripts stay blocked. An unknown path under `/v1`
+returns the API's JSON `404`, never a page.
 
 | Request | Purpose | Success response |
 | --- | --- | --- |
@@ -306,7 +320,7 @@ serves no OpenAPI or documentation routes.
 | `DELETE /v1/session` | Sign the browser out; needs the runtime's `Origin` | `204`, ending the session and clearing the cookie |
 | `POST /v1/rooms/{room_id}/attempts` | Enter Room | `201` with `attempt_id`, `room_id`, `state`, and `expires_at` |
 | `GET /v1/attempts/{attempt_id}/status` | Room Status | `200` with `attempt_id`, `room_id`, `state`, `expires_at`, and `destroy_intent` |
-| `POST /v1/attempts/{attempt_id}/terminal-capability` | Issue a single-use terminal capability | `200` with `capability` and `expires_at` |
+| `POST /v1/attempts/{attempt_id}/terminal-capability` | Issue a single-use terminal capability | `200` with `capability` and `expires_at`, and, when the app serves the terminal, `terminal` with the largest accepted `rows` and `columns` and the `input_bytes` and `frame_bytes` limits |
 | `POST /v1/attempts/{attempt_id}/reset` | Reset Room | `202` with the status fields |
 | `POST /v1/attempts/{attempt_id}/verify-recovery` | Check the Disk Full recovery inside the sandbox | `200` with the status fields |
 | `POST /v1/attempts/{attempt_id}/leave` | Leave Room | `202` with the status fields |
@@ -322,8 +336,14 @@ The terminal route is `/v1/terminal`. A handshake whose `Origin` header names
 another origin closes with `1008` before the authorization frame; a client
 without `Origin` is not a browser and still needs a capability. The client
 first sends
-`{"type": "authorize", "capability": "<capability>"}` within the authorization
-timeout. The server answers `{"type": "authorized"}` and then streams
+`{"type": "authorize", "capability": "<capability>", "rows": <rows>, "columns": <columns>}`
+within the authorization timeout. The shell opens at that size, within the
+same row and column bounds as `resize`; a frame with a size outside them is
+refused with `4400` before its capability is consumed. The size belongs in this
+frame because the `docker exec` client reads the terminal size once when it
+starts and drops a resize that arrives before it is ready for one, so a resize
+sent right after authorization can be lost until the next one. The server
+answers `{"type": "authorized"}` and then streams
 `{"type": "output", "data": "..."}` frames. The client may send `input`
 (`data`), `resize` (`rows`, `columns`), `signal` (`value`; only `2` is
 accepted), and `close` frames. A capability works once, so a reconnect needs a
@@ -453,7 +473,7 @@ export FAILROOM_MAINTENANCE_LIMIT=10
 | --- | --- | --- |
 | `test_linux_docker_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Provisioning through the orchestrator, container hardening, Docker's init as PID 1 from a read-only mount, Leave and Reset cleanup with every generation absent afterwards, and a PID 1 that outlives 60 seconds and stops by the attempt deadline, after which Docker removes the sandbox without a cleanup pass |
 | `test_linux_disk_full_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | The Disk Full filler reduces workspace capacity and recovery restores it; the test builds the Disk Full image itself |
-| `test_linux_terminal_integration.py` | `FAILROOM_TERMINAL_INTEGRATION=1` | Input and output, ANSI bytes, resize, Ctrl+C interruption, one-time capability replay denial, termination and reaping of the shell's session and background jobs after disconnect, also when the client leaves without a close frame, after which the freed session slot admits a new terminal, and refusal with `4429` of a terminal beyond the profile's connection or session limit until one closes, through a real PTY |
+| `test_linux_terminal_integration.py` | `FAILROOM_TERMINAL_INTEGRATION=1` | Input and output, ANSI bytes, the sandbox shell's terminal size from the authorization frame at once and after a resize, Ctrl+C interruption, one-time capability replay denial, termination and reaping of the shell's session and background jobs after disconnect, also when the client leaves without a close frame, after which the freed session slot admits a new terminal, and refusal with `4429` of a terminal beyond the profile's connection or session limit until one closes, through a real PTY |
 | `test_linux_qualification_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Report-only qualification: all eighteen checks pass on the strict profile and the restart scenario's Room sandbox is removed, a never-started and a running sandbox and a Room sandbox a crashed collection left are removed, a second collection is refused while one holds the workspace, another workspace's sandbox is left alone, a container outside the profile fails the checks it violates, and no sandbox or scratch state remains |
 | `test_linux_local_runtime_integration.py` | `FAILROOM_LOCAL_RUNTIME_INTEGRATION=1` | Enter Room, capability, terminal, recovery verification, Reset Room, and Leave Room through the local app; a browser session that signs in with the bearer token, reaches the terminal with only its cookie and the runtime's origin, and signs out; denial of unreviewed and unauthorized Rooms, of a reused capability, and of a capability issued before a reset; reset maintenance; a terminal that stays responsive for 70 seconds; a report refreshed before it expires, with only the new sentinel left and Enter Room still admitted; a sandbox Docker removes by its deadline while the runtime is stopped, recorded destroyed once the runtime starts again; and Room allocation that needs the live sentinel of the startup report, with a sentinel that outlives the attempt TTL, `qualify-local` refused while the runtime runs, and `ENTRY_FAILED` without any Docker call once the sentinel is gone |
 

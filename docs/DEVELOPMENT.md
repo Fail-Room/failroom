@@ -8,10 +8,11 @@ Phase 0 established the product and engineering contracts. The repository now co
 - `packages/state-store/`: SQLite repositories for attempt authority, resource lifecycle, capability consumption, attachment leases and reset generations, plus the injected cleanup pass.
 - `services/api/`: the bounded capability codec, the backend capability authority facade, the bearer identity verifier, and in-memory browser sessions.
 - `services/control-plane/`: the trusted composition; HTTP and WebSocket routes for Enter Room, Room Status, the terminal, Reset Room, recovery verification and Leave Room; and the operator-only local runtime (`serve-local`).
+- `apps/web/`: the browser interface, a static Next.js export with xterm.js and a pinned npm lockfile. It signs in, enters the Disk Full Room, shows Room Status, opens the terminal, verifies the recovery, and resets or leaves the Room; the local runtime serves it.
 
-The local runtime binds only to a loopback address and serves one local operator. It collects a qualification report covering all eighteen required checks when it starts and provisions Disk Full Room sandboxes only while that report passes for the live runtime, as [SECURITY.md](SECURITY.md) requires. Once that report is half as old as its validity, the runtime collects a new one in the background and keeps allocating on the current report meanwhile. It must not be offered to learners or other users. There is no web application, browser terminal UI, production authentication, deployment, or production service. Installing or testing these packages creates no persistent service database.
+The local runtime binds only to a loopback address and serves one local operator. It collects a qualification report covering all eighteen required checks when it starts and provisions Disk Full Room sandboxes only while that report passes for the live runtime, as [SECURITY.md](SECURITY.md) requires. Once that report is half as old as its validity, the runtime collects a new one in the background and keeps allocating on the current report meanwhile. It must not be offered to learners or other users, and neither may the browser interface it serves. There is no learner-facing web application, production authentication, deployment, or production service, and automated browser-to-PTY tests remain planned. Installing or testing these packages creates no persistent service database.
 
-FastAPI and uvicorn are pinned in the control-plane package for the local runtime. Next.js and xterm.js remain planned; their versions, manifests and integration layout will be selected with the browser terminal, and its setup commands will be documented only after those artifacts exist and are verified.
+FastAPI, uvicorn and wsproto, uvicorn's WebSocket implementation, are pinned in the control-plane package for the local runtime. The browser interface pins Next.js, React, xterm.js and its tools to exact versions in `apps/web/package.json` and `package-lock.json`.
 
 ## Available Checks
 
@@ -41,7 +42,7 @@ Its tests use real SQLite files in OS temporary directories, independent connect
 
 The [state-store contract](../packages/state-store/README.md) describes explicit private local database placement, recovery ordering, known limitations and rollback precautions. Runtime integration must run backend expiry, control-plane cleanup and backend pending-finalization recovery before accepting terminal traffic, then maintain independent TTL enforcement. Do not place service databases in synchronized source checkouts or treat a stored evidence digest as physical cleanup proof.
 
-The control-plane package uses Python 3.12 with pinned FastAPI and uvicorn runtime dependencies. It also provides the operator-only local runtime; its [README](../services/control-plane/README.md) documents `serve-local`, `verify-local`, `migrate` and the opt-in Linux integration tests. From services/control-plane/, run:
+The control-plane package uses Python 3.12 with pinned FastAPI, uvicorn and wsproto runtime dependencies. It also provides the operator-only local runtime; its [README](../services/control-plane/README.md) documents `serve-local`, `verify-local`, `migrate` and the opt-in Linux integration tests. From services/control-plane/, run:
 
 Commands:
 - uv sync --locked
@@ -60,6 +61,18 @@ Commands:
 - uv run --locked mypy failroom_api
 
 This package issues and verifies bounded HMAC capability claims, delegates atomic `jti` consumption to the state store, verifies explicitly configured bearer credentials, and keeps the browser sessions they open. Existing databases must be migrated explicitly to schema v4, one version at a time, each with a new absolute backup path; the control-plane README documents the `migrate` command.
+
+The browser interface uses Node.js 24.22.1 and npm. Its `.npmrc` refuses other Node.js versions, never runs package install scripts, and saves exact versions. From `apps/web/`, run:
+
+```sh
+npm ci
+npm run lint
+npm run typecheck
+npm test
+npm run build
+```
+
+`npm test` runs the terminal protocol and API unit tests with Node.js's built-in test runner, and `npm run build` writes the static export to `apps/web/out`. Set `NEXT_TELEMETRY_DISABLED=1` so Next.js sends no usage data. Each web dependency is pinned to an exact version published at least two weeks before it is chosen, unless a security advisory affects that version; then the first fixed version is used. The build uses webpack because Turbopack adds an inline script that the page policy refuses. ESLint stays on 9.x, which no longer receives updates, because the React, import and accessibility plugins of `eslint-config-next` do not yet accept ESLint 10. The [web README](../apps/web/README.md) describes how the local runtime serves the export.
 
 ## Delivery Principles
 
@@ -128,7 +141,7 @@ Infrastructure expansion such as PostgreSQL, orchestration, stronger sandbox run
 - Keep commits coherent and avoid mixing unrelated refactors, generated files, or dependency updates.
 - Rebase or merge the current target branch according to repository policy before final validation.
 - Require review before merging changes that affect a trust boundary, lifecycle transition, terminal protocol, scenario schema, persistence, or infrastructure privilege.
-- GitHub Actions runs each package's documented checks above on every pull request and every push to `main` ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)). It pins each action to a commit and uv to a version and checksum, reads the repository only, and needs no secrets. Once those checks pass, its `linux-docker` job runs the opt-in Docker integration tests on a disposable Ubuntu runner through [`.github/scripts/linux-docker-integration.sh`](../.github/scripts/linux-docker-integration.sh): it uses the control-plane README's inputs, Docker's default seccomp profile from a pinned upstream commit checked against its SHA-256, and the runner's own data disk as the I/O device, and it fails if any Failroom container outlives the tests. It then restarts the runner's Docker daemon with one auto-remove container running and fails if that container survives the restart.
+- GitHub Actions runs the documented checks above ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)). Every push to `main` runs them all; a pull request runs the Python packages' checks and the `linux-docker` job when it changes `services/`, `packages/` or `scenarios/`, the `web` job when it changes `apps/web/`, and everything when it changes `.github/`. A skipped area reports success, so no required check waits for it. CI pins each action to a commit, uv to a version and checksum and Node.js to an exact version, reads the repository only, and needs no secrets. Once the Python checks pass, its `linux-docker` job runs the opt-in Docker integration tests on a disposable Ubuntu runner through [`.github/scripts/linux-docker-integration.sh`](../.github/scripts/linux-docker-integration.sh): it uses the control-plane README's inputs, Docker's default seccomp profile from a pinned upstream commit checked against its SHA-256, and the runner's own data disk as the I/O device, and it fails if any Failroom container outlives the tests. It then restarts the runner's Docker daemon with one auto-remove container running and fails if that container survives the restart.
 
 Every pull request description includes:
 

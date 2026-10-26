@@ -35,6 +35,22 @@ from failroom_control_plane.lifecycle import RoomLifecycleService
 from failroom_control_plane.recovery import RecoveryVerificationService
 from failroom_control_plane.reset import RoomResetService
 from failroom_control_plane.room_scenarios import RoomScenarioRegistry
+from failroom_control_plane.websocket import WebSocketLimits
+
+
+class UnusedGateway:
+    def authorize_and_lease(
+        self, token, *, gateway_session_id, idempotency_key, now
+    ) -> None:
+        raise AssertionError("not called")
+
+
+class UnusedTerminal:
+    def admit(self, lease) -> None:
+        raise AssertionError("not called")
+
+    def attach(self, lease) -> None:
+        raise AssertionError("not called")
 
 
 class RecordingCleanupWorker:
@@ -485,6 +501,41 @@ class CapabilityHttpTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(set(response.json()), {"capability", "expires_at"})
         self.assertNotIn("sandbox_id", response.json())
+
+    def test_a_served_terminal_adds_its_bounds_to_the_capability(self) -> None:
+        limits = WebSocketLimits(
+            authorization_timeout_seconds=5,
+            max_frame_bytes=8192,
+            max_input_bytes=4096,
+            max_output_bytes=65536,
+            max_rows=40,
+            max_columns=120,
+            poll_interval_seconds=0.05,
+        )
+        client = TestClient(
+            create_app(
+                authority=self.authority,
+                verifier=self.verifier,
+                origin=self.origin,
+                now=lambda: self.now,
+                gateway=UnusedGateway(),
+                terminal=UnusedTerminal(),
+                terminal_limits=limits,
+            )
+        )
+        attempt_id = self._ready()
+
+        response = client.post(
+            f"/v1/attempts/{attempt_id}/terminal-capability",
+            headers={"Authorization": "Bearer " + self.token},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(set(response.json()), {"capability", "expires_at", "terminal"})
+        self.assertEqual(
+            response.json()["terminal"],
+            {"rows": 40, "columns": 120, "input_bytes": 4096, "frame_bytes": 8192},
+        )
 
     def test_recovery_endpoint_requires_idempotency_and_returns_only_safe_status(
         self,

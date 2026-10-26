@@ -269,7 +269,7 @@ class MigrationCliTests(unittest.TestCase):
             patch(
                 "failroom_control_plane.cli.build_runtime", return_value=runtime
             ) as build_runtime,
-            patch("failroom_control_plane.cli.uvicorn.run") as run_server,
+            patch("failroom_control_plane.cli.uvicorn.Server") as server,
         ):
             cli._serve_local()
 
@@ -277,13 +277,13 @@ class MigrationCliTests(unittest.TestCase):
         build_runtime.assert_called_once_with(config, now=ANY)
         now = build_runtime.call_args.kwargs["now"]
         self.assertEqual(now().tzinfo, UTC)
-        run_server.assert_called_once_with(
-            runtime.app,
-            host="127.0.0.1",
-            port=8765,
-            log_config=None,
-            access_log=False,
-        )
+        server.return_value.run.assert_called_once_with()
+        settings = server.call_args.args[0]
+        self.assertIs(settings.app, runtime.app)
+        self.assertEqual((settings.host, settings.port), ("127.0.0.1", 8765))
+        self.assertEqual(settings.ws, "wsproto")
+        self.assertIsNone(settings.log_config)
+        self.assertFalse(settings.access_log)
 
     def test_default_local_verifier_parses_config_and_runs_preflight_only(self) -> None:
         config = SimpleNamespace()

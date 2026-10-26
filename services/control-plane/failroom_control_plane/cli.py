@@ -13,6 +13,7 @@ from failroom_sandbox.models import QualificationDecision
 from failroom_sandbox.pty import DockerPtyRuntime
 from failroom_sandbox.qualification import evaluate_qualification
 from failroom_state import Database, StoreError
+from fastapi import FastAPI
 
 from .local_environment import load_operator_environment
 from .local_runtime import (
@@ -82,16 +83,28 @@ def _operator_environment(environment_file: str | None) -> Mapping[str, str] | N
     return load_operator_environment(environment_file)
 
 
-def _serve_local(environment: Mapping[str, str] | None = None) -> None:
-    config = _runtime_config(environment)
-    runtime = build_runtime(config, now=lambda: datetime.now(UTC))
-    uvicorn.run(
-        runtime.app,
-        host=config.bind_host,
-        port=config.bind_port,
+def _server_config(app: FastAPI, host: str, port: int) -> uvicorn.Config:
+    """The listener serve-local runs.
+
+    wsproto serves the terminal's WebSocket; without it uvicorn would refuse
+    every upgrade, so a missing package fails the start instead.
+    """
+    return uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        ws="wsproto",
         log_config=None,
         access_log=False,
     )
+
+
+def _serve_local(environment: Mapping[str, str] | None = None) -> None:
+    config = _runtime_config(environment)
+    runtime = build_runtime(config, now=lambda: datetime.now(UTC))
+    uvicorn.Server(
+        _server_config(runtime.app, config.bind_host, config.bind_port)
+    ).run()
 
 
 def _verify_local(environment: Mapping[str, str] | None = None) -> None:

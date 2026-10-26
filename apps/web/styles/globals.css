@@ -1,0 +1,169 @@
+:root {
+  color-scheme: light dark;
+  --background: #f6f7f9;
+  --surface: #ffffff;
+  --text: #1c2024;
+  --muted: #5b6470;
+  --border: #d5d9df;
+  --accent: #1f5fbf;
+  --danger: #b42318;
+  --notice: #fff4d6;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #121417;
+    --surface: #1b1f24;
+    --text: #e6e8eb;
+    --muted: #9aa3ad;
+    --border: #2f353d;
+    --accent: #6ea0ff;
+    --danger: #ff7a6b;
+    --notice: #3a2f12;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--background);
+  color: var(--text);
+}
+
+.page {
+  margin: 0 auto;
+  max-width: 64rem;
+  padding: 1.5rem 1rem 3rem;
+}
+
+.page.narrow {
+  max-width: 28rem;
+}
+
+.masthead,
+.panel-header,
+.actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.masthead {
+  justify-content: space-between;
+}
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  margin-top: 1rem;
+  padding: 1rem;
+}
+
+.panel-header h2 {
+  margin: 0;
+  margin-right: auto;
+}
+
+.stack {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.lead,
+.hint {
+  color: var(--muted);
+}
+
+.hint {
+  font-size: 0.875rem;
+}
+
+.badge {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 0.8125rem;
+  padding: 0.125rem 0.625rem;
+}
+
+.facts {
+  display: grid;
+  gap: 0.25rem 1rem;
+  grid-template-columns: max-content 1fr;
+}
+
+.facts dd {
+  margin: 0;
+}
+
+.notice,
+.error {
+  border-radius: 0.375rem;
+  padding: 0.5rem 0.75rem;
+}
+
+.notice {
+  background: var(--notice);
+}
+
+.error {
+  border: 1px solid var(--danger);
+  color: var(--danger);
+}
+
+input,
+button {
+  font: inherit;
+}
+
+input {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.375rem;
+  color: var(--text);
+  padding: 0.5rem;
+}
+
+button {
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 0.375rem;
+  color: #ffffff;
+  cursor: pointer;
+  padding: 0.4rem 0.9rem;
+}
+
+button.quiet,
+button.link {
+  background: transparent;
+  color: var(--accent);
+}
+
+button.link {
+  border: 0;
+  padding: 0;
+  text-decoration: underline;
+}
+
+button.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.terminal-surface {
+  background: #000000;
+  border-radius: 0.375rem;
+  height: 26rem;
+  margin-top: 0.75rem;
+  padding: 0.25rem;
+}

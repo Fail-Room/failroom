@@ -1,5 +1,6 @@
-# Runs every package's documented checks (docs/DEVELOPMENT.md), then the opt-in
-# Docker integration tests on a disposable runner.
+# Runs each area's documented checks (docs/DEVELOPMENT.md), then the opt-in
+# Docker integration tests on a disposable runner. A pull request runs only the
+# areas it changes; a push to main runs them all.
 name: CI
 
 on:
@@ -15,8 +16,27 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      python: ${{ steps.areas.outputs.python }}
+      web: ${{ steps.areas.outputs.web }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: areas
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: bash .github/scripts/changed-areas.sh
+
   checks:
     name: checks (${{ matrix.package }})
+    needs: changes
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
@@ -36,25 +56,36 @@ jobs:
         working-directory: ${{ matrix.package }}
     env:
       PYTHONDONTWRITEBYTECODE: "1"
+      # Each step checks the area instead of the job: a skipped matrix job
+      # would report an unexpanded name that a required check never matches.
+      RUN: ${{ needs.changes.outputs.python }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - if: env.RUN == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - if: env.RUN == 'true'
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: "0.12.11"
           checksum: "4ae93e0f148a18434cc094072547cec88912fc4a72b984183c7d0d0e9586cb5e"
           enable-cache: true
           cache-dependency-glob: ${{ matrix.package }}/uv.lock
-      - run: uv sync --locked
-      - run: uv run --locked python -m unittest discover -s tests -v
-      - run: uv run --locked ruff check .
-      - run: uv run --locked ruff format --check .
-      - run: uv run --locked mypy ${{ matrix.module }}
+      - if: env.RUN == 'true'
+        run: uv sync --locked
+      - if: env.RUN == 'true'
+        run: uv run --locked python -m unittest discover -s tests -v
+      - if: env.RUN == 'true'
+        run: uv run --locked ruff check .
+      - if: env.RUN == 'true'
+        run: uv run --locked ruff format --check .
+      - if: env.RUN == 'true'
+        run: uv run --locked mypy ${{ matrix.module }}
 
   linux-docker:
     name: linux-docker
-    needs: checks
+    needs: [changes, checks]
+    if: needs.changes.outputs.python == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -72,3 +103,29 @@ jobs:
             services/sandbox-engine/uv.lock
             services/control-plane/uv.lock
       - run: bash .github/scripts/linux-docker-integration.sh
+
+  web:
+    name: web
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/web
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.22.1"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
