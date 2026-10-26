@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from datetime import datetime
+from pathlib import Path
 from typing import cast
 
 from failroom_api import (
@@ -23,6 +24,7 @@ from .lifecycle import LifecycleError, RoomLifecycleService, RoomStatus
 from .recovery import RecoveryError, RecoveryVerificationService
 from .reset import ResetError, RoomResetService
 from .terminal import ControlPlaneTerminalService
+from .web import WebInterface
 from .websocket import (
     TerminalGatewayProtocol,
     WebSocketLimits,
@@ -174,8 +176,12 @@ def create_app(
     reset: RoomResetService | None = None,
     recovery: RecoveryVerificationService | None = None,
     lifespan: Lifespan[FastAPI] | None = None,
+    web_root: Path | None = None,
 ) -> FastAPI:
-    """Build an API app with all trust dependencies supplied by the caller."""
+    """Build an API app with all trust dependencies supplied by the caller.
+
+    With a web root, the app also serves that static export at its root.
+    """
 
     if type(origin) is not LoopbackOrigin:
         raise ValueError("invalid loopback origin")
@@ -276,13 +282,20 @@ def create_app(
             return _error(code, status)
         except Exception:
             return _error("AUTHORIZATION_FAILED", 500)
-        return JSONResponse(
-            status_code=200,
-            content={
-                "capability": issued.token,
-                "expires_at": issued.expires_at.isoformat(),
-            },
-        )
+        content: dict[str, object] = {
+            "capability": issued.token,
+            "expires_at": issued.expires_at.isoformat(),
+        }
+        if terminal_limits is not None:
+            # A frame beyond these bounds closes the terminal, so the browser
+            # sizes its terminal and splits its input to fit them.
+            content["terminal"] = {
+                "rows": terminal_limits.max_rows,
+                "columns": terminal_limits.max_columns,
+                "input_bytes": terminal_limits.max_input_bytes,
+                "frame_bytes": terminal_limits.max_frame_bytes,
+            }
+        return JSONResponse(status_code=200, content=content)
 
     if lifecycle is not None:
 
@@ -354,5 +367,9 @@ def create_app(
             now=now,
             origins=origin.origins,
         )
+
+    if web_root is not None:
+        # Mounted last, so every API route above matches first.
+        app.mount("/", WebInterface(web_root))
 
     return app

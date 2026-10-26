@@ -86,10 +86,19 @@ class RecordingRuntime:
     def __init__(self, session: PtySession | None = None) -> None:
         self.session = session or RecordingSession()
         self.calls: list[tuple[str, tuple[str, ...]]] = []
+        self.sizes: list[tuple[int | None, int | None]] = []
         self.error: Exception | None = None
 
-    def open(self, container_id: str, *, command: tuple[str, ...]) -> PtySession:
+    def open(
+        self,
+        container_id: str,
+        *,
+        command: tuple[str, ...],
+        rows: int | None = None,
+        columns: int | None = None,
+    ) -> PtySession:
         self.calls.append((container_id, command))
+        self.sizes.append((rows, columns))
         if self.error is not None:
             raise self.error
         return self.session
@@ -210,6 +219,17 @@ class TerminalServiceTests(unittest.TestCase):
 
         self.assertEqual(runtime.calls, [("c" * 64, ("/bin/bash",))])
         self.assertEqual(session.closed, 1)
+
+    def test_attach_opens_the_shell_at_the_client_size_or_the_runtime_default(
+        self,
+    ) -> None:
+        runtime = RecordingRuntime()
+        service = self.service(runtime)
+
+        service.attach(self.lease, rows=30, columns=120).close()
+        service.attach(self.lease).close()
+
+        self.assertEqual(runtime.sizes, [(30, 120), (None, None)])
 
     def test_attach_rejects_mismatched_resource_reference(self) -> None:
         runtime = RecordingRuntime()
@@ -352,7 +372,12 @@ class TerminalServiceTests(unittest.TestCase):
         self.assertEqual(results.count("LIMIT_REACHED"), 13)
 
     def test_terminal_beyond_either_limit_is_closed_with_4429(self) -> None:
-        authorize = {"type": "authorize", "capability": "capability"}
+        authorize = {
+            "type": "authorize",
+            "capability": "capability",
+            "rows": 24,
+            "columns": 80,
+        }
         consumed = CapabilityUse("a" * 64, self.lease.ref, 0, self.lease.expires_at)
         for connection_limit, session_limit in ((1, 4), (4, 1)):
             with self.subTest(connections=connection_limit, sessions=session_limit):

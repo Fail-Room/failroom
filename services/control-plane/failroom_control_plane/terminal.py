@@ -38,7 +38,14 @@ class TerminalError(Exception):
 
 @runtime_checkable
 class TerminalRuntime(Protocol):
-    def open(self, container_id: str, *, command: tuple[str, ...]) -> PtySession: ...
+    def open(
+        self,
+        container_id: str,
+        *,
+        command: tuple[str, ...],
+        rows: int | None = None,
+        columns: int | None = None,
+    ) -> PtySession: ...
 
 
 class TerminalSession(Protocol):
@@ -168,7 +175,14 @@ class ControlPlaneTerminalService:
             raise TerminalError("ATTACHMENT_DENIED")
         return self._connections.acquire(lease.ref)
 
-    def attach(self, lease: AttachmentLease) -> TerminalSession:
+    def attach(
+        self,
+        lease: AttachmentLease,
+        *,
+        rows: int | None = None,
+        columns: int | None = None,
+    ) -> TerminalSession:
+        """Open the shell at the client's terminal size, or the runtime's."""
         if type(lease) is not AttachmentLease:
             raise TerminalError("ATTACHMENT_DENIED")
         try:
@@ -195,7 +209,9 @@ class ControlPlaneTerminalService:
             raise TerminalError("ATTACHMENT_DENIED") from None
         slot = self._sessions.acquire(lease.ref)
         try:
-            session = self._runtime.open(resource.container_id, command=_COMMAND)
+            session = self._runtime.open(
+                resource.container_id, command=_COMMAND, rows=rows, columns=columns
+            )
         except Exception:
             slot.release()
             raise TerminalError("PTY_UNAVAILABLE") from None

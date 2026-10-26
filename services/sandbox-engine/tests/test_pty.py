@@ -1,6 +1,7 @@
 import os
 import select
 import signal
+import struct
 import sys
 import unittest
 from unittest.mock import patch
@@ -39,6 +40,19 @@ class _Process:
     def kill(self):
         self.events.append("client-kill")
 
+    def send_signal(self, sig):
+        self.events.append(f"client-signal-{int(sig)}")
+
+
+def _window_size(fd: int) -> tuple[int, int]:
+    import fcntl
+    import termios
+
+    rows, columns, _, _ = struct.unpack(
+        "HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, bytes(8))
+    )
+    return rows, columns
+
 
 class PtyRuntimeTests(unittest.TestCase):
     def limits(self) -> PtyLimits:
@@ -65,6 +79,27 @@ class PtyRuntimeTests(unittest.TestCase):
             runtime.open("a" * 64, command=("/bin/sh",))
 
         self.assertEqual(raised.exception.code, "PTY_UNAVAILABLE")
+
+    def test_a_starting_size_beyond_the_limits_is_rejected_before_anything_starts(
+        self,
+    ):
+        started: list[tuple[str, ...]] = []
+
+        def opener(argv: tuple[str, ...], slave_fd: int):
+            started.append(argv)
+            return _Process()
+
+        runtime = DockerPtyRuntime(
+            context="default", limits=self.limits(), opener=opener
+        )
+        for rows, columns in ((121, 80), (24, 201), (0, 80), (24, None), (True, 80)):
+            with self.subTest(rows=rows, columns=columns):
+                with self.assertRaises(PtyError) as raised:
+                    runtime.open(
+                        "a" * 64, command=("/bin/bash",), rows=rows, columns=columns
+                    )
+                self.assertEqual(raised.exception.code, "INVALID_REQUEST")
+        self.assertEqual(started, [])
 
     def test_invalid_limits_are_rejected(self):
         with self.assertRaises(PtyError) as raised:
@@ -280,6 +315,58 @@ class PtyRuntimeTests(unittest.TestCase):
             os.close(read_fd)
 
         self.assertEqual(events, ["remote-cleanup", "client-wait"])
+
+    @unittest.skipUnless(sys.platform == "linux", "UNVERIFIED: Linux PTY required")
+    def test_resize_sets_the_pty_size_and_signals_the_client(self):
+        master_fd, slave_fd = os.openpty()
+        events: list[str] = []
+        session = _SubprocessPtySession(master_fd, _Process(events), self.limits())
+        try:
+            session.resize(30, 120)
+
+            self.assertEqual(_window_size(slave_fd), (30, 120))
+            # Without the signal, docker exec never resizes the sandbox's TTY.
+            self.assertEqual(events, [f"client-signal-{int(signal.SIGWINCH)}"])
+        finally:
+            session.close()
+            os.close(slave_fd)
+
+    def _starting_size(self, limits: PtyLimits, **size: int) -> tuple[int, int]:
+        sizes: list[tuple[int, int]] = []
+
+        def opener(argv: tuple[str, ...], slave_fd: int):
+            sizes.append(_window_size(slave_fd))
+            os.write(slave_fd, b"FAILROOM_PTY_SESSION=31\r\n")
+            return _Process()
+
+        runtime = DockerPtyRuntime(
+            context="default",
+            limits=limits,
+            opener=opener,
+            cleanup_runner=lambda argv: None,
+        )
+        runtime.open("a" * 64, command=("/bin/bash",), **size).close()
+        return sizes[0]
+
+    @unittest.skipUnless(sys.platform == "linux", "UNVERIFIED: Linux PTY required")
+    def test_the_client_starts_at_the_requested_size(self):
+        # The client reads this size when it starts; a resize sent just after
+        # it could arrive before the client watches for one.
+        self.assertEqual(
+            self._starting_size(self.limits(), rows=30, columns=120), (30, 120)
+        )
+        self.assertEqual(
+            self._starting_size(self.limits(), rows=120, columns=200), (120, 200)
+        )
+
+    @unittest.skipUnless(sys.platform == "linux", "UNVERIFIED: Linux PTY required")
+    def test_without_a_size_the_client_starts_at_24x80_within_the_limits(self):
+        small = PtyLimits(
+            input_bytes=16, output_bytes=64, session_seconds=60, rows=10, columns=40
+        )
+
+        self.assertEqual(self._starting_size(self.limits()), (24, 80))
+        self.assertEqual(self._starting_size(small), (10, 40))
 
     @unittest.skipUnless(sys.platform == "linux", "UNVERIFIED: Linux PTY required")
     def test_output_after_the_marker_counts_toward_the_output_limit(self):

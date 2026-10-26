@@ -51,6 +51,10 @@ def _terminal_url(config: LocalRuntimeConfig) -> str:
     return "ws" + _base_url(config).removeprefix("http") + "/v1/terminal"
 
 
+def _authorize_frame(capability: str) -> dict:
+    return {"type": "authorize", "capability": capability, "rows": 24, "columns": 80}
+
+
 @unittest.skipUnless(
     os.environ.get("FAILROOM_LOCAL_RUNTIME_INTEGRATION") == "1",
     "UNVERIFIED: opt-in required",
@@ -125,12 +129,7 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
                 self.assertEqual(capability.status_code, 200)
 
                 with client.websocket_connect(_terminal_url(config)) as socket:
-                    socket.send_json(
-                        {
-                            "type": "authorize",
-                            "capability": capability.json()["capability"],
-                        }
-                    )
+                    socket.send_json(_authorize_frame(capability.json()["capability"]))
                     self.assertEqual(socket.receive_json(), {"type": "authorized"})
                     marker = "FAILROOM_LOCAL_RUNTIME_" + uuid4().hex
                     socket.send_json(
@@ -194,12 +193,7 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
                 with client.websocket_connect(
                     _terminal_url(config), headers=origin
                 ) as socket:
-                    socket.send_json(
-                        {
-                            "type": "authorize",
-                            "capability": capability.json()["capability"],
-                        }
-                    )
+                    socket.send_json(_authorize_frame(capability.json()["capability"]))
                     self.assertEqual(socket.receive_json(), {"type": "authorized"})
                     suffix = uuid4().hex
                     # The shell prints the marker only by running the command.
@@ -494,12 +488,7 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
                 self.assertEqual(capability.status_code, 200)
 
                 with client.websocket_connect(_terminal_url(config)) as socket:
-                    socket.send_json(
-                        {
-                            "type": "authorize",
-                            "capability": capability.json()["capability"],
-                        }
-                    )
+                    socket.send_json(_authorize_frame(capability.json()["capability"]))
                     self.assertEqual(socket.receive_json(), {"type": "authorized"})
                     started = time.monotonic()
                     tick = 0
@@ -569,12 +558,7 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
                 self.assertEqual(capability.status_code, 200)
 
                 with client.websocket_connect(_terminal_url(config)) as socket:
-                    socket.send_json(
-                        {
-                            "type": "authorize",
-                            "capability": capability.json()["capability"],
-                        }
-                    )
+                    socket.send_json(_authorize_frame(capability.json()["capability"]))
                     self.assertEqual(socket.receive_json(), {"type": "authorized"})
                     marker = "FAILROOM_LOCAL_RECOVERY_" + uuid4().hex
                     socket.send_json(
@@ -653,12 +637,12 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
                 token = capability.json()["capability"]
 
                 with client.websocket_connect(_terminal_url(config)) as socket:
-                    socket.send_json({"type": "authorize", "capability": token})
+                    socket.send_json(_authorize_frame(token))
                     self.assertEqual(socket.receive_json(), {"type": "authorized"})
                     socket.send_json({"type": "close"})
 
                 with client.websocket_connect(_terminal_url(config)) as socket:
-                    socket.send_json({"type": "authorize", "capability": token})
+                    socket.send_json(_authorize_frame(token))
                     with self.assertRaises(WebSocketDisconnect) as raised:
                         socket.receive_json()
                 self.assertEqual(raised.exception.code, 4403)
@@ -706,12 +690,7 @@ class LinuxLocalRuntimeIntegrationTests(unittest.TestCase):
                 self.assertEqual(reset.json()["state"], "RESETTING")
 
                 with client.websocket_connect(_terminal_url(config)) as socket:
-                    socket.send_json(
-                        {
-                            "type": "authorize",
-                            "capability": capability.json()["capability"],
-                        }
-                    )
+                    socket.send_json(_authorize_frame(capability.json()["capability"]))
                     with self.assertRaises(WebSocketDisconnect) as raised:
                         socket.receive_json()
                 self.assertEqual(raised.exception.code, 4403)

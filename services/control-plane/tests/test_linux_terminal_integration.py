@@ -111,6 +111,10 @@ def _terminal_limits() -> tuple[PtyLimits, WebSocketLimits]:
     )
 
 
+def _authorize_frame(token: str, *, rows: int = 24, columns: int = 80) -> dict:
+    return {"type": "authorize", "capability": token, "rows": rows, "columns": columns}
+
+
 @unittest.skipUnless(
     os.environ.get("FAILROOM_TERMINAL_INTEGRATION") == "1",
     "UNVERIFIED: opt-in required",
@@ -255,13 +259,13 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
                 return output
         raise AssertionError("terminal marker not observed")
 
-    def _authorize(self, receipt) -> dict[str, str]:
+    def _authorize(self, receipt) -> dict[str, object]:
         issued = self.authority.issue(
             self.user,
             receipt.attempt_id,
             now=lambda: self.now,
         )
-        return {"type": "authorize", "capability": issued.token}
+        return _authorize_frame(issued.token)
 
     @staticmethod
     def _close_and_wait(socket) -> None:
@@ -271,6 +275,30 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
             if socket.receive()["type"] == "websocket.close":
                 return
         raise AssertionError("terminal close not observed")
+
+    @staticmethod
+    def _shell_size(socket) -> tuple[int, int]:
+        """Ask the sandbox's shell for its terminal size."""
+        socket.send_json(
+            {
+                "type": "input",
+                "data": "printf 'FAILROOM_SIZE=%s\\n' \"$(stty size | tr ' ' x)\"\n",
+            }
+        )
+        # The echoed command carries no digits after the marker.
+        for _ in range(200):
+            output = socket.receive_json().get("data", "")
+            match = re.search(r"FAILROOM_SIZE=([0-9]+)x([0-9]+)", output)
+            if match:
+                return int(match.group(1)), int(match.group(2))
+        raise AssertionError("terminal size not reported")
+
+    def _wait_for_shell_size(self, socket, expected: tuple[int, int]) -> None:
+        # docker exec resizes the sandbox's TTY shortly after the change.
+        deadline = time.monotonic() + 10
+        while (size := self._shell_size(socket)) != expected:
+            self.assertLess(time.monotonic(), deadline, f"shell size stayed {size}")
+            time.sleep(0.2)
 
     def _authorize_once_a_session_frees(self, receipt) -> None:
         """Authorize a terminal, retrying while a closing session holds the slot."""
@@ -355,9 +383,13 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
             _assert_hardening(self, data, self.profile)
 
             with TestClient(self._app()).websocket_connect("/v1/terminal") as socket:
-                socket.send_json({"type": "authorize", "capability": issued.token})
+                socket.send_json(_authorize_frame(issued.token, rows=30, columns=120))
                 self.assertEqual(socket.receive_json(), {"type": "authorized"})
-                socket.send_json({"type": "resize", "rows": 30, "columns": 120})
+                # The shell already has the authorized size: docker exec drops
+                # a resize that arrives this early, so it cannot set it.
+                self.assertEqual(self._shell_size(socket), (30, 120))
+                socket.send_json({"type": "resize", "rows": 40, "columns": 100})
+                self._wait_for_shell_size(socket, (40, 100))
                 marker = "FAILROOM_ANSI_MARKER"
                 socket.send_json(
                     {
@@ -382,7 +414,7 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
                 now=lambda: self.now,
             )
             with TestClient(self._app()).websocket_connect("/v1/terminal") as socket:
-                socket.send_json({"type": "authorize", "capability": issued.token})
+                socket.send_json(_authorize_frame(issued.token))
                 self.assertEqual(socket.receive_json(), {"type": "authorized"})
                 # Echoed input carries the markers but never the ANSI bytes, so
                 # each wait below observes real command output.
@@ -409,7 +441,7 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
                 socket.send_json({"type": "close"})
 
             with TestClient(self._app()).websocket_connect("/v1/terminal") as socket:
-                socket.send_json({"type": "authorize", "capability": issued.token})
+                socket.send_json(_authorize_frame(issued.token))
                 with self.assertRaises(WebSocketDisconnect) as raised:
                     socket.receive_json()
             self.assertEqual(raised.exception.code, 4403)
@@ -427,7 +459,7 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
             resource = self.control.inspect(self.control_identity, receipt.ref)
             container_id = resource.container_id
             with TestClient(self._app()).websocket_connect("/v1/terminal") as socket:
-                socket.send_json({"type": "authorize", "capability": issued.token})
+                socket.send_json(_authorize_frame(issued.token))
                 self.assertEqual(socket.receive_json(), {"type": "authorized"})
                 socket.send_json(
                     {"type": "input", "data": "sleep 1000 & (sleep 1001 &)\n"}
@@ -479,7 +511,7 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
             resource = self.control.inspect(self.control_identity, receipt.ref)
             container_id = resource.container_id
             with TestClient(self._app()).websocket_connect("/v1/terminal") as socket:
-                socket.send_json({"type": "authorize", "capability": issued.token})
+                socket.send_json(_authorize_frame(issued.token))
                 self.assertEqual(socket.receive_json(), {"type": "authorized"})
                 socket.send_json(
                     {

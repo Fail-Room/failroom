@@ -148,6 +148,17 @@ and then replaces itself with `/bin/bash`. `open()` consumes that first line,
 which must arrive within 10 seconds and match exactly, and fails closed with
 `PTY_UNAVAILABLE` otherwise; output that follows it is relayed normally.
 
+`open()` sets the PTY to the caller's `rows` and `columns`, which must be
+within the configured bounds, or to 24 rows by 80 columns within those bounds
+when it names none, before the client starts: the client gives the sandbox's
+TTY the size it reads at startup. The client runs in its own session without
+the PTY as its controlling terminal, so the kernel does not tell it when the
+size changes: `resize()` sets the PTY's size and then sends the client
+`SIGWINCH`, and the client resizes the sandbox's TTY. The client watches for
+that signal only after its own startup resize and drops one that arrives
+earlier, so a terminal's first size must be given to `open()` rather than sent
+as a resize just after it.
+
 The session enforces explicit input, cumulative output, wall-clock session,
 terminal row/column, and signal bounds. The current signal contract permits
 only `SIGINT` (`Ctrl+C`) and writes the PTY interrupt byte so the remote

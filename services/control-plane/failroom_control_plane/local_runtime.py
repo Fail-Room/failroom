@@ -111,6 +111,23 @@ def _float(environment: Mapping[str, str], name: str) -> float:
     return value
 
 
+def _web_root(environment: Mapping[str, str]) -> Path | None:
+    """Read the optional built browser interface: an export with index.html."""
+    value = environment.get("FAILROOM_LOCAL_WEB_ROOT")
+    if value is None or value == "":
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        raise LocalRuntimeError()
+    try:
+        root = path.resolve(strict=True)
+        if not root.is_dir() or not (root / "index.html").is_file():
+            raise LocalRuntimeError()
+    except OSError:
+        raise LocalRuntimeError() from None
+    return root
+
+
 # One local operator; signing in once more ends the session that expires first.
 _BROWSER_SESSIONS = 8
 
@@ -146,6 +163,7 @@ class LocalRuntimeConfig:
     maintenance_limit: int
     qualification_max_age: timedelta
     session_lifetime: timedelta
+    web_root: Path | None = None
 
     @classmethod
     def from_environment(
@@ -281,6 +299,7 @@ class LocalRuntimeConfig:
                 maintenance_limit=maintenance_limit,
                 qualification_max_age=qualification_max_age(values),
                 session_lifetime=timedelta(seconds=session_seconds),
+                web_root=_web_root(values),
             )
         except (ConfigurationError, LocalRuntimeError, ValueError, UnicodeError):
             raise LocalRuntimeError() from None
@@ -560,6 +579,7 @@ def build_runtime(config: LocalRuntimeConfig, *, now: Clock) -> LocalRuntime:
                 interval=config.maintenance_interval,
                 qualification=qualification,
             ),
+            web_root=config.web_root,
         )
         return LocalRuntime(
             app,

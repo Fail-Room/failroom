@@ -19,6 +19,13 @@ from failroom_control_plane.websocket import (
     serve_terminal,
 )
 
+AUTHORIZE = {
+    "type": "authorize",
+    "capability": "secret-capability",
+    "rows": 24,
+    "columns": 80,
+}
+
 
 class RecordingSession:
     def __init__(self) -> None:
@@ -101,6 +108,7 @@ class RecordingTerminal:
         self.session = session
         self.admissions: list[RecordingAdmission] = []
         self.leases: list[AttachmentLease] = []
+        self.sizes: list[tuple[int | None, int | None]] = []
         self.admit_error: TerminalError | None = None
         self.attach_error: TerminalError | None = None
 
@@ -111,8 +119,15 @@ class RecordingTerminal:
         self.admissions.append(admission)
         return admission
 
-    def attach(self, lease: AttachmentLease) -> RecordingSession:
+    def attach(
+        self,
+        lease: AttachmentLease,
+        *,
+        rows: int | None = None,
+        columns: int | None = None,
+    ) -> RecordingSession:
         self.leases.append(lease)
+        self.sizes.append((rows, columns))
         if self.attach_error is not None:
             raise self.attach_error
         return self.session
@@ -126,10 +141,16 @@ class SlowAttachTerminal(RecordingTerminal):
         self.attaching = threading.Event()
         self.gate = threading.Event()
 
-    def attach(self, lease: AttachmentLease) -> RecordingSession:
+    def attach(
+        self,
+        lease: AttachmentLease,
+        *,
+        rows: int | None = None,
+        columns: int | None = None,
+    ) -> RecordingSession:
         self.attaching.set()
         self.gate.wait(5)
-        return super().attach(lease)
+        return super().attach(lease, rows=rows, columns=columns)
 
 
 class ScriptedSocket:
@@ -199,7 +220,7 @@ class WebSocketTests(unittest.TestCase):
 
     def test_first_frame_authorizes_and_relays_session_output(self) -> None:
         with self.client.websocket_connect("/v1/terminal") as socket:
-            socket.send_json({"type": "authorize", "capability": "secret-capability"})
+            socket.send_json(AUTHORIZE)
             self.assertEqual(socket.receive_json(), {"type": "authorized"})
             socket.send_json({"type": "input", "data": "printf ok\n"})
             self.assertEqual(socket.receive_json(), {"type": "output", "data": "ok\n"})
@@ -213,11 +234,43 @@ class WebSocketTests(unittest.TestCase):
         self.assertEqual(self.session.closed, 1)
         self.assertEqual([a.released for a in self.terminal.admissions], [1])
 
+    def test_the_shell_opens_at_the_size_the_authorization_names(self) -> None:
+        with self.client.websocket_connect("/v1/terminal") as socket:
+            socket.send_json({**AUTHORIZE, "rows": 30, "columns": 120})
+            self.assertEqual(socket.receive_json(), {"type": "authorized"})
+            socket.send_json({"type": "close"})
+
+        self.assertEqual(self.terminal.sizes, [(30, 120)])
+
+    def test_an_authorization_without_a_size_in_bounds_keeps_its_capability(
+        self,
+    ) -> None:
+        capability_only = {"type": "authorize", "capability": "secret-capability"}
+        for frame in (
+            capability_only,
+            {**capability_only, "rows": 24},
+            {**AUTHORIZE, "rows": 0},
+            {**AUTHORIZE, "rows": 101},
+            {**AUTHORIZE, "columns": 201},
+            {**AUTHORIZE, "rows": "24"},
+            {**AUTHORIZE, "rows": True},
+            {**AUTHORIZE, "columns": 80.0},
+        ):
+            with self.subTest(frame=frame):
+                with self.client.websocket_connect("/v1/terminal") as socket:
+                    socket.send_json(frame)
+                    with self.assertRaises(WebSocketDisconnect) as raised:
+                        socket.receive_json()
+                self.assertEqual(raised.exception.code, 4400)
+        # Refused before the gateway, so no capability was consumed.
+        self.assertEqual(self.gateway.calls, [])
+        self.assertEqual(self.terminal.leases, [])
+
     def test_a_client_that_leaves_without_closing_still_closes_the_session(
         self,
     ) -> None:
         with self.client.websocket_connect("/v1/terminal") as socket:
-            socket.send_json({"type": "authorize", "capability": "secret-capability"})
+            socket.send_json(AUTHORIZE)
             self.assertEqual(socket.receive_json(), {"type": "authorized"})
 
         self.assertTrue(self.session.ended.wait(5))
@@ -244,9 +297,7 @@ class WebSocketTests(unittest.TestCase):
                     asyncio.get_running_loop().call_soon(task.cancel)
 
             socket.on_frame = cancel_once_closing
-            await socket.frames.put(
-                {"type": "authorize", "capability": "secret-capability"}
-            )
+            await socket.frames.put(AUTHORIZE)
             await socket.frames.put({"type": "close"})
             with self.assertRaises(asyncio.CancelledError):
                 await task
@@ -264,9 +315,7 @@ class WebSocketTests(unittest.TestCase):
         async def scenario() -> None:
             socket = ScriptedSocket()
             task = self._serve(socket, terminal)
-            await socket.frames.put(
-                {"type": "authorize", "capability": "secret-capability"}
-            )
+            await socket.frames.put(AUTHORIZE)
             self.assertTrue(await asyncio.to_thread(terminal.attaching.wait, 5))
             task.cancel()
             # A task cancelled once still waits in its cleanup for the close,
@@ -289,9 +338,7 @@ class WebSocketTests(unittest.TestCase):
         async def scenario() -> None:
             socket = ScriptedSocket()
             task = self._serve(socket, terminal)
-            await socket.frames.put(
-                {"type": "authorize", "capability": "secret-capability"}
-            )
+            await socket.frames.put(AUTHORIZE)
             self.assertTrue(await asyncio.to_thread(session.reading.wait, 5))
             await socket.frames.put({"type": "close"})
             # The cleanup now waits for the close, queued behind the read.
@@ -311,7 +358,7 @@ class WebSocketTests(unittest.TestCase):
         self.terminal.admit_error = TerminalError("LIMIT_REACHED")
 
         with self.client.websocket_connect("/v1/terminal") as socket:
-            socket.send_json({"type": "authorize", "capability": "secret-capability"})
+            socket.send_json(AUTHORIZE)
             with self.assertRaises(WebSocketDisconnect) as raised:
                 socket.receive_json()
 
@@ -324,7 +371,7 @@ class WebSocketTests(unittest.TestCase):
         self.terminal.attach_error = TerminalError("LIMIT_REACHED")
 
         with self.client.websocket_connect("/v1/terminal") as socket:
-            socket.send_json({"type": "authorize", "capability": "secret-capability"})
+            socket.send_json(AUTHORIZE)
             with self.assertRaises(WebSocketDisconnect) as raised:
                 socket.receive_json()
 
@@ -334,9 +381,9 @@ class WebSocketTests(unittest.TestCase):
 
     def test_second_authorize_frame_is_protocol_denied(self) -> None:
         with self.client.websocket_connect("/v1/terminal") as socket:
-            socket.send_json({"type": "authorize", "capability": "secret-capability"})
+            socket.send_json(AUTHORIZE)
             self.assertEqual(socket.receive_json(), {"type": "authorized"})
-            socket.send_json({"type": "authorize", "capability": "secret-capability"})
+            socket.send_json(AUTHORIZE)
             with self.assertRaises(WebSocketDisconnect) as raised:
                 socket.receive_json()
 
@@ -347,7 +394,7 @@ class WebSocketTests(unittest.TestCase):
         self.gateway.error = GatewayError("CAPABILITY_REPLAY")
 
         with self.client.websocket_connect("/v1/terminal") as socket:
-            socket.send_json({"type": "authorize", "capability": "secret-capability"})
+            socket.send_json(AUTHORIZE)
             with self.assertRaises(WebSocketDisconnect) as raised:
                 socket.receive_json()
 
@@ -372,7 +419,7 @@ class WebSocketTests(unittest.TestCase):
         with self.client.websocket_connect(
             "/v1/terminal", headers={"origin": "http://testserver"}
         ) as socket:
-            socket.send_json({"type": "authorize", "capability": "secret-capability"})
+            socket.send_json(AUTHORIZE)
             self.assertEqual(socket.receive_json(), {"type": "authorized"})
             socket.send_json({"type": "close"})
 

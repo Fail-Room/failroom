@@ -276,7 +276,14 @@ class FakeTerminalRuntime:
         self.open_error: Exception | None = None
         self.opened: list[tuple[str, tuple[str, ...]]] = []
 
-    def open(self, container_id: str, *, command: tuple[str, ...]) -> FakeSession:
+    def open(
+        self,
+        container_id: str,
+        *,
+        command: tuple[str, ...],
+        rows: int | None = None,
+        columns: int | None = None,
+    ) -> FakeSession:
         if self.open_error is not None:
             raise self.open_error
         self.opened.append((container_id, command))
