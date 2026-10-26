@@ -183,6 +183,13 @@ def _size(frame: dict[str, object], limits: WebSocketLimits) -> tuple[int, int] 
     return rows, columns
 
 
+def _session_close_code(error: Exception) -> int:
+    """4410 once the session's shell has ended, 1011 for any other failure."""
+    if isinstance(error, PtyError) and error.code == "SESSION_ENDED":
+        return 4410
+    return 1011
+
+
 async def serve_terminal(
     websocket: WebSocket,
     gateway: TerminalGatewayProtocol,
@@ -225,8 +232,8 @@ async def serve_terminal(
         while True:
             try:
                 data = await calls.run(session.read, limits.max_output_bytes)
-            except (PtyError, TerminalError, OSError):
-                await close_once(1011)
+            except (PtyError, TerminalError, OSError) as error:
+                await close_once(_session_close_code(error))
                 return
             except Exception:
                 await close_once(1011)
@@ -325,8 +332,8 @@ async def serve_terminal(
                     break
                 try:
                     await calls.run(session.write, data.encode("utf-8"))
-                except (PtyError, TerminalError, OSError):
-                    await close_once(1011)
+                except (PtyError, TerminalError, OSError) as error:
+                    await close_once(_session_close_code(error))
                     break
                 except Exception:
                     await close_once(1011)
@@ -339,8 +346,8 @@ async def serve_terminal(
                     break
                 try:
                     await calls.run(session.resize, *resized)
-                except (PtyError, TerminalError, OSError):
-                    await close_once(1011)
+                except (PtyError, TerminalError, OSError) as error:
+                    await close_once(_session_close_code(error))
                     break
                 except Exception:
                     await close_once(1011)
@@ -353,8 +360,8 @@ async def serve_terminal(
                     break
                 try:
                     await calls.run(session.signal, value)
-                except (PtyError, TerminalError, OSError):
-                    await close_once(1011)
+                except (PtyError, TerminalError, OSError) as error:
+                    await close_once(_session_close_code(error))
                     break
                 except Exception:
                     await close_once(1011)

@@ -277,6 +277,15 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
         raise AssertionError("terminal close not observed")
 
     @staticmethod
+    def _close_code(socket) -> int:
+        """Wait, past any output, until the server closes the terminal."""
+        for _ in range(1000):
+            message = socket.receive()
+            if message["type"] == "websocket.close":
+                return message["code"]
+        raise AssertionError("terminal close not observed")
+
+    @staticmethod
     def _shell_size(socket) -> tuple[int, int]:
         """Ask the sandbox's shell for its terminal size."""
         socket.send_json(
@@ -542,6 +551,82 @@ class LinuxTerminalIntegrationTests(unittest.TestCase):
                 time.sleep(0.25)
             self.assertEqual(leftover, [])
             self._authorize_once_a_session_frees(receipt)
+        finally:
+            self._cleanup(receipt)
+
+    def test_a_shell_that_exits_closes_the_terminal_with_4410(self) -> None:
+        receipt = self._provision()
+        try:
+            resource = self.control.inspect(self.control_identity, receipt.ref)
+            container_id = resource.container_id
+            with TestClient(self._app()).websocket_connect("/v1/terminal") as socket:
+                socket.send_json(self._authorize(receipt))
+                self.assertEqual(socket.receive_json(), {"type": "authorized"})
+                # Both stay in the shell's session after it exits until the
+                # session is cleaned.
+                socket.send_json(
+                    {
+                        "type": "input",
+                        "data": (
+                            "sleep 1000 & (sleep 1001 &); "
+                            "printf '\\033[32mFAILROOM_SHELL=%s\\033[0m\\n' $$\n"
+                        ),
+                    }
+                )
+                output = self._receive_until(
+                    socket, "FAILROOM_SHELL=", required_fragment="\x1b[32m"
+                )
+                match = re.search(r"FAILROOM_SHELL=([0-9]+)", output)
+                self.assertIsNotNone(match)
+                shell = match.group(1)
+                commands = {
+                    command
+                    for _, _, sid, command in self._processes(container_id)
+                    if sid == shell
+                }
+                self.assertIn("sleep 1000", commands)
+                self.assertIn("sleep 1001", commands)
+                socket.send_json({"type": "input", "data": "exit\n"})
+                self.assertEqual(self._close_code(socket), 4410)
+
+            # The ended session was still cleaned and its session slot freed.
+            deadline = time.monotonic() + 15
+            while True:
+                leftover = [
+                    process
+                    for process in self._processes(container_id)
+                    if process[2] == shell
+                ]
+                if not leftover or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.25)
+            self.assertEqual(leftover, [])
+            self._authorize_once_a_session_frees(receipt)
+        finally:
+            self._cleanup(receipt)
+
+    def test_a_sandbox_that_goes_away_closes_the_terminal_with_4410(self) -> None:
+        receipt = self._provision()
+        try:
+            resource = self.control.inspect(self.control_identity, receipt.ref)
+            with TestClient(self._app()).websocket_connect("/v1/terminal") as socket:
+                socket.send_json(self._authorize(receipt))
+                self.assertEqual(socket.receive_json(), {"type": "authorized"})
+                # PID 1 stops, as it does at the Room's end, and Docker then
+                # removes the sandbox.
+                subprocess.run(
+                    (
+                        "docker",
+                        "--context",
+                        _required("FAILROOM_DOCKER_CONTEXT"),
+                        "kill",
+                        resource.container_id,
+                    ),
+                    capture_output=True,
+                    check=True,
+                    timeout=float(_required("FAILROOM_DOCKER_TIMEOUT_SECONDS")),
+                )
+                self.assertEqual(self._close_code(socket), 4410)
         finally:
             self._cleanup(receipt)
 

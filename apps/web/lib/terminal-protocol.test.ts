@@ -109,7 +109,7 @@ test("only known server messages are accepted", () => {
 });
 
 test("every documented close code has its own message", () => {
-  const codes = [1000, 1008, 1011, 4400, 4403, 4408, 4409, 4429];
+  const codes = [1000, 1008, 1011, 4400, 4403, 4408, 4409, 4410, 4429];
   const messages = new Set(codes.map(closeMessage));
 
   assert.equal(messages.size, codes.length);

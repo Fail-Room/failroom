@@ -22,9 +22,9 @@ operator on their own host and must not be offered to learners or other users.
   `/v1/terminal`, sends the capability and the terminal's current size in the
   authorization frame, and relays input, resize and output between xterm.js
   and the real PTY in the Room's sandbox; a resize is sent only when the size
-  changes. When the Room is reset or ends, the terminal says so instead of
-  reporting the server's close as a failure. Ctrl+C reaches the PTY as typed
-  input. The terminal stays within the
+  changes. When the shell ends, as after `exit`, or the Room is reset or ends,
+  the terminal says so instead of reporting the server's close as a failure.
+  Ctrl+C reaches the PTY as typed input. The terminal stays within the
   bounds the capability response carries: it never asks for more rows or
   columns than the server accepts, and it splits typed or pasted text so each
   frame stays within the input and frame limits after JSON escaping.
