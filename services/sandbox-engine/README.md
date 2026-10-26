@@ -174,6 +174,13 @@ session with `setsid` is not stopped by `close()`; the sandbox's PID 1 lifetime
 bounds it.
 Both commands rely on `/bin/sh`, `kill` and `sleep` in the reviewed image.
 
+The `docker exec` client holds the PTY's only other end, so reading the PTY
+fails once the client exits, which it does when the shell exits or the sandbox
+goes away; a read first returns what the shell wrote before then. On a PTY
+error the session waits up to one second for the client and closes itself as
+`close()` does. It raises `SESSION_ENDED` if the client has exited and
+`PTY_UNAVAILABLE` if it still runs, and every later call raises the same code.
+
 Non-Linux interpreters fail closed; the Windows unit suite does not claim Linux
 PTY or Docker isolation evidence. The primitive never exposes a host runtime
 socket, host shell, or host filesystem to the learner sandbox.

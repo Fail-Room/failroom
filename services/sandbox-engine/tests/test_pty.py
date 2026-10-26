@@ -2,6 +2,7 @@ import os
 import select
 import signal
 import struct
+import subprocess
 import sys
 import unittest
 from unittest.mock import patch
@@ -42,6 +43,21 @@ class _Process:
 
     def send_signal(self, sig):
         self.events.append(f"client-signal-{int(sig)}")
+
+
+class _ExitedProcess(_Process):
+    """A client that exited on its own, as when its shell ends."""
+
+    def poll(self):
+        return 0
+
+
+class _RunningProcess(_Process):
+    """A client that keeps running whatever it is asked."""
+
+    def wait(self, timeout=None):
+        self.events.append("client-wait")
+        raise subprocess.TimeoutExpired("docker", timeout)
 
 
 def _window_size(fd: int) -> tuple[int, int]:
@@ -315,6 +331,68 @@ class PtyRuntimeTests(unittest.TestCase):
             os.close(read_fd)
 
         self.assertEqual(events, ["remote-cleanup", "client-wait"])
+
+    def _closed_pty_session(
+        self, process: _Process, output: bytes
+    ) -> _SubprocessPtySession:
+        """A session whose PTY's other end wrote `output` and then closed."""
+        master_fd, slave_fd = os.openpty()
+        os.set_blocking(master_fd, False)
+        os.write(slave_fd, output)
+        # The client holds the only other end; its exit closes it like this.
+        os.close(slave_fd)
+        return _SubprocessPtySession(
+            master_fd,
+            process,
+            self.limits(),
+            cleanup=lambda: process.events.append("remote-cleanup"),
+        )
+
+    @unittest.skipUnless(sys.platform == "linux", "UNVERIFIED: Linux PTY required")
+    def test_a_client_that_exits_ends_the_session_after_its_output(self):
+        events: list[str] = []
+        session = self._closed_pty_session(_ExitedProcess(events), b"bye")
+
+        self.assertEqual(session.read(100), b"bye")
+        with self.assertRaises(PtyError) as raised:
+            session.read(100)
+
+        self.assertEqual(raised.exception.code, "SESSION_ENDED")
+        # It still cleans the shell's session, but signals no reaped client.
+        self.assertEqual(events, ["client-wait", "remote-cleanup"])
+        for call in (
+            lambda: session.read(100),
+            lambda: session.write(b"ls\n"),
+            lambda: session.resize(30, 120),
+        ):
+            with self.assertRaises(PtyError) as again:
+                call()
+            self.assertEqual(again.exception.code, "SESSION_ENDED")
+
+    @unittest.skipUnless(sys.platform == "linux", "UNVERIFIED: Linux PTY required")
+    def test_a_pty_error_while_the_client_runs_is_a_failure(self):
+        events: list[str] = []
+        session = self._closed_pty_session(_RunningProcess(events), b"")
+
+        with self.assertRaises(PtyError) as raised:
+            session.read(100)
+
+        self.assertEqual(raised.exception.code, "PTY_UNAVAILABLE")
+        # It waited for the client, cleaned the shell's session, then ended the
+        # client, which would not stop.
+        self.assertEqual(
+            events,
+            [
+                "client-wait",
+                "remote-cleanup",
+                "client-wait",
+                "client-kill",
+                "client-wait",
+            ],
+        )
+        with self.assertRaises(PtyError) as again:
+            session.write(b"ls\n")
+        self.assertEqual(again.exception.code, "PTY_UNAVAILABLE")
 
     @unittest.skipUnless(sys.platform == "linux", "UNVERIFIED: Linux PTY required")
     def test_resize_sets_the_pty_size_and_signals_the_client(self):

@@ -36,6 +36,10 @@ _SESSION_MARKER = re.compile(rb"FAILROOM_PTY_SESSION=([1-9][0-9]{0,9})\r?\n")
 _MARKER_MAX_BYTES = 64
 _MARKER_TIMEOUT_SECONDS = 10.0
 _CLEANUP_TIMEOUT_SECONDS = 10.0
+# How long a PTY error waits for the docker exec client to exit. The client's
+# exit is what closes the PTY, so it has normally exited already; a client
+# still running after this means the PTY itself failed.
+_CLIENT_EXIT_SECONDS = 1.0
 # The size a sandbox's TTY starts with, within the limits, when the caller
 # names none.
 _DEFAULT_ROWS = 24
@@ -79,6 +83,7 @@ class PtyError(RuntimeError):
             "PTY_UNAVAILABLE",
             "INPUT_LIMIT",
             "OUTPUT_LIMIT",
+            "SESSION_ENDED",
             "SESSION_EXPIRED",
         }:
             code = "PTY_UNAVAILABLE"
@@ -221,6 +226,9 @@ def _cleanup_argv(context: str, container_id: str, session: int) -> tuple[str, .
 
 
 def _terminate_client(process: _Process) -> None:
+    # A client already reaped no longer owns its PID, so it is not signalled.
+    if process.poll() is not None:
+        return
     try:
         os.killpg(os.getpgid(process.pid), signal.SIGTERM)
     except (ProcessLookupError, OSError):
@@ -256,13 +264,31 @@ class _SubprocessPtySession:
         self._started = time.monotonic()
         self._output_bytes = 0
         self._closed = False
+        self._ended = False
 
     def _ensure_active(self) -> None:
         if self._closed:
-            raise PtyError("PTY_UNAVAILABLE")
+            raise PtyError("SESSION_ENDED" if self._ended else "PTY_UNAVAILABLE")
         if time.monotonic() - self._started >= self._limits.session_seconds:
             self.close()
             raise PtyError("SESSION_EXPIRED")
+
+    def _fail(self) -> PtyError:
+        """Close after a PTY error and tell an ended session from a failure.
+
+        The docker exec client holds the PTY's only other end, so the PTY
+        reports an error once the client exits, which it does when the shell
+        exits or the sandbox goes away. That ends the session; an error while
+        the client still runs is a PTY failure.
+        """
+        try:
+            self._process.wait(timeout=_CLIENT_EXIT_SECONDS)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        else:
+            self._ended = True
+        self.close()
+        return PtyError("SESSION_ENDED" if self._ended else "PTY_UNAVAILABLE")
 
     def read(self, maximum: int) -> bytes:
         self._ensure_active()
@@ -282,8 +308,9 @@ class _SubprocessPtySession:
         except BlockingIOError:
             return b""
         except OSError:
-            self.close()
-            raise PtyError("PTY_UNAVAILABLE") from None
+            # The kernel returns what the shell wrote before the PTY's other
+            # end closed, then this error.
+            raise self._fail() from None
         self._output_bytes += len(data)
         return data
 
@@ -297,8 +324,7 @@ class _SubprocessPtySession:
                 written = os.write(self._master_fd, remaining)
                 remaining = remaining[written:]
         except OSError:
-            self.close()
-            raise PtyError("PTY_UNAVAILABLE") from None
+            raise self._fail() from None
 
     def resize(self, rows: int, columns: int) -> None:
         self._ensure_active()
@@ -319,8 +345,7 @@ class _SubprocessPtySession:
             # is why open() takes the client's starting size.
             self._process.send_signal(signal.SIGWINCH)
         except OSError:
-            self.close()
-            raise PtyError("PTY_UNAVAILABLE") from None
+            raise self._fail() from None
 
     def signal(self, value: int) -> None:
         self._ensure_active()

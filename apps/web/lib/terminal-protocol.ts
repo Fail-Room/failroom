@@ -143,6 +143,8 @@ export function closeMessage(code: number): string {
       return "The terminal waited too long for authorization.";
     case 4409:
       return "The terminal received more input than it accepts at once.";
+    case 4410:
+      return "The terminal closed because its shell ended.";
     case 4429:
       return "This Room already has as many terminals as it allows. Close another one first.";
     default:

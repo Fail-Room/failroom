@@ -6,6 +6,7 @@ import unittest
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
+from failroom_sandbox.pty import PtyError
 from failroom_sandbox.terminal_gateway import GatewayAttachment, GatewayError
 from failroom_state import AttachmentLease, CapabilityUse, ResourceRef
 from fastapi import FastAPI
@@ -52,6 +53,28 @@ class RecordingSession:
     def close(self) -> None:
         self.closed += 1
         self.ended.set()
+
+
+class EndingSession(RecordingSession):
+    """A session that relays its shell's last output and then raises `error`."""
+
+    def __init__(self, error: PtyError) -> None:
+        super().__init__()
+        self.error = error
+        self._output.put(b"exit\r\n")
+
+    def read(self, maximum: int) -> bytes:
+        data = super().read(maximum)
+        if not data:
+            raise self.error
+        return data
+
+
+class EndedWriteSession(RecordingSession):
+    """A session whose shell has ended by the time input arrives."""
+
+    def write(self, data: bytes) -> None:
+        raise PtyError("SESSION_ENDED")
 
 
 class GatedSession(RecordingSession):
@@ -353,6 +376,44 @@ class WebSocketTests(unittest.TestCase):
         self.assertTrue(session.ended.wait(5))
         self.assertEqual(session.order, ["read", "close"])
         self.assertEqual([a.released for a in terminal.admissions], [1])
+
+    def _closed_after_output(self, session: EndingSession) -> int:
+        """Relay the session's last output and return the close code after it."""
+        self.terminal.session = session
+        with self.client.websocket_connect("/v1/terminal") as socket:
+            socket.send_json(AUTHORIZE)
+            self.assertEqual(socket.receive_json(), {"type": "authorized"})
+            self.assertEqual(
+                socket.receive_json(), {"type": "output", "data": "exit\r\n"}
+            )
+            with self.assertRaises(WebSocketDisconnect) as raised:
+                socket.receive_json()
+        self.assertTrue(session.ended.wait(5))
+        self.assertEqual(session.closed, 1)
+        self.assertEqual([a.released for a in self.terminal.admissions], [1])
+        return raised.exception.code
+
+    def test_a_shell_that_ends_closes_with_4410_after_its_output(self) -> None:
+        code = self._closed_after_output(EndingSession(PtyError("SESSION_ENDED")))
+
+        self.assertEqual(code, 4410)
+
+    def test_any_other_session_failure_closes_with_1011(self) -> None:
+        code = self._closed_after_output(EndingSession(PtyError("PTY_UNAVAILABLE")))
+
+        self.assertEqual(code, 1011)
+
+    def test_input_to_a_shell_that_has_ended_closes_with_4410(self) -> None:
+        self.terminal.session = EndedWriteSession()
+
+        with self.client.websocket_connect("/v1/terminal") as socket:
+            socket.send_json(AUTHORIZE)
+            self.assertEqual(socket.receive_json(), {"type": "authorized"})
+            socket.send_json({"type": "input", "data": "ls\n"})
+            with self.assertRaises(WebSocketDisconnect) as raised:
+                socket.receive_json()
+
+        self.assertEqual(raised.exception.code, 4410)
 
     def test_connection_beyond_the_limit_is_closed_before_attach(self) -> None:
         self.terminal.admit_error = TerminalError("LIMIT_REACHED")

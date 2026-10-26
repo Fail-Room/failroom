@@ -351,17 +351,23 @@ new capability. The server closes the connection with `4408` when authorization
 times out, `4400` for an invalid frame, `4403` when authorization or attachment
 is denied, `4409` for an oversized frame or input, `4429` when the sandbox
 generation already has as many authorized connections or open sessions as the
-profile allows, and `1011` for a runtime failure, including a rejected signal
-value. A connection counts against these limits only after the gateway has
-consumed its capability, because the capability is what names the sandbox: a
-refused connection has used its capability, and sockets that have not
-authorized are bounded only by the authorization timeout. The counts live in
-the control plane's process memory and start empty when it restarts. Every
-disconnect closes the PTY session and kills the shell's session inside the
-sandbox, including its background jobs; Docker's init, the sandbox's PID 1,
-reaps any of them that had been orphaned to it, so none remain as zombies. A
-process started with `setsid` leaves that session and keeps running until the
-sandbox's PID 1 lifetime ends.
+profile allows, `4410` when the shell has ended, and `1011` for a runtime
+failure, including a rejected signal value. A connection counts against these
+limits only after the gateway has consumed its capability, because the
+capability is what names the sandbox: a refused connection has used its
+capability, and sockets that have not authorized are bounded only by the
+authorization timeout. The counts live in the control plane's process memory
+and start empty when it restarts. Every disconnect closes the PTY session and
+kills the shell's session inside the sandbox, including its background jobs;
+Docker's init, the sandbox's PID 1, reaps any of them that had been orphaned to
+it, so none remain as zombies. A process started with `setsid` leaves that
+session and keeps running until the sandbox's PID 1 lifetime ends. The shell
+ends when the learner exits it or the sandbox goes away, as when Docker removes
+it at the Room's end; either way the `docker exec` client exits and closes the
+PTY. The server then relays the shell's last output, closes the PTY session as
+on a disconnect, which also kills the background jobs an exited shell leaves in
+its session, and closes the connection with `4410`. A PTY error while that
+client still runs is a runtime failure.
 
 ## Operator migration
 
@@ -473,7 +479,7 @@ export FAILROOM_MAINTENANCE_LIMIT=10
 | --- | --- | --- |
 | `test_linux_docker_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Provisioning through the orchestrator, container hardening, Docker's init as PID 1 from a read-only mount, Leave and Reset cleanup with every generation absent afterwards, and a PID 1 that outlives 60 seconds and stops by the attempt deadline, after which Docker removes the sandbox without a cleanup pass |
 | `test_linux_disk_full_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | The Disk Full filler reduces workspace capacity and recovery restores it; the test builds the Disk Full image itself |
-| `test_linux_terminal_integration.py` | `FAILROOM_TERMINAL_INTEGRATION=1` | Input and output, ANSI bytes, the sandbox shell's terminal size from the authorization frame at once and after a resize, Ctrl+C interruption, one-time capability replay denial, termination and reaping of the shell's session and background jobs after disconnect, also when the client leaves without a close frame, after which the freed session slot admits a new terminal, and refusal with `4429` of a terminal beyond the profile's connection or session limit until one closes, through a real PTY |
+| `test_linux_terminal_integration.py` | `FAILROOM_TERMINAL_INTEGRATION=1` | Input and output, ANSI bytes, the sandbox shell's terminal size from the authorization frame at once and after a resize, Ctrl+C interruption, one-time capability replay denial, termination and reaping of the shell's session and background jobs after disconnect, also when the client leaves without a close frame, after which the freed session slot admits a new terminal, closure with `4410` when the shell exits, with its background jobs ended and its session slot freed, and when the sandbox goes away, and refusal with `4429` of a terminal beyond the profile's connection or session limit until one closes, through a real PTY |
 | `test_linux_qualification_integration.py` | `FAILROOM_DOCKER_INTEGRATION=1` | Report-only qualification: all eighteen checks pass on the strict profile and the restart scenario's Room sandbox is removed, a never-started and a running sandbox and a Room sandbox a crashed collection left are removed, a second collection is refused while one holds the workspace, another workspace's sandbox is left alone, a container outside the profile fails the checks it violates, and no sandbox or scratch state remains |
 | `test_linux_local_runtime_integration.py` | `FAILROOM_LOCAL_RUNTIME_INTEGRATION=1` | Enter Room, capability, terminal, recovery verification, Reset Room, and Leave Room through the local app; a browser session that signs in with the bearer token, reaches the terminal with only its cookie and the runtime's origin, and signs out; denial of unreviewed and unauthorized Rooms, of a reused capability, and of a capability issued before a reset; reset maintenance; a terminal that stays responsive for 70 seconds; a report refreshed before it expires, with only the new sentinel left and Enter Room still admitted; a sandbox Docker removes by its deadline while the runtime is stopped, recorded destroyed once the runtime starts again; and Room allocation that needs the live sentinel of the startup report, with a sentinel that outlives the attempt TTL, `qualify-local` refused while the runtime runs, and `ENTRY_FAILED` without any Docker call once the sentinel is gone |
 
